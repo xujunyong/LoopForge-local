@@ -1,0 +1,259 @@
+package runner
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"os/exec"
+	"path/filepath"
+	goruntime "runtime"
+	"slices"
+	"sort"
+	"strings"
+	"time"
+
+	"agentflow/internal/domain"
+	"agentflow/internal/managedcli"
+)
+
+// providerSpec maps a platform executor kind to the local CLI binary the
+// runner must discover. Credentials for these CLIs stay on this machine; the
+// control plane never receives them.
+type providerSpec struct {
+	Kind   string
+	Binary string
+	Update string // non-interactive update subcommand for an unmanaged installation
+	// VersionFlags precede --version. A CLI that rejects them is not the one
+	// the platform drives (other tools share the name) and is not reported.
+	VersionFlags []string
+}
+
+// defaultProviders lists the CLIs this runner drives in non-interactive
+// mode. Runner tasks can reuse Codex, Claude Code or Antigravity login. CodeBuddy tasks
+// receive the configured CODEBUDDY_API_KEY from the daemon. Additional
+// providers can be detected by name.
+var defaultProviders = []providerSpec{
+	{Kind: "claude-code", Binary: "claude", Update: "update"},
+	{Kind: "codex", Binary: "codex", Update: "update"},
+	{Kind: "codebuddy", Binary: "codebuddy", Update: "update"},
+	// Agent CLIs run in a private HOME. Antigravity can reuse account login;
+	// the others receive the responsible user's key.
+	{Kind: "opencode", Binary: "opencode", Update: "upgrade"},
+	{Kind: "cursor", Binary: "cursor-agent", Update: "update"},
+	{Kind: "agy", Binary: "agy", Update: "update"},
+	{Kind: "kimi", Binary: "kimi"},
+	{Kind: "pi", Binary: "pi"},
+	{Kind: "dsh", Binary: "dsh"},
+	// The official ZCode has no npm package and its --help omits
+	// --output-format, so compatibility is probed with the flags we pass.
+	{Kind: "zcode", Binary: "zcode", VersionFlags: []string{"--output-format", "stream-json", "--mode", "yolo"}},
+}
+
+// terminalProviderKind is the built-in remote-terminal capability: the
+// platform can dispatch shell commands (verification gates, and later
+// sandbox-side operations) to this machine.
+const terminalProviderKind = "terminal"
+
+// mockProviderKind is served in-process (no binary) so an end-to-end test can
+// exercise register/claim/execute/complete without any real Agent CLI.
+const mockProviderKind = "mock"
+
+// extraSearchPaths covers CLIs installed in user-local directories that a
+// launchd/systemd service environment does not include in PATH (the daemon
+// often runs with a minimal /usr/bin:/bin PATH even though the user's shell
+// finds ~/.local/bin, Homebrew, or nvm-installed CLIs).
+func extraSearchPaths() []string {
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return nil
+	}
+	paths := []string{
+		filepath.Join(home, ".local", "bin"),
+		filepath.Join(home, "bin"),
+		"/opt/homebrew/bin",
+		"/usr/local/bin",
+	}
+	// nvm installs Node-based CLIs (codex) under versioned directories.
+	if entries, err := os.ReadDir(filepath.Join(home, ".nvm", "versions", "node")); err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() {
+				paths = append(paths, filepath.Join(home, ".nvm", "versions", "node", entry.Name(), "bin"))
+			}
+		}
+	}
+	return paths
+}
+
+// lookupCLI resolves a binary name against PATH first, then the common
+// user-local installation directories.
+func lookupCLI(binary string) (string, bool) {
+	if path, err := exec.LookPath(binary); err == nil && strings.TrimSpace(path) != "" {
+		return path, true
+	}
+	for _, dir := range extraSearchPaths() {
+		candidate := filepath.Join(dir, binary)
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
+// DetectRuntimes scans PATH for the known Agent CLIs and records their
+// versions. A missing CLI is simply absent from the report; it is not an
+// error, and the platform will not dispatch that provider to this machine.
+func DetectRuntimes(ctx context.Context, extraBinaries map[string]string) []domain.RunnerRuntime {
+	return detectRuntimes(ctx, extraBinaries, nil)
+}
+
+func detectRuntimes(ctx context.Context, extraBinaries map[string]string, inventory managedcli.Inventory) []domain.RunnerRuntime {
+	specs := runtimeProviderSpecs(extraBinaries)
+	var enabledProviders []string
+	if inventory != nil {
+		var err error
+		enabledProviders, err = managedcli.EnabledProviders()
+		if err != nil {
+			log.Printf("managed CLI updates disabled: %v", err)
+		}
+	}
+	out := make([]domain.RunnerRuntime, 0, len(specs)+2)
+	out = append(out, builtinRuntimes()...)
+	for _, spec := range specs {
+		binary, managed := inventory.BinaryFor(spec.Kind)
+		if !managed {
+			binary = spec.Binary
+		}
+		if explicit := strings.TrimSpace(extraBinaries[spec.Kind]); explicit != "" {
+			binary, managed = explicit, false
+		}
+		path, ok := lookupCLI(binary)
+		if !ok {
+			continue
+		}
+		var env map[string]string
+		if managed {
+			env = managedcli.AutoUpdateEnvironment(spec.Kind)
+		}
+		version := probeVersion(ctx, path, spec.VersionFlags, env)
+		if version == "" && len(spec.VersionFlags) > 0 {
+			continue
+		}
+		capabilities := []string{"non_interactive"}
+		if managed && slices.Contains(enabledProviders, spec.Kind) {
+			capabilities = append(capabilities, domain.RuntimeCapabilityManagedUpdate)
+		} else if !managed && spec.Update != "" {
+			// Inspect the installed CLI's subcommands only when asked to update.
+			capabilities = append(capabilities, domain.RuntimeCapabilityNativeUpdate)
+		}
+		out = append(out, domain.RunnerRuntime{
+			Provider:     spec.Kind,
+			BinaryPath:   path,
+			Version:      version,
+			Capabilities: capabilities,
+			Status:       domain.RuntimeStatusOnline,
+		})
+	}
+	return out
+}
+
+// runtimeProviderSpecs returns the CLIs to probe: every default provider in
+// declaration order, followed by extra kinds configured only through
+// extraBinaries in sorted order. An extra binary for a default kind does not
+// add a second spec; detectRuntimes applies it as an explicit override.
+func runtimeProviderSpecs(extraBinaries map[string]string) []providerSpec {
+	specs := make([]providerSpec, 0, len(defaultProviders)+len(extraBinaries))
+	seen := make(map[string]bool, len(defaultProviders)+len(extraBinaries))
+	for _, spec := range defaultProviders {
+		specs = append(specs, spec)
+		seen[spec.Kind] = true
+	}
+	kinds := make([]string, 0, len(extraBinaries))
+	for kind := range extraBinaries {
+		kinds = append(kinds, kind)
+	}
+	sort.Strings(kinds)
+	for _, kind := range kinds {
+		if !seen[kind] {
+			specs = append(specs, providerSpec{Kind: kind, Binary: extraBinaries[kind]})
+			seen[kind] = true
+		}
+	}
+	return specs
+}
+
+// builtinRuntimes returns the in-process runtimes every runner reports
+// regardless of installed CLIs: the mock provider and the terminal
+// capability, which lets the platform run verification gates and
+// sandbox-side commands on this machine.
+func builtinRuntimes() []domain.RunnerRuntime {
+	return []domain.RunnerRuntime{
+		{
+			Provider:     mockProviderKind,
+			BinaryPath:   "(builtin)",
+			Capabilities: []string{"non_interactive"},
+			Status:       domain.RuntimeStatusOnline,
+		},
+		{
+			Provider:     terminalProviderKind,
+			BinaryPath:   "(builtin)",
+			Capabilities: []string{"terminal"},
+			Status:       domain.RuntimeStatusOnline,
+		},
+	}
+}
+
+func probeVersion(ctx context.Context, path string, flags []string, environments ...map[string]string) string {
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(probeCtx, path, append(append([]string{}, flags...), "--version")...)
+	if len(environments) > 0 && len(environments[0]) > 0 {
+		cmd.Env = os.Environ()
+		for key, value := range environments[0] {
+			cmd.Env = append(cmd.Env, key+"="+value)
+		}
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	line := strings.TrimSpace(string(out))
+	if idx := strings.IndexByte(line, '\n'); idx >= 0 {
+		line = strings.TrimSpace(line[:idx])
+	}
+	if len(line) > 128 {
+		line = line[:128]
+	}
+	return line
+}
+
+// providerBinaryPath resolves the binary path for a claimed task from the
+// runner's own runtime inventory.
+func providerBinaryPath(runtimes []domain.RunnerRuntime, provider string) (string, bool) {
+	for _, rt := range runtimes {
+		if strings.EqualFold(rt.Provider, provider) && rt.Status != domain.RuntimeStatusDisabled {
+			return rt.BinaryPath, true
+		}
+	}
+	return "", false
+}
+
+// providerArgv builds the non-interactive CLI invocation. task.Args lets a
+// task pass additional flags (for example a model override); the prompt is
+// always the final positional argument so it can never be swallowed as a flag
+// value.
+func providerArgv(provider, binary string, prompt string, extraArgs []string) ([]string, error) {
+	args := append([]string{}, extraArgs...)
+	switch strings.TrimSpace(provider) {
+	case "claude-code":
+		return append([]string{binary}, append(args, "-p", "--output-format", "text", prompt)...), nil
+	case "codex":
+		return append([]string{binary}, append(args, "exec", "--skip-git-repo-check", prompt)...), nil
+	case "codebuddy":
+		// Keep CodeBuddy unattended: bypass permission prompts and terminate
+		// option parsing before the positional prompt.
+		return append([]string{binary}, append(args, "-y", "--permission-mode", "bypassPermissions", "--setting-sources", "user", "--", prompt)...), nil
+	default:
+		return nil, fmt.Errorf("provider %q is not supported by this runner (%s/%s)", provider, goruntime.GOOS, goruntime.GOARCH)
+	}
+}

@@ -1,0 +1,998 @@
+package runtime
+
+import (
+	"agentflow/internal/domain"
+	"agentflow/internal/procwatch"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+)
+
+type dockerSandbox struct {
+	id, name, workspace string
+	profile             domain.SandboxProfile
+	requirements        SandboxRequirements
+	dockerfile          domain.DockerfileDefinition
+	builtImage          string
+	mu                  sync.Mutex
+	browserMu           sync.Mutex
+	started             bool
+	cliSetupOnce        sync.Once
+	cliSetupGate        chan struct{}
+	// execGate lets parallel branches exec concurrently (read side) while a
+	// cwd-recovery Recreate (write side) waits for them instead of docker
+	// rm-ing the container under a sibling's running command.
+	execGate sync.RWMutex
+}
+
+func (s *dockerSandbox) ID() string        { return s.id }
+func (s *dockerSandbox) Workspace() string { return s.workspace }
+func (s *dockerSandbox) Driver() string    { return "docker" }
+
+// Close tears the sandbox down by name rather than by the in-memory started
+// flag. A worker that restarted inherits a live container but a fresh struct
+// with started=false and no builtImage, so trusting those fields leaks the
+// container and its image for good: nothing else ever removes them, and Docker
+// cannot prune a container that is still "running".
+func (s *dockerSandbox) Close(ctx context.Context) error {
+	s.mu.Lock()
+	s.started = false
+	image := s.builtImage
+	s.builtImage = ""
+	s.mu.Unlock()
+	if image == "" {
+		image = tempDockerImageName(s.id)
+	}
+	removeDockerSandbox(ctx, s.name, image)
+	return nil
+}
+
+// removeDockerSandbox drops a sandbox container. Per-run throwaway images
+// (agentflow-tmp-*) are removed with it; content-hashed cache images stay so
+// the next SOP with the same Dockerfile does not rebuild from node:22.
+func removeDockerSandbox(ctx context.Context, container, image string) {
+	if !dockerAvailable() {
+		return
+	}
+	// Retry holds the engine state mutex across this call, so an unresponsive
+	// daemon must not be able to block it indefinitely. rm -f is a SIGKILL and
+	// the sweep retries every 20s, so giving up early costs nothing.
+	ctx, cancel := context.WithTimeout(ctx, dockerTeardownTimeout)
+	defer cancel()
+	if strings.TrimSpace(container) != "" {
+		_ = removeDockerWorkspaceContainers(ctx, container)
+	}
+	if ephemeralDockerImage(image) {
+		_ = exec.CommandContext(ctx, "docker", "rmi", "-f", image).Run()
+	}
+}
+
+const (
+	dockerTeardownTimeout    = 60 * time.Second
+	legacyDockerScriptSuffix = "-scripts"
+)
+
+func removeDockerWorkspaceContainers(ctx context.Context, container string) error {
+	// Older runs can still own a script companion. Reclaim it with the workspace.
+	if err := removeDockerContainer(ctx, container+legacyDockerScriptSuffix); err != nil {
+		return err
+	}
+	removeDockerBrowser(ctx, container)
+	return removeDockerContainer(ctx, container)
+}
+
+func removeDockerContainer(ctx context.Context, name string) error {
+	out, err := exec.CommandContext(ctx, "docker", "rm", "-f", name).CombinedOutput()
+	if err != nil && !dockerObjectGone(string(out), err) {
+		return fmt.Errorf("remove Docker container %s: %w: %s", name, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// dockerAvailable keeps run teardown from spawning processes on control planes
+// that only ever use the local driver. Cleanup runs per finished run and on a
+// 20s sweep, so this is on a hot path.
+var dockerAvailable = sync.OnceValue(func() bool {
+	_, err := exec.LookPath("docker")
+	return err == nil
+})
+
+var dockerReady struct {
+	sync.Mutex
+	checked time.Time
+	ok      bool
+}
+
+// DockerReady reports whether the Docker daemon answers, cached for a minute
+// because the UI asks on every page load.
+func DockerReady() bool {
+	dockerReady.Lock()
+	defer dockerReady.Unlock()
+	if time.Since(dockerReady.checked) < time.Minute {
+		return dockerReady.ok
+	}
+	ok := false
+	if dockerAvailable() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		ok = exec.CommandContext(ctx, "docker", "version", "--format", "{{.Server.Version}}").Run() == nil
+		cancel()
+	}
+	dockerReady.checked, dockerReady.ok = time.Now(), ok
+	return ok
+}
+
+func (s *dockerSandbox) Exec(ctx context.Context, command CommandSpec, sink EventSink) (string, error) {
+	if err := s.ensureStarted(ctx); err != nil {
+		return "", err
+	}
+	s.execGate.RLock()
+	out, err := s.execOnce(ctx, command, sink)
+	s.execGate.RUnlock()
+	if err != nil && isDockerCwdUnsafe(out, err) {
+		s.execGate.Lock()
+		recErr := s.Recreate(ctx)
+		s.execGate.Unlock()
+		if recErr != nil {
+			return out, fmt.Errorf("current working directory is outside of container mount namespace: %w", err)
+		}
+		s.execGate.RLock()
+		out, err = s.execOnce(ctx, command, sink)
+		s.execGate.RUnlock()
+		if err != nil && isDockerCwdUnsafe(out, err) {
+			return out, fmt.Errorf("current working directory is outside of container mount namespace: %w", err)
+		}
+	}
+	// docker CLI reports "No such exec instance" on stderr and exits 1.
+	// The engine only sees `exit status 1` unless that daemon line is kept
+	// on the error; Recreate here would docker rm a still-bound workspace.
+	if err != nil {
+		err = annotateDockerExecError(out, err)
+		if isMissingDockerExec(err) {
+			s.invalidate()
+		}
+	}
+	return out, err
+}
+
+func (s *dockerSandbox) execOnce(ctx context.Context, command CommandSpec, sink EventSink) (out string, err error) {
+	command, cliPath, err := s.prepareSOPCLI(ctx, command)
+	if err != nil {
+		return "", err
+	}
+	args := []string{"exec"}
+	if command.Stdin != nil || isManagedClaude(command) {
+		args = append(args, "-i")
+	}
+	for _, environment := range appendEnvironment(nil, s.profile.Environment, command.environment) {
+		args = append(args, "-e", environment)
+	}
+	if cliPath != "" {
+		args = append(args, "-e", "AGENTFLOW_RUNTIME_CLI_PATH="+cliPath)
+	}
+	toolchain := s.toolchainExecEnv()
+	args = append(args, toolchain...)
+	args = append(args, s.name)
+	argv := dockerWorkspaceExecArgv(command.Argv)
+	if command.WorkingDir != "" {
+		argv = append([]string{"sh", "-lc", dockerMCPCallLaunch + dockerCLISharedPathSetup +
+			`cd "$1" && shift && exec "$@"`, "conversation", command.WorkingDir}, dropShellLoginFlag(command.Argv)...)
+	}
+	processFile := ""
+	if command.OwnProcessGroup {
+		processFile = filepath.Join(s.requirements.ConversationRoot, "home", "tmp", fmt.Sprintf("process-%d.pid", time.Now().UnixNano()))
+		argv = dockerConversationProcessArgv(processFile, argv)
+		defer func() {
+			stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			stopArgs := append(append(append([]string{"exec"}, toolchain...), s.name), dockerConversationStopArgv(processFile)...)
+			if stopErr := exec.CommandContext(stopCtx, "docker", stopArgs...).Run(); stopErr != nil {
+				err = errors.Join(err, fmt.Errorf("停止 CLI 子进程失败: %w", stopErr))
+			}
+		}()
+	}
+	args = append(args, argv...)
+	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd.Stdin = command.Stdin
+	return runCommand(cmd, sink, command)
+}
+
+// dockerWorkspaceExecArgv runs argv inside /workspace without docker exec -w.
+// runc treats a failed getcwd after -w as exit 126 ("cwd outside mount namespace").
+// The outer shell is a login shell so the image profile can set php/composer
+// PATH; helper bin is prepended after that, and an inner `sh -lc` is demoted
+// to `sh -c` so a second login does not wipe the workspace bin.
+func dockerWorkspaceExecArgv(argv []string) []string {
+	launch := dockerMCPCallLaunch + "PATH=$PATH:" + dockerCLISharedPath + "\nexport PATH\n"
+	if len(argv) == 0 {
+		return []string{"sh", "-lc", launch + "pwd"}
+	}
+	return append([]string{"sh", "-lc", launch + `exec "$0" "$@"`}, dropShellLoginFlag(argv)...)
+}
+
+const dockerMCPCallLaunch = `cd /workspace || exit
+if [ -x /workspace/.agentflow/runtime/bin/agentflow-helper ]; then
+  PATH=/workspace/.agentflow/runtime/bin:$PATH
+  export PATH
+fi
+if [ -n "${AGENTFLOW_RUNTIME_CLI_PATH:-}" ] && [ -d "$AGENTFLOW_RUNTIME_CLI_PATH" ]; then
+  PATH=$PATH:$AGENTFLOW_RUNTIME_CLI_PATH
+  export PATH
+fi
+` + toolchainPathSetup
+
+// prepareSOPCLI is limited to the default binaries of registered providers.
+// Explicit executable paths, shell tasks and already prepared chat commands
+// retain their original argv.
+func (s *dockerSandbox) prepareSOPCLI(ctx context.Context, command CommandSpec) (CommandSpec, string, error) {
+	spec, ok := onDemandCLICatalog()[command.Provider]
+	if !ok || len(command.Argv) == 0 || command.Argv[0] != spec.Binary {
+		return command, "", nil
+	}
+	// Probe with the normal command user's PATH. This also finds installs
+	// from earlier nodes without running the privileged preparation again.
+	args := []string{"exec"}
+	path, hasPath := command.environment["PATH"]
+	if !hasPath {
+		path, hasPath = s.profile.Environment["PATH"]
+	}
+	if hasPath {
+		args = append(args, "-e", "PATH="+path)
+	}
+	args = append(append(args, s.toolchainExecEnv()...), s.name)
+	args = append(args, dockerWorkspaceExecArgv([]string{"sh", "-c", dockerCLIProbe, "loopforge-cli-probe", spec.Binary})...)
+	output, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput()
+	if err == nil {
+		return command, "", nil
+	}
+	if !isDockerCLIMissing(err) {
+		return command, "", fmt.Errorf("探测沙箱 CLI %s 失败：%w: %s", spec.Binary, err, conversationSetupOutput(output))
+	}
+	// The published image can use the existing, shared host installations.
+	// Other sandboxes prepare the official CLI in the current container.
+	cliPath, err := s.onDemandCLIPath(ctx, command)
+	if err != nil || cliPath != "" {
+		return command, cliPath, err
+	}
+	binary, err := s.ensureDockerCLI(ctx, command.Provider, "/workspace")
+	if err != nil {
+		return command, "", err
+	}
+	command.Argv = append([]string{binary}, command.Argv[1:]...)
+	return command, "", nil
+}
+
+func isDockerCLIMissing(err error) bool {
+	var exit *exec.ExitError
+	return errors.As(err, &exit) && exit.ExitCode() == 127
+}
+
+// onDemandCLIPath installs a CLI the published runtime image does not bundle
+// (Claude Code and the npm agent CLIs) for sandboxes of that image, and returns
+// the mounted bin directory. It is appended to PATH so a CLI shipped by an
+// older image still takes precedence.
+func (s *dockerSandbox) onDemandCLIPath(ctx context.Context, command CommandSpec) (string, error) {
+	if len(command.Argv) == 0 || RuntimeCLIDir() == "" || isolatedRuntimeImage(s.dockerfile) == "" {
+		return "", nil
+	}
+	spec, ok := onDemandCLICatalog()[command.Provider]
+	if !ok || spec.Bundled || spec.InstallerURL != "" || command.Argv[0] != spec.Binary {
+		return "", nil
+	}
+	if spec.Engine == "claude-code" {
+		if _, err := EnsureClaudeCode(ctx); err != nil {
+			return "", err
+		}
+		return ClaudeCodeBinDir(), nil
+	}
+	path, err := InstallOnDemandCLI(ctx, spec.Engine)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Dir(path), nil
+}
+
+func dropShellLoginFlag(argv []string) []string {
+	if len(argv) == 0 {
+		return argv
+	}
+	switch filepath.Base(argv[0]) {
+	case "sh", "bash", "dash", "zsh":
+	default:
+		return argv
+	}
+	out := []string{argv[0]}
+	for _, arg := range argv[1:] {
+		switch arg {
+		case "-lc", "-cl":
+			out = append(out, "-c")
+		case "-l", "--login":
+			continue
+		default:
+			out = append(out, arg)
+		}
+	}
+	return out
+}
+
+func (s *dockerSandbox) Recreate(ctx context.Context) error {
+	return s.start(ctx, true)
+}
+
+// invalidate drops the cached started flag without docker rm. The next
+// ensureStarted revalidates: a live container on the same workspace bind is
+// restarted and reused, and only a genuinely broken one gets recreated.
+func (s *dockerSandbox) invalidate() {
+	s.mu.Lock()
+	s.started = false
+	s.mu.Unlock()
+}
+
+// BindWorkspace starts the container against the current workspace inode.
+// Unlike Recreate, a healthy container started after checkout is reused so
+// later nodes and retries do not docker rm a live bind.
+func (s *dockerSandbox) BindWorkspace(ctx context.Context) error {
+	return s.ensureStarted(ctx)
+}
+
+func IsCwdMountFailure(err error) bool {
+	return isDockerCwdUnsafe("", err)
+}
+
+// IsSandboxInterrupt reports deploy/restart teardown: context cancel, a
+// SIGTERM'd helper, or Docker destroying the exec/container underneath us.
+// These must park the node for resume instead of consuming MaxAttempts.
+func IsSandboxInterrupt(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "context canceled") ||
+		strings.Contains(msg, "signal: killed") ||
+		strings.Contains(msg, "signal: terminated") ||
+		isMissingDockerExec(err)
+}
+
+func isMissingDockerExec(err error) bool {
+	if err == nil {
+		return false
+	}
+	return looksLikeDockerExecGone(err.Error())
+}
+
+func looksLikeDockerExecGone(text string) bool {
+	msg := strings.ToLower(text)
+	return strings.Contains(msg, "no such exec instance") ||
+		strings.Contains(msg, "no such container") ||
+		strings.Contains(msg, "container not found") ||
+		(strings.Contains(msg, "error response from daemon") && strings.Contains(msg, "is not running"))
+}
+
+func annotateDockerExecError(out string, err error) error {
+	if err == nil || looksLikeDockerExecGone(err.Error()) {
+		return err
+	}
+	excerpt := dockerInterruptExcerpt(out)
+	if excerpt == "" {
+		return err
+	}
+	return fmt.Errorf("%w: %s", err, excerpt)
+}
+
+// dockerInterruptExcerpt returns the docker CLI's own failure line from the
+// tail of out. Everything else in out is agent-controlled text, and an
+// interrupt parks the node without consuming an attempt, so a build log that
+// merely mentions "no such container" must not be able to requeue forever.
+func dockerInterruptExcerpt(out string) string {
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(lines) > dockerInterruptTailLines {
+		lines = lines[len(lines)-dockerInterruptTailLines:]
+	}
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		lower := strings.ToLower(line)
+		if !strings.HasPrefix(lower, "error response from daemon:") && !strings.HasPrefix(lower, "error: no such") {
+			continue
+		}
+		if !looksLikeDockerExecGone(lower) {
+			continue
+		}
+		if len(line) > 300 {
+			return line[:300]
+		}
+		return line
+	}
+	return ""
+}
+
+const dockerInterruptTailLines = 5
+
+func isDockerCwdUnsafe(out string, err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(out + "\n" + err.Error())
+	return strings.Contains(msg, "outside of container mount") || strings.Contains(msg, "container breakout") || strings.Contains(msg, "oci runtime exec failed") || strings.Contains(msg, "exit status 126")
+}
+
+type dockerWorkspaceMounts struct {
+	source      string
+	legacyMasks bool
+}
+
+func inspectDockerWorkspaceMounts(ctx context.Context, name string) (*dockerWorkspaceMounts, error) {
+	out, err := exec.CommandContext(ctx, "docker", "inspect", "--type", "container", "--format", `{{json .Mounts}}`, name).CombinedOutput()
+	if dockerObjectGone(string(out), err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("docker inspect mounts: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	var mounts []struct {
+		Destination, Source string
+	}
+	if err := json.Unmarshal(out, &mounts); err != nil {
+		return nil, fmt.Errorf("decode Docker mounts for %s: %w", name, err)
+	}
+	workspace := &dockerWorkspaceMounts{}
+	for _, mount := range mounts {
+		switch mount.Destination {
+		case "/workspace":
+			workspace.source = mount.Source
+		case "/workspace/.agentflow/isolation/empty-dir", "/workspace/.agentflow/isolation/empty-file":
+			// Older containers keep these binds even when restarted.
+			workspace.legacyMasks = true
+		}
+	}
+	return workspace, nil
+}
+
+func dockerBindMatchesWorkspace(source, workspace string) bool {
+	if strings.TrimSpace(source) == "" || strings.TrimSpace(workspace) == "" {
+		return false
+	}
+	want, err := filepath.Abs(workspace)
+	if err != nil {
+		return false
+	}
+	got, err := filepath.Abs(source)
+	if err != nil {
+		return false
+	}
+	return filepath.Clean(got) == filepath.Clean(want)
+}
+
+// dockerSandboxesUnder maps sandbox container name -> workspace directory name
+// for every container whose /workspace bind lives directly under root.
+//
+// Ownership is decided by the bind mount, not by the name, because a runner
+// daemon sharing the host creates agentflow-rt-* containers against its own
+// workspace root and cleans them up itself.
+func dockerSandboxesUnder(ctx context.Context, root string) (map[string]string, error) {
+	if !dockerAvailable() {
+		return nil, nil
+	}
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return nil, err
+	}
+	ids, err := exec.CommandContext(ctx, "docker", "ps", "-aq", "--filter", "name=^/"+dockerSandboxPrefix).Output()
+	if err != nil {
+		return nil, fmt.Errorf("docker ps: %w", err)
+	}
+	out, err := collectDockerSandboxMounts(ctx, strings.Fields(string(ids)))
+	if err != nil {
+		return nil, err
+	}
+	return parseDockerSandboxMounts(out, absRoot), nil
+}
+
+// dockerSandboxMountFormat is one inspect line: container name, tab, the host
+// path bound at /workspace.
+const dockerSandboxMountFormat = `{{.Name}}` + "\t" + `{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}`
+
+// collectDockerSandboxMounts inspects each container on its own. A container
+// that disappears between ps and inspect is skipped; one failure used to abort
+// the whole reclaim pass.
+func collectDockerSandboxMounts(ctx context.Context, ids []string) (string, error) {
+	var b strings.Builder
+	for _, id := range ids {
+		out, err := exec.CommandContext(ctx, "docker", "inspect", "-f", dockerSandboxMountFormat, id).CombinedOutput()
+		if err != nil {
+			if dockerObjectGone(string(out), err) {
+				continue
+			}
+			return "", fmt.Errorf("docker inspect %s: %w: %s", id, err, strings.TrimSpace(string(out)))
+		}
+		line := strings.TrimSpace(string(out))
+		if line == "" {
+			continue
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	return b.String(), nil
+}
+
+func dockerObjectGone(output string, err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(output + "\n" + err.Error())
+	return strings.Contains(msg, "no such object") ||
+		strings.Contains(msg, "no such container") ||
+		strings.Contains(msg, "container not found")
+}
+
+// parseDockerSandboxMounts reads `docker inspect` lines of "name\tbindSource"
+// and keeps only the containers bound one level under root.
+func parseDockerSandboxMounts(out, absRoot string) map[string]string {
+	found := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		name, source, ok := strings.Cut(strings.TrimSpace(line), "\t")
+		name = strings.TrimPrefix(strings.TrimSpace(name), "/")
+		source = strings.TrimSpace(source)
+		if !ok || name == "" || source == "" {
+			continue
+		}
+		abs, err := filepath.Abs(source)
+		if err != nil || filepath.Dir(abs) != absRoot {
+			continue
+		}
+		found[name] = filepath.Base(abs)
+	}
+	return found
+}
+
+func createDocker(ctx context.Context, id, workspace string, p domain.SandboxProfile, requirements SandboxRequirements, dockerfile domain.DockerfileDefinition) (Sandbox, error) {
+	if strings.TrimSpace(dockerfile.Content) == "" {
+		return nil, fmt.Errorf("docker sandbox requires a dockerfile")
+	}
+	// Delay docker create until the first Exec so the bind-mount is taken
+	// after prepareRepository has cloned into this directory. Creating the
+	// container first, then letting git replace the workspace inode, is the
+	// runc 126 "cwd outside mount namespace" failure.
+	return &dockerSandbox{id: id, name: dockerContainerName(id), workspace: workspace, profile: p, requirements: requirements, dockerfile: dockerfile}, nil
+}
+
+const dockerSandboxPrefix = "agentflow-"
+const dockerCachedImagePrefix = "agentflow-img-"
+const dockerTempImagePrefix = "agentflow-tmp-"
+
+func dockerContainerName(id string) string { return dockerSandboxPrefix + id }
+
+func tempDockerImageName(id string) string { return dockerTempImagePrefix + safeID(id) }
+
+func ephemeralDockerImage(image string) bool {
+	return strings.HasPrefix(strings.TrimSpace(image), dockerTempImagePrefix)
+}
+
+func dropEphemeralDockerImage(image string) {
+	if !ephemeralDockerImage(image) {
+		return
+	}
+	_ = exec.Command("docker", "rmi", "-f", image).Run()
+}
+
+func cachedDockerImageName(dockerfile domain.DockerfileDefinition) string {
+	sum := sha256.Sum256(dockerImageCacheKey(dockerfile))
+	return dockerCachedImagePrefix + hex.EncodeToString(sum[:])[:16]
+}
+
+func dockerImageCacheKey(dockerfile domain.DockerfileDefinition) []byte {
+	var b strings.Builder
+	b.WriteString(dockerfile.Content)
+	b.WriteByte(0)
+	names := make([]string, 0, len(dockerfile.Files))
+	for name := range dockerfile.Files {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		b.WriteString(name)
+		b.WriteByte(0)
+		b.WriteString(dockerfile.Files[name])
+		b.WriteByte(0)
+	}
+	return []byte(b.String())
+}
+
+func dockerImageExists(ctx context.Context, image string) bool {
+	if strings.TrimSpace(image) == "" || !dockerAvailable() {
+		return false
+	}
+	return exec.CommandContext(ctx, "docker", "image", "inspect", image).Run() == nil
+}
+
+// DockerImageCached reports whether this Dockerfile already has a local cache
+// tag. Used by the engine to tell first-run users that a long image build is
+// about to start, instead of looking like the node never began.
+func DockerImageCached(ctx context.Context, dockerfile domain.DockerfileDefinition) bool {
+	if strings.TrimSpace(dockerfile.Content) == "" {
+		return false
+	}
+	if image := isolatedRuntimeImage(dockerfile); image != "" {
+		return dockerImageExists(ctx, image)
+	}
+	return dockerImageExists(ctx, cachedDockerImageName(effectiveIsolatedDockerfile(dockerfile)))
+}
+
+func reclaimCachedDockerImages(ctx context.Context, keep map[string]struct{}) (int, error) {
+	listed, err := listCachedDockerImages(ctx)
+	if err != nil {
+		return 0, err
+	}
+	inUse, err := cachedDockerImagesInUse(ctx)
+	if err != nil {
+		return 0, err
+	}
+	removed := 0
+	for _, image := range staleCachedDockerImages(listed, keep, inUse) {
+		if out, err := exec.CommandContext(ctx, "docker", "rmi", "-f", image).CombinedOutput(); err != nil {
+			return removed, fmt.Errorf("docker rmi %s: %w: %s", image, err, strings.TrimSpace(string(out)))
+		}
+		removed++
+	}
+	return removed, nil
+}
+
+func listCachedDockerImages(ctx context.Context) ([]string, error) {
+	out, err := exec.CommandContext(ctx, "docker", "images", "--format", "{{.Repository}}", "--filter", "reference="+dockerCachedImagePrefix+"*").Output()
+	if err != nil {
+		return nil, fmt.Errorf("docker images: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return parseCachedDockerImageNames(string(out)), nil
+}
+
+func cachedDockerImagesInUse(ctx context.Context) (map[string]struct{}, error) {
+	out, err := exec.CommandContext(ctx, "docker", "ps", "-a", "--format", "{{.Image}}").Output()
+	if err != nil {
+		return nil, fmt.Errorf("docker ps: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	used := map[string]struct{}{}
+	for _, image := range parseCachedDockerImageNames(string(out)) {
+		used[image] = struct{}{}
+	}
+	return used, nil
+}
+
+func parseCachedDockerImageNames(out string) []string {
+	var names []string
+	seen := map[string]struct{}{}
+	for _, line := range strings.Split(out, "\n") {
+		name := normalizeCachedDockerImageName(line)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	return names
+}
+
+func normalizeCachedDockerImageName(raw string) string {
+	name := strings.TrimSpace(raw)
+	if name == "" {
+		return ""
+	}
+	if tag := strings.LastIndex(name, ":"); tag > 0 && !strings.Contains(name[tag:], "/") {
+		name = name[:tag]
+	}
+	if !strings.HasPrefix(name, dockerCachedImagePrefix) {
+		return ""
+	}
+	return name
+}
+
+func staleCachedDockerImages(listed []string, keep, inUse map[string]struct{}) []string {
+	var stale []string
+	for _, image := range listed {
+		if !strings.HasPrefix(image, dockerCachedImagePrefix) {
+			continue
+		}
+		if _, ok := keep[image]; ok {
+			continue
+		}
+		if _, ok := inUse[image]; ok {
+			continue
+		}
+		stale = append(stale, image)
+	}
+	return stale
+}
+
+func (s *dockerSandbox) ensureStarted(ctx context.Context) error {
+	return s.start(ctx, false)
+}
+
+func (s *dockerSandbox) start(ctx context.Context, recreate bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.started && !recreate {
+		return nil
+	}
+	s.started = false
+	name, workspace, p := s.name, s.workspace, s.profile
+	mounts, err := inspectDockerWorkspaceMounts(ctx, name)
+	if err != nil {
+		return err
+	}
+	if mounts != nil {
+		if !dockerBindMatchesWorkspace(mounts.source, workspace) {
+			return fmt.Errorf("docker sandbox %s is bound to %s, not %s", name, mounts.source, workspace)
+		}
+		if !recreate && !mounts.legacyMasks {
+			if err := exec.CommandContext(ctx, "docker", "start", name).Run(); err == nil {
+				if err := waitDockerWorkspaceReady(ctx, name); err == nil {
+					s.started = true
+					return nil
+				}
+			}
+		}
+	}
+	built, err := ensureDockerImage(ctx, workspace, s.dockerfile)
+	if err != nil {
+		return err
+	}
+	image := built
+	args := []string{"create", "--name", name, "--init", "--cap-drop=ALL", "--security-opt", "no-new-privileges", "-v", workspace + ":/workspace"}
+	// Native installs own private (0700) workspaces as the service user.
+	// A root image without DAC capabilities cannot access another UID's bind.
+	// Run default/root images as that user; retain explicit non-root image users.
+	if os.Geteuid() != 0 {
+		configured, err := exec.CommandContext(ctx, "docker", "image", "inspect", "--format", "{{.Config.User}}", image).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("inspect sandbox image user: %w: %s", err, strings.TrimSpace(string(configured)))
+		}
+		user, _, _ := strings.Cut(strings.TrimSpace(string(configured)), ":")
+		if user == "" || user == "root" || user == "0" {
+			args = append(args, "--user", fmt.Sprintf("%d:%d", os.Geteuid(), os.Getegid()))
+		}
+	}
+	network := strings.TrimSpace(os.Getenv("AGENTFLOW_DOCKER_NETWORK"))
+	if s.requirements.ConversationRoot != "" || s.requirements.RunnerLoginRelay {
+		_, relayNetwork, err := conversationDockerAccess(ctx)
+		if err != nil {
+			return err
+		}
+		if relayNetwork != "" {
+			network = relayNetwork
+		}
+		args = append(args, "--add-host", "host.docker.internal:host-gateway")
+	}
+	if network != "" {
+		args = append(args, "--network", network)
+	}
+	if root := s.requirements.ConversationRoot; root != "" {
+		args = append(args, "-v", root+":"+root+":ro", "-v", filepath.Join(root, "home")+":"+filepath.Join(root, "home"), "-v", workspace+":"+filepath.Join(root, "ws"))
+		guards, err := conversationGuardMounts(root)
+		if err != nil {
+			return err
+		}
+		args = append(args, guards...)
+	}
+	stateArgs, err := dockerAgentStateMountRequirements(s.requirements)
+	if err != nil {
+		return err
+	}
+	args = append(args, stateArgs...)
+	if cliDir := RuntimeCLIDir(); cliDir != "" {
+		if err := os.MkdirAll(cliDir, 0o755); err != nil {
+			return fmt.Errorf("prepare runtime CLI directory: %w", err)
+		}
+		args = append(args, "--mount", "type=bind,src="+cliDir+",dst="+cliDir+",readonly")
+	}
+	if p.ReadOnlyRootFS {
+		args = append(args, "--read-only", "--tmpfs", "/tmp:rw,noexec,nosuid,size=256m")
+	}
+	if image == isolatedRuntimeImage(s.dockerfile) {
+		args = append(args, "--entrypoint", "sh", image, "-lc", "trap : TERM INT; sleep infinity & wait")
+	} else {
+		args = append(args, image, "sh", "-lc", "trap : TERM INT; sleep infinity & wait")
+	}
+	// Resolve the replacement image and mounts before retiring a workspace with
+	// legacy masks. Its new container ID invalidates old preparation receipts.
+	if mounts != nil || recreate {
+		if err := removeDockerWorkspaceContainers(ctx, name); err != nil {
+			return err
+		}
+	}
+	s.builtImage = built
+	if out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput(); err != nil {
+		dropEphemeralDockerImage(s.builtImage)
+		s.builtImage = ""
+		return fmt.Errorf("docker create: %w: %s", err, out)
+	}
+	if out, err := exec.CommandContext(ctx, "docker", "start", name).CombinedOutput(); err != nil {
+		_ = exec.CommandContext(ctx, "docker", "rm", "-f", name).Run()
+		dropEphemeralDockerImage(s.builtImage)
+		s.builtImage = ""
+		return fmt.Errorf("docker start: %w: %s", err, out)
+	}
+	if err := waitDockerWorkspaceReady(ctx, name); err != nil {
+		_ = exec.Command("docker", "rm", "-f", name).Run()
+		s.started = false
+		return err
+	}
+	s.started = true
+	return nil
+}
+
+func waitDockerWorkspaceReady(ctx context.Context, name string) error {
+	deadline := time.Now().Add(20 * time.Second)
+	var lastOut []byte
+	var lastErr error
+	for {
+		cmd := exec.CommandContext(ctx, "docker", "exec", name, "sh", "-lc", "cd /workspace && pwd")
+		lastOut, lastErr = cmd.CombinedOutput()
+		if lastErr == nil && strings.Contains(string(lastOut), "/workspace") {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if time.Now().After(deadline) {
+			if lastErr == nil {
+				lastErr = fmt.Errorf("unexpected pwd output %q", strings.TrimSpace(string(lastOut)))
+			}
+			return fmt.Errorf("docker workspace not ready: %w: %s", lastErr, strings.TrimSpace(string(lastOut)))
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+func dockerBuildArgs(image, contextDir string) []string {
+	return []string{"build", "-t", image, contextDir}
+}
+
+func prepareDockerfileBuildContext(workspace string, dockerfile domain.DockerfileDefinition) (string, error) {
+	if strings.TrimSpace(dockerfile.Content) == "" {
+		return "", fmt.Errorf("dockerfile content is empty")
+	}
+	contextID, err := catalogDirName(dockerfile.ID)
+	if err != nil {
+		contextID = "default"
+	}
+	root, err := resetControlDirectory(workspace, "docker", contextID)
+	if err != nil {
+		return "", err
+	}
+	if err := writeManagedFile(workspace, filepath.Join(root, "Dockerfile"), []byte(dockerfile.Content), 0o600); err != nil {
+		return "", err
+	}
+	for name, data := range dockerfile.Files {
+		if err := domain.ValidateRelativeFilePath(name); err != nil {
+			return "", fmt.Errorf("dockerfile file: %w", err)
+		}
+		if filepath.Base(name) == "Dockerfile" && filepath.Dir(filepath.FromSlash(name)) == "." {
+			continue
+		}
+		target := filepath.Join(root, filepath.FromSlash(filepath.Clean(name)))
+		rel, relErr := filepath.Rel(root, target)
+		if relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+			return "", fmt.Errorf("invalid dockerfile file path %q", name)
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return "", err
+		}
+		if err := writeManagedFile(workspace, target, []byte(data), 0o644); err != nil {
+			return "", err
+		}
+	}
+	return root, nil
+}
+
+func ensureDockerImage(ctx context.Context, workspace string, dockerfile domain.DockerfileDefinition) (string, error) {
+	if image := isolatedRuntimeImage(dockerfile); image != "" {
+		if !dockerImageExists(ctx, image) {
+			return "", fmt.Errorf("isolated runtime image %q is not available in the sandbox Docker daemon", image)
+		}
+		return image, nil
+	}
+	dockerfile = effectiveIsolatedDockerfile(dockerfile)
+	image := cachedDockerImageName(dockerfile)
+	if dockerImageExists(ctx, image) {
+		return image, nil
+	}
+	contextDir, err := prepareDockerfileBuildContext(workspace, dockerfile)
+	if err != nil {
+		return "", err
+	}
+	args := dockerBuildArgs(image, contextDir)
+	watch := dockerBuildWatch(dockerfile)
+	report := DockerBuildProgressObserver(ctx)
+	build := func(ctx context.Context) *exec.Cmd {
+		cmd := exec.CommandContext(ctx, "docker", args...)
+		if report != nil {
+			cmd.Env = append(cmd.Environ(), "BUILDKIT_PROGRESS=plain")
+		}
+		return cmd
+	}
+	var buildID string
+	if report != nil {
+		buildID = rand.Text()
+		step := "启动构建"
+		report(domain.WorkspaceImageBuildProgress{ID: buildID, Step: step})
+		watch.OnLine = func(line string) {
+			if next := dockerBuildStep(line); next != "" && next != step {
+				step = next
+				report(domain.WorkspaceImageBuildProgress{ID: buildID, Step: step})
+			}
+		}
+	}
+	tail, err := procwatch.Run(ctx, build, watch)
+	if report != nil {
+		report(domain.WorkspaceImageBuildProgress{ID: buildID, Done: true, Failed: err != nil})
+	}
+	if err != nil {
+		// Only the tail: a build killed after minutes of apt output used to
+		// carry all of it in the error.
+		return "", fmt.Errorf("docker build: %w: %s", err, tail)
+	}
+	return image, nil
+}
+
+// A Dockerfile step can work quietly for an arbitrary amount of time.
+// Apply an output-based limit only when explicitly configured.
+const (
+	dockerBuildStallEnv   = "AGENTFLOW_DOCKER_BUILD_STALL_TIMEOUT"
+	dockerBuildTimeoutEnv = "AGENTFLOW_DOCKER_BUILD_TIMEOUT"
+)
+
+func dockerBuildWatch(dockerfile domain.DockerfileDefinition) procwatch.Options {
+	name := strings.TrimSpace(dockerfile.Name)
+	if name == "" {
+		name = strings.TrimSpace(dockerfile.ID)
+	}
+	label := "构建沙箱镜像"
+	if name != "" {
+		label += " " + name
+	}
+	return procwatch.Options{
+		Stage: "image", Label: label,
+		Stall: procwatch.DurationEnv(dockerBuildStallEnv, 0), StallEnv: dockerBuildStallEnv,
+		Timeout: procwatch.DurationEnv(dockerBuildTimeoutEnv, 0), TimeoutEnv: dockerBuildTimeoutEnv,
+	}
+}
+
+func isolatedRuntimeImage(dockerfile domain.DockerfileDefinition) string {
+	if !isBuiltInIsolatedDockerfile(dockerfile) {
+		return ""
+	}
+	return strings.TrimSpace(os.Getenv("AGENTFLOW_ISOLATED_IMAGE"))
+}
+
+const isolatedDockerfileBase = "FROM node:22-bookworm\nRUN apt-get update && apt-get install -y --no-install-recommends git openssh-client python3 ripgrep ca-certificates curl && rm -rf /var/lib/apt/lists/*\n"
+const legacyIsolatedDockerfile = isolatedDockerfileBase + "RUN npm install -g @openai/codex @anthropic-ai/claude-code @tencent-ai/codebuddy-code\nWORKDIR /workspace\n"
+
+// IsolatedDockerfile is the platform image recipe. Sandboxes whose Dockerfile
+// is this or the seeded generic-docker one (legacyIsolatedDockerfile) run on
+// AGENTFLOW_ISOLATED_IMAGE instead of building their own image.
+const IsolatedDockerfile = isolatedDockerfileBase + "RUN npm install -g @openai/codex @anthropic-ai/claude-code\nARG CODEBUDDY_PACKAGE=@tencent-ai/codebuddy-code\nRUN if [ -n \"$CODEBUDDY_PACKAGE\" ]; then npm install -g \"$CODEBUDDY_PACKAGE\"; fi\nWORKDIR /workspace\n"
+
+func isBuiltInIsolatedDockerfile(dockerfile domain.DockerfileDefinition) bool {
+	return len(dockerfile.Files) == 0 && (dockerfile.Content == IsolatedDockerfile || dockerfile.Content == legacyIsolatedDockerfile)
+}
+
+func effectiveIsolatedDockerfile(dockerfile domain.DockerfileDefinition) domain.DockerfileDefinition {
+	if os.Getenv("AGENTFLOW_SKIP_CODEBUDDY_INSTALL") == "1" && isBuiltInIsolatedDockerfile(dockerfile) {
+		dockerfile.Content = strings.Replace(IsolatedDockerfile, "ARG CODEBUDDY_PACKAGE=@tencent-ai/codebuddy-code", "ARG CODEBUDDY_PACKAGE=", 1)
+	}
+	return dockerfile
+}

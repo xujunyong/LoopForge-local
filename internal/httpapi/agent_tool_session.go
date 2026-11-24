@@ -1,0 +1,563 @@
+package httpapi
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"log"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"agentflow/internal/domain"
+)
+
+type AgentToolMode string
+
+const (
+	AgentToolClarify   AgentToolMode = "clarify"
+	AgentToolAssistant AgentToolMode = "assistant"
+	// Legacy gateway mode; AI scheduled tasks use AgentToolAssistant in full access.
+	AgentToolScheduled AgentToolMode = "scheduled"
+	AgentToolReport    AgentToolMode = "report"
+)
+
+const (
+	agentToolSessionTokenBytes = 32
+	agentToolSessionDefaultTTL = 5 * time.Minute
+	agentToolJanitorInterval   = 30 * time.Second
+)
+
+type AgentTerminalKind string
+
+const (
+	AgentTerminalClarification AgentTerminalKind = "clarification"
+	AgentTerminalAssistant     AgentTerminalKind = "assistant"
+	AgentTerminalReport        AgentTerminalKind = "report"
+)
+
+type AgentTerminalResult struct {
+	Kind          AgentTerminalKind
+	Clarification *clarifyModelResult
+	Assistant     *assistantReply
+	Report        *domain.AINotificationContent
+}
+
+// AgentToolSession is an in-process MCP gateway binding for one model turn.
+// Its lifetime follows the turn, including turns without a deadline.
+// The token is CSPRNG random and is never logged or returned to
+// the browser.
+type AgentToolSession struct {
+	toolsMu           sync.RWMutex
+	pendingMode       string
+	modeAction        func(context.Context) error
+	SelectedMCPIDs    map[string]bool
+	ExecutionRunnerID string
+	runnerLogin       bool
+	transient         bool
+	RuntimeMode       string
+	Notify            func(string, any)
+	Token             string
+	UserID            int64
+	ProjectID         string
+	Mode              AgentToolMode
+	IssueID           string
+	WorkspaceToken    string
+	RunID             string
+	// ChatSessionID/ChatOwnerID identify the ordinary conversation this turn
+	// belongs to, so Main Bot can open and bind a temporary workspace there.
+	ChatSessionID string
+	ChatOwnerID   int64
+	// turnMessages is the transcript this chat request is sending. A new
+	// personal session is stored only after the reply, so proposal checks
+	// read the request before the saved session.
+	turnMessages     []assistantMessage
+	SandboxProfileID string
+	// workspaceRunID is the one workspace an ordinary conversation is bound
+	// to: one it opened itself, or the SOP run of an issue.
+	workspaceRunID string
+	workspaceMu    sync.Mutex
+	workspaceTurn  *assistantWorkspaceTurn
+	SpaceID        string
+	Surface        string // entry of the turn; see sopDesigner
+	// DesignerCanvas is the canvas a designer turn edits; operations in its
+	// workflows_save draft are applied to it.
+	DesignerCanvas   json.RawMessage
+	ControlScope     assistantControlScope
+	ExpiresAt        time.Time
+	MCPServers       []domain.MCPServerDefinition
+	User             domain.User
+	AttachmentIDs    map[string]bool
+	AttachmentOwners map[string]int64
+	ExecMode         assistantExecMode
+	approvalReviewer assistantApprovalReviewer
+	Final            chan AgentTerminalResult
+
+	mu           sync.Mutex
+	clarifyRepos map[string]string // read-only analysis checkouts for this turn
+	catalog      []agentToolDescriptor
+	terminalOnly bool
+	runIDs       []string
+	assets       []domain.AssistantAssetRef
+	// replyFiles are what Main Bot handed the user this turn: browser
+	// screenshots and workspace files it attached. Tool results never reach
+	// the transcript, so the turn stores these as attachments of its reply.
+	replyFiles    []agentReplyFile
+	screenshotSeq int
+	// dispatches are the Agent calls still running this turn. A subagent
+	// works in the bound workspace, so it is not switched under it.
+	// The value is the subagent id once the stream reports it.
+	dispatches map[string]string
+	// nativeReviews are the assisted-mode reviews of external writes this
+	// phase, by approval ID; hook polls read the verdict here.
+	nativeReviews map[string]*agentNativeReview
+	// toolCalls cancels the tools/call requests still running, by JSON-RPC
+	// id, when the CLI sends notifications/cancelled for them.
+	toolCalls map[string]*agentToolCallCancel
+	// gitHosts maps each host an HTTPS Git token was handed out for this turn
+	// onto its platform, for the end-of-turn PR scan. gitScrubbed names the
+	// credentials the agent wrote by hand that were removed after its CLI.
+	gitHosts          map[string]string
+	gitScrubbed       []string
+	nativePhaseClosed atomic.Bool
+	closed            atomic.Bool
+	committed         atomic.Bool
+	ctx               context.Context
+	stopContext       func() bool // protected by mu
+	CancelModel       context.CancelFunc
+}
+
+type agentReplyFile struct {
+	Name       string
+	MimeType   string
+	Data       []byte
+	Screenshot bool
+}
+
+type agentNativeReview struct {
+	digest string
+	done   chan struct{}
+	result assistantApprovalReview
+}
+
+// nativeReview starts the review of one exact native invocation on the first
+// poll and waits up to wait for its verdict; done is false when the hook has
+// to poll again. ok is false when the approval ID is reused for different
+// input. The review follows the turn's context, so a stopped turn cancels it.
+func (s *AgentToolSession) nativeReview(ctx context.Context, wait time.Duration, id, digest string, review func(context.Context) assistantApprovalReview) (assistantApprovalReview, bool, bool) {
+	s.mu.Lock()
+	item, found := s.nativeReviews[id]
+	if !found {
+		if s.nativeReviews == nil {
+			s.nativeReviews = map[string]*agentNativeReview{}
+		}
+		item = &agentNativeReview{digest: digest, done: make(chan struct{})}
+		s.nativeReviews[id] = item
+	}
+	s.mu.Unlock()
+	if item.digest != digest {
+		return assistantApprovalReview{}, false, false
+	}
+	if !found {
+		parent := s.ctx
+		if parent == nil {
+			parent = context.Background()
+		}
+		go func() {
+			ctx, cancel := context.WithTimeout(parent, nativeReviewBudget)
+			defer cancel()
+			item.result = review(ctx)
+			close(item.done)
+		}()
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-item.done:
+		return item.result, true, true
+	case <-timer.C:
+	case <-ctx.Done():
+	}
+	return assistantApprovalReview{}, false, true
+}
+
+const (
+	agentReplyScreenshotLimit = 4
+	agentReplyFileLimit       = 4
+)
+
+// addReplyScreenshot keeps the latest screenshots of the turn. An unchanged
+// frame is skipped so checking the same page twice does not repeat it.
+func (s *AgentToolSession) addReplyScreenshot(mimeType string, data []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	count := 0
+	for _, f := range s.replyFiles {
+		if !f.Screenshot {
+			continue
+		}
+		if bytes.Equal(f.Data, data) {
+			return
+		}
+		count++
+	}
+	if count >= agentReplyScreenshotLimit {
+		for i, f := range s.replyFiles {
+			if f.Screenshot {
+				s.replyFiles = append(s.replyFiles[:i:i], s.replyFiles[i+1:]...)
+				break
+			}
+		}
+	}
+	s.screenshotSeq++
+	ext := map[string]string{"image/png": ".png", "image/gif": ".gif", "image/webp": ".webp"}[mimeType]
+	if ext == "" {
+		ext = ".jpg"
+	}
+	s.replyFiles = append(s.replyFiles, agentReplyFile{Name: fmt.Sprintf("browser-screenshot-%d%s", s.screenshotSeq, ext), MimeType: mimeType, Data: data, Screenshot: true})
+}
+
+// attachReplyFile adds a file to the reply; attaching the same name again
+// replaces it, so a demo revised during the turn is delivered once, current.
+func (s *AgentToolSession) attachReplyFile(name, mimeType string, data []byte) error {
+	return s.addReplyFile(name, mimeType, data, true)
+}
+
+// addReplyFile stores a file of this turn's reply. limited applies the
+// per-turn cap meant for the model's own attachments; a role's collected
+// deliverables are bounded by its contract instead.
+func (s *AgentToolSession) addReplyFile(name, mimeType string, data []byte, limited bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	files := 0
+	for i, f := range s.replyFiles {
+		if f.Screenshot {
+			continue
+		}
+		if f.Name == name {
+			s.replyFiles[i] = agentReplyFile{Name: name, MimeType: mimeType, Data: data}
+			return nil
+		}
+		files++
+	}
+	if limited && files >= agentReplyFileLimit {
+		return fmt.Errorf("每轮最多附 %d 个文件", agentReplyFileLimit)
+	}
+	s.replyFiles = append(s.replyFiles, agentReplyFile{Name: name, MimeType: mimeType, Data: data})
+	return nil
+}
+
+func (s *AgentToolSession) takeReplyFiles() []agentReplyFile {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := s.replyFiles
+	s.replyFiles = nil
+	return out
+}
+
+// SetTerminalOnly drops read/query tools so a retry turn can only submit.
+func (s *AgentToolSession) SetTerminalOnly() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.terminalOnly = true
+	s.catalog = nil
+	s.MCPServers = nil
+	s.mu.Unlock()
+}
+
+type agentToolSessionRegistry struct {
+	mu       sync.Mutex
+	sessions map[string]*AgentToolSession
+}
+
+var (
+	agentToolSessions    = newAgentToolSessionRegistry()
+	agentToolJanitorOnce sync.Once
+)
+
+func newAgentToolSessionRegistry() *agentToolSessionRegistry {
+	return &agentToolSessionRegistry{sessions: map[string]*AgentToolSession{}}
+}
+
+func resetAgentToolSessionsForTest() {
+	agentToolSessions = newAgentToolSessionRegistry()
+}
+
+func ensureAgentToolJanitor() {
+	agentToolJanitorOnce.Do(func() {
+		go agentToolSessions.janitor()
+	})
+}
+
+func newAgentToolSessionToken() (string, error) {
+	var raw [agentToolSessionTokenBytes]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(raw[:]), nil
+}
+
+func (r *agentToolSessionRegistry) create(session *AgentToolSession) error {
+	if session == nil {
+		return errAgentToolInvalidSession
+	}
+	token := strings.TrimSpace(session.Token)
+	if token == "" {
+		var err error
+		token, err = newAgentToolSessionToken()
+		if err != nil {
+			return err
+		}
+		session.Token = token
+	}
+	if session.Final == nil {
+		session.Final = make(chan AgentTerminalResult, 1)
+	}
+	if session.ctx != nil {
+		if err := session.ctx.Err(); err != nil {
+			return err
+		}
+		// A live turn without a deadline must not inherit the fallback TTL
+		// used by standalone bindings. Cancellation and Close revoke it.
+		session.ExpiresAt, _ = session.ctx.Deadline()
+	} else if session.ExpiresAt.IsZero() {
+		session.ExpiresAt = time.Now().Add(agentToolSessionDefaultTTL)
+	}
+	r.mu.Lock()
+	if r.sessions == nil {
+		r.sessions = map[string]*AgentToolSession{}
+	}
+	r.sessions[token] = session
+	r.mu.Unlock()
+	if session.ctx != nil {
+		session.mu.Lock()
+		if !session.closed.Load() {
+			session.stopContext = context.AfterFunc(session.ctx, func() { r.delete(token) })
+		}
+		session.mu.Unlock()
+	}
+	ensureAgentToolJanitor()
+	return nil
+}
+
+func (r *agentToolSessionRegistry) get(token string) (*AgentToolSession, bool) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return nil, false
+	}
+	r.mu.Lock()
+	session, ok := r.sessions[token]
+	r.mu.Unlock()
+	if !ok || session == nil {
+		return nil, false
+	}
+	if session.expired(time.Now()) {
+		r.delete(token)
+		return nil, false
+	}
+	return session, true
+}
+
+func (r *agentToolSessionRegistry) delete(token string) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return
+	}
+	r.mu.Lock()
+	session, ok := r.sessions[token]
+	if ok {
+		delete(r.sessions, token)
+	}
+	r.mu.Unlock()
+	if session != nil {
+		session.shutdown()
+	}
+}
+
+func (r *agentToolSessionRegistry) janitor() {
+	ticker := time.NewTicker(agentToolJanitorInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		r.purgeExpired(time.Now())
+	}
+}
+
+func (r *agentToolSessionRegistry) purgeExpired(now time.Time) {
+	r.mu.Lock()
+	var stale []*AgentToolSession
+	for token, session := range r.sessions {
+		if session == nil || session.expired(now) {
+			delete(r.sessions, token)
+			if session != nil {
+				stale = append(stale, session)
+			}
+		}
+	}
+	r.mu.Unlock()
+	for _, session := range stale {
+		session.shutdown()
+	}
+}
+
+func (s *AgentToolSession) expired(now time.Time) bool {
+	if s == nil {
+		return true
+	}
+	if s.ctx != nil && s.ctx.Err() != nil {
+		return true
+	}
+	return !s.ExpiresAt.IsZero() && !s.ExpiresAt.After(now)
+}
+
+func (s *AgentToolSession) shutdown() {
+	if s == nil {
+		return
+	}
+	closing := s.closed.CompareAndSwap(false, true)
+	s.mu.Lock()
+	if s.stopContext != nil {
+		s.stopContext()
+		s.stopContext = nil
+	}
+	s.mu.Unlock()
+	if closing && s.CancelModel != nil {
+		s.CancelModel()
+	}
+}
+
+func (s *AgentToolSession) Close() {
+	if s == nil {
+		return
+	}
+	agentToolSessions.delete(s.Token)
+}
+
+func (s *AgentToolSession) finished() bool {
+	return s != nil && s.committed.Load()
+}
+
+func (s *AgentToolSession) commitFinal(result AgentTerminalResult) error {
+	if s == nil {
+		return errAgentToolInvalidSession
+	}
+	if s.expired(time.Now()) {
+		return errAgentToolInvalidSession
+	}
+	if !s.closed.CompareAndSwap(false, true) {
+		return errAgentToolTerminalCommitted
+	}
+	select {
+	case s.Final <- result:
+	default:
+	}
+	s.committed.Store(true)
+	if s.CancelModel != nil {
+		s.CancelModel()
+	}
+	logAgentToolEvent("terminal", "mode="+string(s.Mode), "kind="+string(result.Kind), "ok=1")
+	return nil
+}
+
+func (s *AgentToolSession) takeFinal() (AgentTerminalResult, bool) {
+	if s == nil || s.Final == nil {
+		return AgentTerminalResult{}, false
+	}
+	select {
+	case result := <-s.Final:
+		return result, true
+	default:
+		return AgentTerminalResult{}, false
+	}
+}
+
+func logAgentToolEvent(event string, fields ...string) {
+	parts := make([]string, 0, 1+len(fields))
+	parts = append(parts, event)
+	for _, field := range fields {
+		if strings.TrimSpace(field) == "" {
+			continue
+		}
+		lower := strings.ToLower(field)
+		if strings.Contains(lower, "authorization") || strings.Contains(lower, "token=") || strings.Contains(lower, "bearer ") {
+			continue
+		}
+		parts = append(parts, field)
+	}
+	log.Printf("agent-tool %s", strings.Join(parts, " "))
+}
+
+func logAgentProtocolFailure(mode AgentToolMode, modelID, class string, err error) {
+	reason := class
+	if err != nil {
+		msg := strings.TrimSpace(err.Error())
+		if msg != "" {
+			reason = class + ":" + truncateRunes(msg, 160)
+		}
+	}
+	logAgentToolEvent("protocol-failure", "mode="+string(mode), "model="+strings.TrimSpace(modelID), "class="+reason)
+}
+
+func (s *AgentToolSession) terminalToolsOnly() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.terminalOnly
+}
+
+// trackDispatch follows Main Bot's Agent calls from the CLI stream: a call
+// starts running when it is announced and stops when its result arrives. It
+// returns the subagent type of a dispatch that just finished without error.
+func (s *AgentToolSession) trackDispatch(event assistantStreamEvent) string {
+	if s == nil || event.ID == "" || event.Parent != "" {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch {
+	case event.Kind == "tool" && (event.Tool == "Agent" || event.Tool == "Task"):
+		if s.dispatches == nil {
+			s.dispatches = map[string]string{}
+		}
+		// The CLI announces the call before its input; keep the type once known.
+		if event.Subagent != "" || s.dispatches[event.ID] == "" {
+			s.dispatches[event.ID] = event.Subagent
+		}
+	case event.Kind == "toolDone":
+		subagent, ok := s.dispatches[event.ID]
+		delete(s.dispatches, event.ID)
+		if ok && !event.Failed {
+			return subagent
+		}
+	}
+	return ""
+}
+
+func (s *AgentToolSession) dispatchRunning() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.dispatches) > 0
+}
+
+func (s *AgentToolSession) diagnostics() *assistantDiagnosticsCollector {
+	if s == nil || s.ctx == nil {
+		return nil
+	}
+	return assistantDiagnosticsFrom(s.ctx)
+}
+
+// sopDesigner reports a SOP designer turn: read-only platform tools plus one
+// workflows_save draft, no workspace, browser or external MCP.
+func (s *AgentToolSession) sopDesigner() bool {
+	return s != nil && s.Surface == assistantSurfaceSOPDesigner
+}

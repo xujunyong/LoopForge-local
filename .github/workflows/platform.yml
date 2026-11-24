@@ -1,0 +1,260 @@
+name: platform
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+permissions:
+  contents: read
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      REAL_BROWSER_TESTS: '^(TestMainBotBrowserStartsAndDrivesRunBrowser|TestBrowserStreamPushesFramesAndRunsCommands|TestRunnerStartsPanelBrowserInRunSandbox|TestBrowserAgentOperationsDriveRealChromium|TestBrowserScrollEndsOnASharpFrame)$'
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: '22'
+      - run: python3 scripts/test-install.py -v
+      - name: Build and test the chatbot frontend embedded by the platform binary
+        run: bash scripts/build-chatbot.sh
+      - name: Let Chromium use its sandbox as an unprivileged user
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      # Engine and API tests run SOP nodes in the shared test-native sandbox,
+      # which is bwrap on Linux.
+      - name: Install bubblewrap for the native sandbox
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - name: Warm up Chromium so the first real-browser test does not pay the cold start
+        run: |
+          for name in chromium chromium-browser google-chrome-stable google-chrome; do
+            bin=$(command -v "$name") && break
+          done
+          echo "Chromium: $bin"
+          time timeout 120 "$bin" --headless=new --no-first-run --disable-gpu \
+            --user-data-dir="$RUNNER_TEMP/chromium-warmup" --dump-dom about:blank >/dev/null
+      # Real-Chromium tests run on their own: alongside the rest of the suite
+      # the browser can miss its DevTools liveness check on a loaded runner.
+      # Collect both isolated runs with identical instrumentation, then gate
+      # their union without rerunning the suite or counting a statement twice.
+      - name: Non-browser Go tests
+        run: go test -p=2 ./... -count=1 -timeout=600s -skip "$REAL_BROWSER_TESTS" -covermode=set -coverpkg=agentflow/internal/... -coverprofile="${{ runner.temp }}/go.cover"
+      - name: Real-browser Go tests
+        run: go test -p=1 ./internal/httpapi ./internal/runner ./internal/runtime -count=1 -timeout=300s -run "$REAL_BROWSER_TESTS" -v -covermode=set -coverpkg=agentflow/internal/... -coverprofile="${{ runner.temp }}/go-browser.cover"
+      - name: Coverage gate regression tests
+        run: python3 scripts/test-coverage-go.py -v
+      - name: Go statement coverage gate
+        run: |
+          min=$(tr -d '[:space:]' < scripts/coverage-go.min)
+          test -n "$min"
+          bash scripts/coverage-go.sh --profile "${{ runner.temp }}/go.cover" --profile "${{ runner.temp }}/go-browser.cover" --min "$min"
+      - name: Browser-free UI tests for the platform console
+        run: npm ci --no-audit --no-fund && npm run coverage
+        working-directory: webtest
+      - name: Install pinned CLIs for local protocol acceptance
+        run: npm install --global @openai/codex@0.162.1 @anthropic-ai/claude-code@2.1.300
+      - name: Check real CLI credentials, MCP, stream parsing and native-tool restrictions
+        env:
+          AGENTFLOW_TEST_NATIVE_PROVIDERS: '1'
+        run: go test -p=2 ./internal/httpapi ./internal/runtime -run 'TestAssistantNativeProviderGateway|TestNativeProviderCustomGateway|TestFeatureModelsWithoutCodeBuddy' -count=1 -v
+      - run: go vet ./...
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+      - run: python3 scripts/collect-go-notices.py
+      - run: python3 scripts/check-public.py
+      - name: Secret scanner download regression tests
+        run: python3 scripts/test-scan-secrets.py -v
+      - run: bash scripts/scan-secrets.sh
+        env:
+          LOOPFORGE_GITLEAKS_TOKEN: ${{ github.token }}
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      AGENTFLOW_E2E_TOKEN_FILE: ${{ github.workspace }}/e2e/.auth/api-token
+      AGENTFLOW_E2E_DOCKER: '1'
+      LOOPFORGE_UNCONFIGURED_USER: e2e-no-key
+      LOOPFORGE_UNCONFIGURED_PASSWORD_FILE: ${{ github.workspace }}/.local/no-key-password
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: '22'
+      - run: npm ci
+        working-directory: e2e
+      - run: npm audit --audit-level=high
+        working-directory: e2e
+      - run: bash ../scripts/install-playwright-deps.sh npx playwright
+        working-directory: e2e
+      # The e2e SOPs and the runner the suite starts use the native e2e sandbox,
+      # which is bwrap on Linux.
+      - name: Let bubblewrap create user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Install bubblewrap for the native sandbox
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      # The welcome SOP runs in generic-docker. As in a Compose installation, it
+      # uses the pinned platform image instead of building one during the tests.
+      - name: Pull the pinned platform image for the generic-docker sandbox
+        run: |
+          pinned=$(sed -n 's/^ *image: \${LOOPFORGE_IMAGE:-\(.*\)}$/\1/p' compose.yaml)
+          docker pull --quiet "$pinned"
+          echo "AGENTFLOW_ISOLATED_IMAGE=$pinned" >> "$GITHUB_ENV"
+      - name: Start clean local installation
+        run: |
+          bash scripts/dev.sh > /tmp/loopforge.log 2>&1 &
+          for attempt in $(seq 1 300); do
+            if curl -fsS http://127.0.0.1:8090/api/health; then exit 0; fi
+            sleep 2
+          done
+          cat /tmp/loopforge.log
+          exit 1
+      - name: Provision account without model credentials
+        run: |
+          python3 -c 'import pathlib,secrets; p=pathlib.Path(".local/no-key-password"); p.write_text(secrets.token_urlsafe(20)); p.chmod(0o600)'
+          node --input-type=module <<'JS'
+          import fs from 'node:fs';
+          const base=process.env.AGENTFLOW_E2E_BASE || 'http://127.0.0.1:8090';
+          const password=fs.readFileSync(process.env.LOOPFORGE_UNCONFIGURED_PASSWORD_FILE,'utf8').trim();
+          const response=await fetch(base+'/api/auth/register',{
+            method:'POST',headers:{Origin:base,'Content-Type':'application/json'},
+            body:JSON.stringify({login:process.env.LOOPFORGE_UNCONFIGURED_USER,password}),
+          });
+          if(!response.ok)throw new Error('Acceptance signup: HTTP '+response.status);
+          const {user,admin}=await response.json();
+          if(admin)throw new Error('Acceptance account must be an ordinary member');
+          const cookie=(response.headers.get('set-cookie')||'').split(';')[0];
+          if(!cookie)throw new Error('Acceptance signup: HTTP '+response.status+' without a session cookie');
+          const project=await fetch(base+'/api/projects/welcome',{headers:{Cookie:cookie}}).then(r=>r.json());
+          if(!project.members?.some(member=>member.userId===user.id))throw new Error('Acceptance account did not join the welcome project');
+          JS
+      - run: node e2e/setup-auth.mjs
+      # Mirror e2e/local.sh: a disposable bare remote enables the
+      # repository-bound API tests (repoSkip), and the ordinary member's token
+      # enables the second-user cases (tokenBSkip). The API runs on this host,
+      # so it can clone the local path.
+      - name: Provision disposable repository and second-user token
+        run: |
+          repo="$RUNNER_TEMP/e2e-repo"
+          mkdir -p "$repo/src"
+          git -C "$repo/src" init -q -b main
+          echo baseline > "$repo/src/README.md"
+          git -C "$repo/src" -c user.name=e2e -c user.email=e2e@local add README.md
+          git -C "$repo/src" -c user.name=e2e -c user.email=e2e@local commit -qm baseline
+          git clone -q --bare "$repo/src" "$repo/remote.git"
+          echo "AGENTFLOW_E2E_REPO_CLONE_URL=$repo/remote.git" >> "$GITHUB_ENV"
+          echo "AGENTFLOW_E2E_REPO_BRANCH=main" >> "$GITHUB_ENV"
+          token_b=$(node --input-type=module <<'JS'
+          import fs from 'node:fs';
+          const base=process.env.AGENTFLOW_E2E_BASE || 'http://127.0.0.1:8090';
+          const password=fs.readFileSync(process.env.LOOPFORGE_UNCONFIGURED_PASSWORD_FILE,'utf8').trim();
+          const login=await fetch(base+'/api/auth/password',{method:'POST',headers:{Origin:base,'Content-Type':'application/json'},body:JSON.stringify({login:process.env.LOOPFORGE_UNCONFIGURED_USER,password})});
+          if(!login.ok)throw new Error('Second-user login: HTTP '+login.status);
+          const cookie=(login.headers.get('set-cookie')||'').split(';')[0];
+          if(!cookie)throw new Error('Second-user login: HTTP '+login.status+' without a session cookie');
+          const created=await fetch(base+'/api/auth/tokens',{method:'POST',headers:{Origin:base,Cookie:cookie,'Content-Type':'application/json'},body:JSON.stringify({name:'e2e-second-user',expiresInDays:1})});
+          if(!created.ok)throw new Error('Second-user token: HTTP '+created.status);
+          const {token}=await created.json();
+          if(!token)throw new Error('Second-user token response has no token');
+          process.stdout.write(token);
+          JS
+          )
+          echo "::add-mask::$token_b"
+          echo "AGENTFLOW_E2E_TOKEN_B=$token_b" >> "$GITHUB_ENV"
+      - run: node --test --test-concurrency=1 --test-reporter=spec e2e/api/*.test.mjs
+      - run: npx playwright test --config playwright.config.mjs
+        working-directory: e2e
+      - run: npx playwright test --config public/playwright.config.mjs
+        env:
+          LOOPFORGE_UNCONFIGURED_USER: e2e-no-key
+          LOOPFORGE_UNCONFIGURED_PASSWORD_FILE: ${{ github.workspace }}/.local/no-key-password
+        working-directory: e2e
+      # Separate steps so a failing suite stays failed: these are skipped
+      # unless every suite above succeeded, and a low hit rate fails the job.
+      - name: Export registered HTTP routes
+        run: AGENTFLOW_ROUTES_OUT="${{ runner.temp }}/routes.json" go test ./internal/httpapi -run '^TestRouteInventoryExport$' -count=1
+      - name: Require registered routes to be hit at least 85%
+        run: node e2e/coverage/route-coverage.mjs --routes "${{ runner.temp }}/routes.json" --log /tmp/loopforge.log --min 85
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: platform-browser-results
+          path: e2e/test-results/
+          if-no-files-found: ignore
+  first-run:
+    # The path a new user takes: one-command install, then accounts created in the browser.
+    # Pulls the GHCR release pinned in compose.yaml; release.yml smoke-tests each newly published image.
+    # A pin bumped ahead of its tag has no image yet, so that commit is checked from source.
+    # So is a commit whose schema scripts differ from the pinned tag: the installer applies
+    # this checkout's scripts, which the released image may not be able to read.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      LOOPFORGE_TEST_URL: http://127.0.0.1:8090
+      LOOPFORGE_UNCONFIGURED_USER: e2e-no-key
+      LOOPFORGE_UNCONFIGURED_PASSWORD_FILE: ${{ github.workspace }}/.local/no-key-password
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: '22'
+      - run: npm ci
+        working-directory: e2e
+      - run: bash ../scripts/install-playwright-deps.sh npx playwright
+        working-directory: e2e
+      - name: Install the pinned release, or build this checkout when the release cannot run it
+        run: |
+          pinned=$(sed -n 's/^ *image: \${LOOPFORGE_IMAGE:-\(.*\)}$/\1/p' compose.yaml)
+          tag="v${pinned##*:}"
+          schema=(migrations scripts/install-schema-extensions.sh scripts/install-observability-schema.sh)
+          if ! docker manifest inspect "$pinned" > /dev/null 2>&1; then
+            echo "::notice::$pinned is not published yet; building this checkout"
+            ./start.sh dev
+          elif ! git fetch --quiet --depth=1 origin "refs/tags/$tag:refs/tags/$tag"; then
+            echo "::warning::could not fetch $tag to compare schema scripts; installing $pinned"
+            ./start.sh -d
+          elif ! git diff --quiet "$tag" -- "${schema[@]}"; then
+            echo "::notice::schema scripts changed since $tag; building this checkout"
+            ./start.sh dev
+          else
+            ./start.sh -d
+          fi
+      - name: Generate test passwords
+        run: |
+          mkdir -p .local
+          python3 -c 'import pathlib,secrets
+          for n in ("admin-password","no-key-password"):
+              p=pathlib.Path(".local")/n; p.write_text(secrets.token_urlsafe(20)); p.chmod(0o600)'
+      - run: npx playwright test --config public/playwright.config.mjs 00-first-run
+        env:
+          LOOPFORGE_FRESH_INSTALL: '1'
+        working-directory: e2e
+      - run: npx playwright test --config public/playwright.config.mjs
+        working-directory: e2e
+      - if: failure()
+        run: docker compose logs platform | tail -200
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: first-run-results
+          path: e2e/test-results/
+          if-no-files-found: ignore
+  platform-required:
+    # Stable check name for branch protection. An admin marks this required
+    # in GitHub; the workflow does not change repository settings.
+    name: platform-required
+    if: always()
+    needs: [core, browser, first-run]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every platform job to pass
+        working-directory: ${{ runner.temp }}
+        run: |
+          if [[ "${{ needs.core.result }}" != "success" || "${{ needs.browser.result }}" != "success" || "${{ needs.first-run.result }}" != "success" ]]; then
+            echo "core=${{ needs.core.result }} browser=${{ needs.browser.result }} first-run=${{ needs.first-run.result }}" >&2
+            exit 1
+          fi

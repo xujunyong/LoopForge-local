@@ -1,0 +1,250 @@
+package repo
+
+import (
+	"agentflow/internal/domain"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestAssistantDefaultsFollowCredentialChanges(t *testing.T) {
+	store, err := OpenTest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.PutUser(domain.User{LoginName: "assistant-defaults-owner"}); err != nil {
+		t.Fatal(err)
+	}
+	user, _ := store.UserByLoginName("assistant-defaults-owner")
+	update := func(change UserCredentialUpdate) domain.AssistantDefaults {
+		t.Helper()
+		if _, err := store.UpdateUserCredentials(user.ID, change); err != nil {
+			t.Fatal(err)
+		}
+		saved, _ := store.User(user.ID)
+		return saved.AssistantDefaults
+	}
+	if got := update(UserCredentialUpdate{CodexAPIKey: "fixture-key"}); got.Executor != "codex" {
+		t.Fatalf("the first configured CLI should be the default: %+v", got)
+	}
+	if got := update(UserCredentialUpdate{CodeBuddyAPIKey: "fixture-key"}); got.Executor != "codex" {
+		t.Fatalf("adding another credential changed the default: %+v", got)
+	}
+	chosen := domain.AssistantDefaults{Executor: "codebuddy", Model: "deepseek-v4.1-flash", Effort: "high", Approval: "assisted"}
+	if got := update(UserCredentialUpdate{AssistantDefaults: &chosen}); got != chosen {
+		t.Fatalf("explicit defaults were lost: %+v", got)
+	}
+	if got := update(UserCredentialUpdate{CodeBuddyAPIKeyClear: true}); got.Executor != "codex" || got.Model != "" || got.Effort != "" || got.Approval != "assisted" {
+		t.Fatalf("deleting the chosen CLI should select another available CLI: %+v", got)
+	}
+	if _, err := store.UpdateUserCredentials(user.ID, UserCredentialUpdate{AssistantDefaults: &chosen}); !errors.Is(err, ErrAssistantDefaultExecutorUnavailable) {
+		t.Fatalf("unconfigured CLI accepted: %v", err)
+	}
+}
+
+func TestAgentCLICredentialsRoundTrip(t *testing.T) {
+	st, err := OpenTest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.PutUser(domain.User{LoginName: "agent-cli-owner"}); err != nil {
+		t.Fatal(err)
+	}
+	user, ok := st.UserByLoginName("agent-cli-owner")
+	if !ok {
+		t.Fatal("missing user")
+	}
+	base := "https://gateway.example/v1"
+	protocol := "chat"
+	models := []domain.CLIModel{{ID: "model-a", Name: "Model A"}}
+	updated, err := st.UpdateUserCredentials(user.ID, UserCredentialUpdate{AgentCLICredentials: map[string]AgentCLICredentialUpdate{
+		"opencode": {APIKey: "oc-secret", BaseURL: &base, Protocol: &protocol, Models: &models},
+		"shell":    {APIKey: "nope"},
+	}})
+	if err == nil || updated.ID != 0 {
+		t.Fatal("unknown CLI was accepted")
+	}
+	updated, err = st.UpdateUserCredentials(user.ID, UserCredentialUpdate{AgentCLICredentials: map[string]AgentCLICredentialUpdate{
+		"opencode": {APIKey: "oc-secret", BaseURL: &base, Protocol: &protocol, Models: &models},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutUser(domain.User{ID: user.ID, LoginName: "agent-cli-owner", ChineseName: "刷新"}); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := st.User(user.ID)
+	if !ok {
+		t.Fatal("missing saved user")
+	}
+	cred := got.AgentCLICredentials["opencode"]
+	if cred.APIKey != "oc-secret" || cred.BaseURL != base || cred.Protocol != "chat" || len(cred.Models) != 1 || cred.Models[0].ID != "model-a" {
+		t.Fatalf("agent CLI credential = %+v", cred)
+	}
+	if got.CodexAPIKey != "" {
+		t.Fatal("agent CLI credential wrote a Codex column")
+	}
+	public := domain.PublicUser(got)
+	raw, _ := json.Marshal(public)
+	if strings.Contains(string(raw), "oc-secret") || !public.AgentCLICredentials["opencode"].APIKeyConfigured {
+		t.Fatal("public user leaked the agent CLI key or lost the configured flag")
+	}
+	cleared, err := st.UpdateUserCredentials(user.ID, UserCredentialUpdate{AgentCLICredentials: map[string]AgentCLICredentialUpdate{
+		"opencode": {APIKeyClear: true, BaseURL: new(string), Protocol: new(string), Models: &[]domain.CLIModel{}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cleared.AgentCLICredentials) != 0 {
+		t.Fatalf("clear left %+v", cleared.AgentCLICredentials)
+	}
+}
+
+func TestProviderUserCredentials(t *testing.T) {
+	for _, driver := range []string{"memory", "mysql"} {
+		t.Run(driver, func(t *testing.T) {
+			var st *Store
+			var err error
+			if driver == "mysql" {
+				dsn := os.Getenv("AGENTFLOW_TEST_MYSQL_DSN")
+				if dsn == "" {
+					t.Skip("set AGENTFLOW_TEST_MYSQL_DSN for MySQL integration")
+				}
+				st, err = Open(dsn)
+			} else {
+				st, err = OpenTest()
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer st.Close()
+			login := fmt.Sprintf("provider_test_%d", time.Now().UnixNano())
+			defer st.DB.Exec("DELETE FROM users WHERE login_name=?", login)
+			if err := st.PutUser(domain.User{LoginName: login}); err != nil {
+				t.Fatal(err)
+			}
+			u, _ := st.UserByLoginName(login)
+			codexURL, claudeURL := "https://codex.example/v1", "https://claude.example"
+			levels, defaultOnly := []string{" low ", "xhigh", "low"}, []string{}
+			codexModels := []domain.CLIModel{{ID: "gpt-5.5", Name: "gpt-5.5", ReasoningEfforts: &levels}}
+			claudeModels := []domain.CLIModel{{ID: "claude-sonnet", Name: "Sonnet", ReasoningEfforts: &defaultOnly}}
+			_, err = st.UpdateUserCredentials(u.ID, UserCredentialUpdate{CodexAPIKey: "codex-secret", CodexBaseURL: &codexURL, CodexModels: &codexModels, ClaudeCodeAPIKey: "claude-secret", ClaudeCodeBaseURL: &claudeURL, ClaudeCodeModels: &claudeModels})
+			if err != nil {
+				t.Fatal(err)
+			}
+			// A login refresh and a partial credential save must preserve all providers.
+			if err := st.PutUser(domain.User{ID: u.ID, LoginName: login, ChineseName: "更新姓名"}); err != nil {
+				t.Fatal(err)
+			}
+			err = st.SaveGitHTTPCredential(u.ID, "", domain.GitHTTPCredentialSecret{GitHTTPCredential: domain.GitHTTPCredential{Host: "github.com", Name: "GitHub", Platform: domain.GitPlatformGitHub}, Token: "git-secret"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, ok := st.User(u.ID)
+			if !ok || got.CodexAPIKey != "codex-secret" || got.ClaudeCodeAPIKey != "claude-secret" || got.CodexBaseURL != codexURL || got.ClaudeCodeBaseURL != claudeURL || len(got.CodexModels) != 1 || got.CodexModels[0].ID != "gpt-5.5" || got.CodexModels[0].Name != "" || len(got.ClaudeCodeModels) != 1 || got.ClaudeCodeModels[0].Name != "Sonnet" {
+				t.Fatalf("credentials did not survive refresh and partial update: %+v %+v", got.CodexModels, got.ClaudeCodeModels)
+			}
+			if efforts := got.CodexModels[0].ReasoningEfforts; efforts == nil || !slices.Equal(*efforts, []string{"low", "xhigh"}) {
+				t.Fatalf("reasoning levels lost on refresh: %+v", got.CodexModels)
+			}
+			if efforts := got.ClaudeCodeModels[0].ReasoningEfforts; efforts == nil || len(*efforts) != 0 {
+				t.Fatal("explicit default-only model reverted to automatic reasoning levels")
+			}
+			{
+				var configRows int
+				if err := st.DB.Raw(`SELECT COUNT(*) FROM user_configs WHERE user_id=?`, u.ID).Scan(&configRows).Error; err != nil {
+					t.Fatal(err)
+				}
+				if configRows != 1 {
+					t.Fatalf("user config normalization incomplete: configRows=%d", configRows)
+				}
+				if st.isMySQL() {
+					// The production migration removes legacy credential columns;
+					// querying them after startup would itself be an invalid test.
+					for _, column := range []string{"git_token", "codebuddy_api_key", "codex_api_key", "claude_code_api_key"} {
+						if st.DB.Migrator().HasColumn("users", column) {
+							t.Fatalf("legacy credential column still exists: users.%s", column)
+						}
+					}
+				}
+			}
+			public := domain.PublicUser(got)
+			raw, _ := json.Marshal(public)
+			if strings.Contains(string(raw), "secret") || !public.CodexAPIKeyConfigured || !public.ClaudeCodeAPIKeyConfigured {
+				t.Fatal("public user leaked credentials or lost configured state")
+			}
+			empty := ""
+			noModels := []domain.CLIModel{}
+			_, err = st.UpdateUserCredentials(u.ID, UserCredentialUpdate{CodexAPIKeyClear: true, ClaudeCodeAPIKeyClear: true, CodexBaseURL: &empty, ClaudeCodeBaseURL: &empty, CodexModels: &noModels, ClaudeCodeModels: &noModels})
+			if err != nil {
+				t.Fatal(err)
+			}
+			cleared, _ := st.User(u.ID)
+			if cleared.CodexAPIKey != "" || cleared.ClaudeCodeAPIKey != "" || cleared.CodexBaseURL != "" || cleared.ClaudeCodeBaseURL != "" || len(cleared.CodexModels) != 0 || len(cleared.ClaudeCodeModels) != 0 || !cleared.GitHubCredentialConfigured {
+				t.Fatal("clear operation did not isolate providers")
+			}
+		})
+	}
+}
+
+func TestCursorFamilyEffortsRoundTrip(t *testing.T) {
+	st, err := OpenTest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.PutUser(domain.User{LoginName: "cursor-owner"}); err != nil {
+		t.Fatal(err)
+	}
+	user, _ := st.UserByLoginName("cursor-owner")
+	models := []domain.CLIModel{
+		{ID: "widget", Name: "Widget", Efforts: map[string]string{"low": "widget-low", "medium": "widget", "xhigh": "widget-extra-high"}, DefaultEffort: "medium"},
+		{ID: "solo", Efforts: map[string]string{"ultra": "solo-ultra"}, DefaultEffort: "high"},
+		{ID: "plain-model"},
+	}
+	if _, err := st.UpdateUserCredentials(user.ID, UserCredentialUpdate{AgentCLICredentials: map[string]AgentCLICredentialUpdate{
+		"cursor": {APIKey: "crsr_secret", Models: &models},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := st.User(user.ID)
+	saved := got.AgentCLICredentials["cursor"].Models
+	if len(saved) != 3 || saved[0].Efforts["xhigh"] != "widget-extra-high" || saved[0].DefaultEffort != "medium" || saved[1].DefaultEffort != "" || saved[2].Efforts != nil {
+		t.Fatalf("saved cursor catalog = %+v", saved)
+	}
+	// The catalog came from this key's plan; a new key drops it.
+	if _, err := st.UpdateUserCredentials(user.ID, UserCredentialUpdate{AgentCLICredentials: map[string]AgentCLICredentialUpdate{
+		"cursor": {APIKey: "crsr_secret"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := st.User(user.ID); len(got.AgentCLICredentials["cursor"].Models) != 3 {
+		t.Fatal("saving the same key dropped the catalog")
+	}
+	if _, err := st.UpdateUserCredentials(user.ID, UserCredentialUpdate{AgentCLICredentials: map[string]AgentCLICredentialUpdate{
+		"cursor": {APIKey: "crsr_other"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := st.User(user.ID); got.AgentCLICredentials["cursor"].Models != nil {
+		t.Fatalf("new key kept the old catalog: %+v", got.AgentCLICredentials["cursor"])
+	}
+	for name, bad := range map[string]domain.CLIModel{
+		"unknown effort":          {ID: "widget", Efforts: map[string]string{"turbo": "widget-turbo"}},
+		"bad target":              {ID: "widget", Efforts: map[string]string{"low": "widget low"}},
+		"unknown reasoning level": {ID: "widget", ReasoningEfforts: &[]string{"turbo"}},
+	} {
+		if _, err := st.UpdateUserCredentials(user.ID, UserCredentialUpdate{AgentCLICredentials: map[string]AgentCLICredentialUpdate{
+			"cursor": {Models: &[]domain.CLIModel{bad}},
+		}}); err == nil {
+			t.Errorf("%s was accepted", name)
+		}
+	}
+}

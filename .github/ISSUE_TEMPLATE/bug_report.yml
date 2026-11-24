@@ -1,0 +1,75 @@
+name: Bug report
+description: Report a reproducible LoopForge problem
+title: "[Bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve LoopForge. Remove credentials, private endpoints, internal logs, and personal data before submitting.
+  - type: dropdown
+    id: host
+    attributes:
+      label: Component / host
+      options:
+        - Platform — web / API
+        - Platform — runner / sandbox
+        - Platform — deployment
+        - Local — CodeBuddy
+        - Local — Codex
+        - Local — Cursor
+        - Local — Claude Code
+        - Local — installer / CLI
+    validations:
+      required: true
+  - type: dropdown
+    id: edition
+    attributes:
+      label: Edition
+      options:
+        - Platform
+        - Local Classic
+        - Local Portable
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: LoopForge version
+      placeholder: "Platform commit SHA or Local package version"
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the actual and expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Provide the smallest safe sequence that reproduces the issue.
+      placeholder: |
+        1. Run ...
+        2. Enter ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: Include browser errors, deployment steps, or Local `loopforge doctor` output, with secrets removed.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety checks
+      options:
+        - label: I removed credentials, private endpoints, internal identifiers, and personal data.
+          required: true
+        - label: I searched existing issues for duplicates.
+          required: true

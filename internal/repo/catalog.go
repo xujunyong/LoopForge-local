@@ -1,0 +1,968 @@
+package repo
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"path/filepath"
+	"slices"
+	"sort"
+	"strings"
+	"time"
+
+	"agentflow/internal/domain"
+
+	"gorm.io/gorm"
+)
+
+// BaselineAlignResolverAgent is the shared platform role for scheduled
+// baseline alignment. No project hooks or issue-fix verification gates.
+func BaselineAlignResolverAgent() domain.AgentDefinition {
+	return domain.AgentDefinition{
+		ID:          domain.BaselineAlignAgentID,
+		Name:        "基线对齐执行员",
+		Version:     1,
+		ProjectID:   "platform",
+		Shared:      true,
+		Description: "全平台共用：把默认分支合入集成分支并解决冲突。不跑项目测试，不写修复报告，不发 MR。",
+		Prompt:      "你只做基线对齐，不是需求修复。\n1. 在当前工作分支执行 git fetch 并 merge 默认分支\n2. 逐块解决冲突，保留双方有效实现；拿不准时选对业务影响更小的一侧并在提交说明里写清\n3. git add 冲突文件并创建合并提交，提交说明列出冲突文件与取舍\n4. 不要 push，不要改默认分支，不要跑项目单测或 E2E，不要写 fix-plan.md / fix-report.md / review-report.md\n5. 结束后用几句话说明每个冲突文件的取舍即可",
+	}
+}
+
+// ---------- Agents ----------
+
+func (r *CatalogRepo) Agents() []domain.AgentDefinition {
+	out := payloadList[domain.AgentDefinition](r.DB, "agents", "")
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+func (r *CatalogRepo) Agent(id string) (domain.AgentDefinition, bool) {
+	return payloadOne[domain.AgentDefinition](r.DB, "agents", id)
+}
+
+func (r *CatalogRepo) PutAgent(v domain.AgentDefinition) error {
+	if strings.TrimSpace(v.ID) == "" || strings.TrimSpace(v.Name) == "" {
+		return errors.New("agent id and name are required")
+	}
+	if v.Loop.Enabled {
+		if v.Loop.MaxIterations < 1 || v.Loop.MaxIterations > 12 {
+			return errors.New("agent loop maxIterations must be between 1 and 12")
+		}
+		if v.Loop.ExitCondition == "" {
+			v.Loop.ExitCondition = "all_gates_pass"
+		}
+	}
+	for _, output := range v.ArtifactOutputs {
+		clean := filepath.Clean(strings.TrimSpace(output.Path))
+		if output.Name == "" || clean == "." || filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("invalid agent artifact contract %q", output.Name)
+		}
+	}
+	validStages := map[string]bool{"before_execution": true, "after_execution": true, "before_publish": true, "on_failure": true}
+	for _, point := range v.Interventions {
+		if point.ID == "" || point.Name == "" || !validStages[point.Stage] {
+			return fmt.Errorf("invalid agent intervention point %q", point.ID)
+		}
+	}
+	validHookEvents := map[string]bool{"SessionStart": true, "UserPromptSubmit": true, "PreToolUse": true, "PostToolUse": true, "Stop": true}
+	hookIDs := map[string]bool{}
+	for index := range v.Hooks {
+		hook := &v.Hooks[index]
+		hook.ID = strings.TrimSpace(hook.ID)
+		hook.Name = strings.TrimSpace(hook.Name)
+		hook.Event = strings.TrimSpace(hook.Event)
+		hook.Language = strings.ToLower(strings.TrimSpace(hook.Language))
+		hook.Script = strings.TrimSpace(hook.Script)
+		if hook.ID == "" || hook.ID == "." || hook.ID == ".." || filepath.Base(hook.ID) != hook.ID || strings.ContainsAny(hook.ID, " \\/") {
+			return fmt.Errorf("invalid agent hook id %q", hook.ID)
+		}
+		if hookIDs[hook.ID] {
+			return fmt.Errorf("duplicate agent hook %q", hook.ID)
+		}
+		hookIDs[hook.ID] = true
+		if hook.Name == "" || !validHookEvents[hook.Event] {
+			return fmt.Errorf("invalid agent hook %q", hook.ID)
+		}
+		if hook.Language != "shell" && hook.Language != "python" {
+			return fmt.Errorf("agent hook %q has invalid language %q", hook.ID, hook.Language)
+		}
+		if hook.Script == "" {
+			return fmt.Errorf("agent hook %q script is required", hook.ID)
+		}
+		if hook.TimeoutSec == 0 {
+			hook.TimeoutSec = 10
+		}
+		if hook.TimeoutSec < 1 || hook.TimeoutSec > 600 {
+			return fmt.Errorf("agent hook %q timeoutSec must be between 1 and 600", hook.ID)
+		}
+	}
+	v.UpdatedAt = time.Now().UTC()
+	v.Rules = normalizeRefs(v.Rules, "rules/")
+	v.Skills = normalizeRefs(v.Skills, "skills/")
+	if old, ok := r.Agent(v.ID); ok {
+		v.ProjectID = domain.KeepCatalogProjectID(v.ProjectID, old.ProjectID)
+		if err := r.snapshotRevision("agent", old.ID, old.Name, old.Version, 0, old); err != nil {
+			return err
+		}
+	}
+	return upsert(r.DB, "agents", map[string]any{
+		"id": v.ID, "name": v.Name, "payload": mustJSON(v), "updated_at": timePtr(v.UpdatedAt),
+	})
+}
+
+// ---------- Rules / Skills / MCP servers ----------
+
+func (r *CatalogRepo) Rules() []domain.RuleDefinition {
+	out := payloadList[domain.RuleDefinition](r.DB, "rules", "")
+	sort.Slice(out, func(i, j int) bool { return out[i].Priority > out[j].Priority })
+	return out
+}
+
+func (r *CatalogRepo) Rule(id string) (domain.RuleDefinition, bool) {
+	return payloadOne[domain.RuleDefinition](r.DB, "rules", id)
+}
+
+func (r *CatalogRepo) PutRule(v domain.RuleDefinition) error {
+	v.UpdatedAt = time.Now().UTC()
+	return upsert(r.DB, "rules", map[string]any{
+		"id": v.ID, "name": v.Name, "payload": mustJSON(v), "updated_at": timePtr(v.UpdatedAt),
+	})
+}
+
+func (r *CatalogRepo) DeleteRule(id string) error {
+	if _, ok := r.Rule(id); !ok {
+		return fmt.Errorf("rule not found")
+	}
+	return r.DB.Table("rules").Where("id = ?", id).Delete(nil).Error
+}
+
+func (r *CatalogRepo) Skills() []domain.SkillDefinition {
+	return payloadList[domain.SkillDefinition](r.DB, "skills", "")
+}
+
+func (r *CatalogRepo) Skill(id string) (domain.SkillDefinition, bool) {
+	return payloadOne[domain.SkillDefinition](r.DB, "skills", id)
+}
+
+func (r *CatalogRepo) PutSkill(v domain.SkillDefinition) error {
+	v.UpdatedAt = time.Now().UTC()
+	return upsert(r.DB, "skills", map[string]any{
+		"id": v.ID, "name": v.Name, "payload": mustJSON(v), "updated_at": timePtr(v.UpdatedAt),
+	})
+}
+
+func (r *CatalogRepo) DeleteSkill(id string) error {
+	if _, ok := r.Skill(id); !ok {
+		return fmt.Errorf("skill not found")
+	}
+	return r.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("skill_id = ?", id).Delete(&skillFileRow{}).Error; err != nil {
+			return err
+		}
+		return tx.Table("skills").Where("id = ?", id).Delete(nil).Error
+	})
+}
+
+func (r *CatalogRepo) MCPServers() []domain.MCPServerDefinition {
+	return payloadList[domain.MCPServerDefinition](r.DB, "mcp_servers", "")
+}
+
+func (r *CatalogRepo) MCPServer(id string) (domain.MCPServerDefinition, bool) {
+	return payloadOne[domain.MCPServerDefinition](r.DB, "mcp_servers", id)
+}
+
+func (r *CatalogRepo) PutMCPServer(v domain.MCPServerDefinition) error {
+	// Uploaded contents and their manifest are owned by the mcp_files API.
+	// Definition-only updates (including JSON import) must not orphan existing
+	// rows merely because fileRefs was omitted by an older client.
+	if v.FileRefs == nil {
+		if existing, ok := r.MCPServer(v.ID); ok {
+			v.FileRefs = existing.FileRefs
+		}
+	}
+	if err := domain.ValidateMCPServer(v); err != nil {
+		return err
+	}
+	v.UpdatedAt = time.Now().UTC()
+	return upsert(r.DB, "mcp_servers", map[string]any{
+		"id": v.ID, "name": v.Name, "payload": mustJSON(v), "updated_at": timePtr(v.UpdatedAt),
+	})
+}
+
+func (r *CatalogRepo) DeleteMCPServer(id string) error {
+	if _, ok := r.MCPServer(id); !ok {
+		return fmt.Errorf("MCP not found")
+	}
+	return r.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("mcp_id = ?", id).Delete(&mcpFileRow{}).Error; err != nil {
+			return err
+		}
+		return tx.Table("mcp_servers").Where("id = ?", id).Delete(nil).Error
+	})
+}
+
+func (r *CatalogRepo) DeleteAgent(id string) error {
+	if _, ok := payloadOne[domain.AgentDefinition](r.DB, "agents", id); !ok {
+		return fmt.Errorf("agent not found")
+	}
+	return r.DB.Table("agents").Where("id = ?", id).Delete(nil).Error
+}
+
+// ---------- Executors ----------
+
+func (r *CatalogRepo) Executors() []domain.ExecutorDefinition {
+	return payloadList[domain.ExecutorDefinition](r.DB, "executors", "")
+}
+
+func (r *CatalogRepo) Executor(id string) (domain.ExecutorDefinition, bool) {
+	return payloadOne[domain.ExecutorDefinition](r.DB, "executors", id)
+}
+
+func (r *CatalogRepo) PutExecutor(v domain.ExecutorDefinition) error {
+	if strings.TrimSpace(v.ID) == "" || strings.TrimSpace(v.Name) == "" || strings.TrimSpace(v.Kind) == "" {
+		return errors.New("executor id, name and kind are required")
+	}
+	return upsert(r.DB, "executors", map[string]any{
+		"id": v.ID, "name": v.Name, "kind": v.Kind, "payload": mustJSON(v),
+	})
+}
+
+// BuiltInExecutors is the complete user-selectable CLI catalog. Executor
+// definitions remain persisted for historical snapshots and compatibility,
+// but they are no longer a user-managed runtime asset.
+func BuiltInExecutors() []domain.ExecutorDefinition {
+	return []domain.ExecutorDefinition{
+		{ID: "codebuddy", Name: "CodeBuddy", Kind: "codebuddy", Binary: "codebuddy", Args: []string{"-p", "--output-format", "stream-json", "--include-partial-messages", "-y", "--setting-sources", "none"}, Protocol: "stream-json"},
+		{ID: "codex", Name: "Codex", Kind: "codex", Binary: "codex", Args: []string{"exec", "--json", "--sandbox", "workspace-write", "--skip-git-repo-check"}, Protocol: "jsonl"},
+		{ID: "claude", Name: "Claude Code", Kind: "claude-code", Binary: "claude", Args: []string{"-p", "--output-format", "stream-json", "--permission-mode", "dontAsk"}, Protocol: "stream-json"},
+		{ID: "opencode", Name: "OpenCode", Kind: "opencode", Binary: "opencode", Protocol: "stream-json"},
+		{ID: "cursor", Name: "Cursor CLI", Kind: "cursor", Binary: "cursor-agent", Protocol: "stream-json"},
+		{ID: "agy", Name: "Antigravity", Kind: "agy", Binary: "agy", Protocol: "stream-json"},
+		{ID: "kimi", Name: "Kimi Code", Kind: "kimi", Binary: "kimi", Protocol: "stream-json"},
+		{ID: "pi", Name: "Pi", Kind: "pi", Binary: "pi", Protocol: "stream-json"},
+		{ID: "dsh", Name: "DeepSeek Harness", Kind: "dsh", Binary: "dsh", Protocol: "stream-json"},
+		{ID: "zcode", Name: "ZCode", Kind: "zcode", Binary: "zcode", Protocol: "stream-json"},
+	}
+}
+
+func BuiltInExecutor(id string) (domain.ExecutorDefinition, bool) {
+	for _, executor := range BuiltInExecutors() {
+		if executor.ID == strings.TrimSpace(id) {
+			return executor, true
+		}
+	}
+	return domain.ExecutorDefinition{}, false
+}
+
+func BuiltInExecutorForKind(kind string) (domain.ExecutorDefinition, bool) {
+	for _, executor := range BuiltInExecutors() {
+		if executor.Kind == strings.TrimSpace(kind) {
+			return executor, true
+		}
+	}
+	return domain.ExecutorDefinition{}, false
+}
+
+// ---------- Sandboxes ----------
+
+func (r *CatalogRepo) Sandboxes() []domain.SandboxProfile {
+	profiles := payloadList[domain.SandboxProfile](r.DB, "sandboxes", "")
+	profiles = slices.DeleteFunc(profiles, func(profile domain.SandboxProfile) bool {
+		return isDefaultSandboxID(profile.ID) && !platformSandboxOwner(profile.ProjectID)
+	})
+	for i := range profiles {
+		profiles[i] = platformSandboxProfile(profiles[i])
+	}
+	for _, profile := range profiles {
+		if profile.ID == DefaultSandboxProfileID {
+			return profiles
+		}
+	}
+	if profile, ok := r.Sandbox(DefaultSandboxProfileID); ok {
+		profiles = append(profiles, profile)
+	}
+	return profiles
+}
+
+func (r *CatalogRepo) Sandbox(id string) (domain.SandboxProfile, bool) {
+	isDefault := isDefaultSandboxID(id)
+	if isDefault {
+		id = DefaultSandboxProfileID
+	}
+	var profile domain.SandboxProfile
+	var row struct {
+		Payload         []byte
+		PlatformDefault bool
+	}
+	err := r.DB.Table("sandboxes").Select("payload, id = ? AS platform_default", DefaultSandboxProfileID).
+		Where("id = ?", id).Take(&row).Error
+	// A missing row may use the built-in default. Database failures or invalid
+	// stored configuration must not silently switch a run's execution policy.
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		if reserved, err := r.IsReservedSandboxID(id); err == nil && reserved {
+			return GenericDockerSandbox(), true
+		}
+		return domain.SandboxProfile{}, false
+	}
+	if err != nil || json.Unmarshal(row.Payload, &profile) != nil {
+		return domain.SandboxProfile{}, false
+	}
+	if isDefault || row.PlatformDefault {
+		if !platformSandboxOwner(profile.ProjectID) {
+			// A project profile on an installation awaiting migration cannot
+			// replace the platform-wide default.
+			return GenericDockerSandbox(), true
+		}
+		profile.ID = DefaultSandboxProfileID
+	}
+	return platformSandboxProfile(profile), true
+}
+
+func isDefaultSandboxID(id string) bool {
+	return strings.EqualFold(strings.TrimSpace(id), DefaultSandboxProfileID)
+}
+
+// IsReservedSandboxID recognizes the default ID and its MySQL equivalents.
+// The catalog uses utf8mb4_unicode_ci for its primary keys.
+func (r *CatalogRepo) IsReservedSandboxID(id string) (bool, error) {
+	if isDefaultSandboxID(id) {
+		return true, nil
+	}
+	if id == "" || !r.isMySQL() {
+		return false, nil
+	}
+	var reserved bool
+	err := r.DB.Raw("SELECT CONVERT(? USING utf8mb4) COLLATE utf8mb4_unicode_ci = ?", id, DefaultSandboxProfileID).Scan(&reserved).Error
+	return reserved, err
+}
+
+// Stored platform defaults are projectless, including operator overrides.
+func platformSandboxOwner(projectID string) bool {
+	return projectID == ""
+}
+
+// platformSandboxProfile keeps the built-in generic Docker sandbox shared:
+// conversation workspaces fall back to it, and rows seeded before it carried
+// the shared flag would otherwise hide it from every project. A row still
+// marked local reads as native, never as the runtime's unisolated driver.
+func platformSandboxProfile(profile domain.SandboxProfile) domain.SandboxProfile {
+	if isDefaultSandboxID(profile.ID) && platformSandboxOwner(profile.ProjectID) {
+		profile.ID = DefaultSandboxProfileID
+		profile.ProjectID = "platform"
+		profile.Shared = true
+	}
+	if strings.TrimSpace(profile.Driver) == domain.SandboxDriverLocal {
+		profile = normalizeSandboxProfile(profile)
+	}
+	return profile
+}
+
+func (r *CatalogRepo) PutSandbox(v domain.SandboxProfile) error {
+	if strings.TrimSpace(v.ID) == "" || strings.TrimSpace(v.Name) == "" {
+		return errors.New("sandbox id and name are required")
+	}
+	reserved, err := r.IsReservedSandboxID(v.ID)
+	if err != nil {
+		return err
+	}
+	if reserved {
+		if v.ProjectID != "" && v.ProjectID != "platform" {
+			return fmt.Errorf("沙箱标识 %s 保留给平台默认沙箱", DefaultSandboxProfileID)
+		}
+		v.ID, v.ProjectID = DefaultSandboxProfileID, ""
+	}
+	if err := domain.ValidateEnvironmentVariables(v.Environment); err != nil {
+		return fmt.Errorf("sandbox environment: %w", err)
+	}
+	if strings.TrimSpace(v.Driver) == domain.SandboxDriverLocal {
+		return errors.New("local 沙箱已移除，请改用 native 沙箱")
+	}
+	stored := normalizeSandboxProfile(v)
+	if err := domain.ValidateSandboxAssets(stored); err != nil {
+		return err
+	}
+	return upsert(r.DB, "sandboxes", map[string]any{
+		"id": stored.ID, "name": stored.Name, "payload": mustJSON(stored),
+	})
+}
+
+func (r *CatalogRepo) DeleteSandbox(id string) error {
+	reserved, err := r.IsReservedSandboxID(id)
+	if err != nil {
+		return err
+	}
+	if reserved {
+		return errors.New("默认运行沙箱不能删除；可编辑配置或新建其他沙箱")
+	}
+	if _, ok := r.Sandbox(id); !ok {
+		return fmt.Errorf("sandbox not found")
+	}
+	return r.DB.Table("sandboxes").Where("id = ?", id).Delete(nil).Error
+}
+
+// ---------- Workflows ----------
+
+// Workflows lists project SOPs plus stored generic templates. A leftover
+// workflows-table row occupying a generic id is filtered out so the template
+// stays authoritative. Generic templates always sort after the stored SOPs
+// (master semantics: the stored list is sorted by UpdatedAt, generics are
+// appended).
+func (r *CatalogRepo) Workflows() []domain.WorkflowDefinition {
+	generic := r.GenericWorkflows()
+	reserved := make(map[string]bool, len(generic))
+	for _, template := range generic {
+		reserved[template.ID] = true
+	}
+	stored := payloadList[domain.WorkflowDefinition](r.DB, "workflows", "")
+	out := make([]domain.WorkflowDefinition, 0, len(stored)+len(generic))
+	for _, workflow := range stored {
+		workflow = normalizeWorkflowDefinition(workflow)
+		if reserved[workflow.ID] {
+			continue
+		}
+		out = append(out, workflow)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].UpdatedAt.After(out[j].UpdatedAt) })
+	return append(out, generic...)
+}
+
+// Workflow resolves a custom SOP or a generic_templates row. Generic ids stay
+// reserved so a leftover workflows-table collision cannot shadow the template.
+func (r *CatalogRepo) Workflow(id string) (domain.WorkflowDefinition, bool) {
+	if wf, ok := r.GenericWorkflowByID(id); ok {
+		return wf, true
+	}
+	workflow, ok := payloadOne[domain.WorkflowDefinition](r.DB, "workflows", id)
+	if !ok {
+		return domain.WorkflowDefinition{}, false
+	}
+	return normalizeWorkflowDefinition(workflow), ok
+}
+
+// storedWorkflow reads only the physical workflows table, ignoring the
+// generic-template fallback. Writers use it for existence checks so a legacy
+// colliding row stays writable and never conflicts with template revisions.
+func (r *CatalogRepo) storedWorkflow(id string) (domain.WorkflowDefinition, bool) {
+	workflow, ok := payloadOne[domain.WorkflowDefinition](r.DB, "workflows", id)
+	if !ok {
+		return domain.WorkflowDefinition{}, false
+	}
+	return normalizeWorkflowDefinition(workflow), ok
+}
+
+func (r *CatalogRepo) PutWorkflow(v domain.WorkflowDefinition) error {
+	return r.putWorkflow(v, false)
+}
+
+func workflowContent(v domain.WorkflowDefinition) string {
+	v.Revision, v.PublishedRevision = 0, 0
+	v.CreatedAt, v.UpdatedAt = time.Time{}, time.Time{}
+	return string(mustJSON(v))
+}
+
+func workflowPublishedRevision(v domain.WorkflowDefinition) int {
+	if v.PublishedRevision == 0 && v.Status == "published" {
+		return v.Revision // Legacy published definitions predate this marker.
+	}
+	return v.PublishedRevision
+}
+
+func workflowNeedsPublish(v domain.WorkflowDefinition) bool {
+	return v.Status != "published" || workflowPublishedRevision(v) != v.Revision
+}
+
+// PublishWorkflow is idempotent until the saved definition changes.
+func (r *CatalogRepo) PublishWorkflow(id string) (domain.WorkflowDefinition, error) {
+	var published domain.WorkflowDefinition
+	err := r.DB.Transaction(func(tx *gorm.DB) error {
+		var row struct{ ID string }
+		if err := r.locking(tx.Table("workflows")).Select("id").Where("id = ?", id).Take(&row).Error; err != nil {
+			return err
+		}
+		catalog := *r
+		catalog.deps = &deps{DB: tx}
+		var err error
+		published, err = catalog.publishStoredWorkflow(id)
+		return err
+	})
+	return published, err
+}
+
+func (r *CatalogRepo) publishStoredWorkflow(id string) (domain.WorkflowDefinition, error) {
+	v, ok := r.storedWorkflow(id)
+	if !ok {
+		return domain.WorkflowDefinition{}, errors.New("workflow not found")
+	}
+	if !workflowNeedsPublish(v) {
+		return v, nil
+	}
+	v.Status = "published"
+	v.Version++
+	if err := r.putWorkflow(v, true); err != nil {
+		return domain.WorkflowDefinition{}, err
+	}
+	stored, _ := r.storedWorkflow(id)
+	return stored, nil
+}
+
+func (r *CatalogRepo) putWorkflow(v domain.WorkflowDefinition, publishing bool) error {
+	if strings.TrimSpace(v.ID) == "" || strings.TrimSpace(v.Name) == "" {
+		return errors.New("workflow id and name are required")
+	}
+	if err := domain.ValidateWorkflowPreparation(v); err != nil {
+		return err
+	}
+	if err := domain.ValidateWorkflowMetricStages(v); err != nil {
+		return err
+	}
+	v = normalizeWorkflowDefinition(v)
+	if _, ok := r.Sandbox(v.SandboxProfileID); !ok {
+		return fmt.Errorf("sandbox profile %q not found", v.SandboxProfileID)
+	}
+	now := time.Now().UTC()
+	old, ok := r.storedWorkflow(v.ID)
+	if ok {
+		v.ProjectID = domain.KeepCatalogProjectID(v.ProjectID, old.ProjectID)
+		if v.Revision != old.Revision {
+			return fmt.Errorf("workflow revision conflict: current revision is %d", old.Revision)
+		}
+		if !publishing && workflowContent(v) == workflowContent(old) {
+			return nil
+		}
+		v.PublishedRevision = workflowPublishedRevision(old)
+		v.Revision = old.Revision + 1
+		v.CreatedAt = old.CreatedAt
+		if v.Version == 0 {
+			v.Version = old.Version
+		}
+	} else {
+		v.PublishedRevision = 0
+		v.Revision = 1
+		v.CreatedAt = now
+		if v.Version == 0 {
+			v.Version = 1
+		}
+	}
+	if err := r.validateWorkflowNotifications(v); err != nil {
+		return err
+	}
+	if v.Status == "" {
+		v.Status = "draft"
+	}
+	if publishing {
+		v.PublishedRevision = v.Revision
+	}
+	v.UpdatedAt = now
+	if ok {
+		if err := r.snapshotRevision("workflow", old.ID, old.Name, old.Version, old.Revision, old); err != nil {
+			return err
+		}
+	}
+	return upsert(r.DB, "workflows", map[string]any{
+		"id": v.ID, "name": v.Name, "version": v.Version, "revision": v.Revision, "status": v.Status,
+		"payload": mustJSON(v), "created_at": timePtr(v.CreatedAt), "updated_at": timePtr(v.UpdatedAt),
+	})
+}
+
+// DeleteWorkflow removes a SOP definition. Historical runs keep their own
+// WorkflowSnapshot, so already-finished runs stay fully readable afterwards.
+func (r *CatalogRepo) DeleteWorkflow(id string) error {
+	if _, ok := r.storedWorkflow(id); !ok {
+		return fmt.Errorf("workflow not found")
+	}
+	return r.DB.Table("workflows").Where("id = ?", id).Delete(nil).Error
+}
+
+// ---------- Repositories ----------
+
+func (r *CatalogRepo) Repositories() []domain.Repository {
+	out := payloadList[domain.Repository](r.DB, "repositories", "")
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ProjectID == out[j].ProjectID {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].ProjectID < out[j].ProjectID
+	})
+	return out
+}
+
+func (r *CatalogRepo) Repository(id string) (domain.Repository, bool) {
+	return payloadOne[domain.Repository](r.DB, "repositories", id)
+}
+
+func (r *CatalogRepo) PutRepository(v domain.Repository) error {
+	if _, ok := r.projects.Project(v.ProjectID); !ok {
+		return fmt.Errorf("project not found")
+	}
+	now := time.Now().UTC()
+	if old, ok := r.Repository(v.ID); ok {
+		v.CreatedAt = old.CreatedAt
+	} else {
+		v.CreatedAt = now
+	}
+	v.UpdatedAt = now
+	return upsert(r.DB, "repositories", map[string]any{
+		"id": v.ID, "project_id": v.ProjectID, "name": v.Name, "payload": mustJSON(v),
+		"created_at": timePtr(v.CreatedAt), "updated_at": timePtr(v.UpdatedAt),
+	})
+}
+
+func (r *CatalogRepo) DeleteRepository(id string) error {
+	return r.DB.Table("repositories").Where("id = ?", id).Delete(nil).Error
+}
+
+// ---------- Sync config / Schedule jobs ----------
+
+func (r *CatalogRepo) SyncConfig() domain.SyncConfig {
+	cfg, _ := payloadOne[domain.SyncConfig](r.DB, "sync_config", mysqlSyncConfigID)
+	return cfg
+}
+
+func (r *CatalogRepo) PutSyncConfig(cfg domain.SyncConfig) error {
+	current := r.SyncConfig()
+	cfg.PlaybookSeedRev = current.PlaybookSeedRev
+	return upsert(r.DB, "sync_config", map[string]any{
+		"id": mysqlSyncConfigID, "payload": mustJSON(cfg), "updated_at": timePtr(time.Now().UTC()),
+	})
+}
+
+func (r *CatalogRepo) ScheduleJobs() []domain.ScheduleJob {
+	out := payloadList[domain.ScheduleJob](r.DB, "schedule_jobs", "")
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+func (r *CatalogRepo) ScheduleJob(id string) (domain.ScheduleJob, bool) {
+	return payloadOne[domain.ScheduleJob](r.DB, "schedule_jobs", id)
+}
+
+func (r *CatalogRepo) PutScheduleJob(v domain.ScheduleJob) error {
+	return r.DB.Transaction(func(tx *gorm.DB) error {
+		var row scheduleJobRow
+		var old domain.ScheduleJob
+		err := r.locking(tx).Where("id = ?", v.ID).First(&row).Error
+		if err == nil {
+			if err := json.Unmarshal(row.Payload, &old); err != nil {
+				return err
+			}
+		} else if err != gorm.ErrRecordNotFound {
+			return err
+		}
+		if !(old.LastStatus == "running" && v.LastStatus != "running") {
+			if err := r.notifications.validateNotificationBindings(tx, v.ProjectID, v.Notifications, true); err != nil {
+				return err
+			}
+		}
+		now := time.Now().UTC()
+		if old.ID != "" {
+			v.CreatedAt = old.CreatedAt
+		} else {
+			v.CreatedAt = now
+		}
+		v.UpdatedAt = now
+		if strings.TrimSpace(v.Cron) == "" && v.IntervalSec < 30 {
+			v.IntervalSec = 30
+		}
+		v.NotificationSnapshot = domain.CloneNotificationBindings(old.NotificationSnapshot)
+		if v.LastStatus == "running" && (old.LastStatus != "running" || old.LastRunAt.UnixMilli() != v.LastRunAt.UnixMilli()) {
+			v.NotificationSnapshot = domain.CloneNotificationBindings(v.Notifications)
+		}
+		enabled := 0
+		if v.Enabled {
+			enabled = 1
+		}
+		if err := upsert(tx, "schedule_jobs", map[string]any{"id": v.ID, "name": v.Name, "enabled": enabled, "payload": mustJSON(v), "updated_at": timePtr(v.UpdatedAt)}); err != nil {
+			return err
+		}
+		trigger := map[string]string{"success": "succeeded", "failed": "failed"}[v.LastStatus]
+		if old.ID != "" && old.LastStatus == "running" && trigger != "" && !v.LastRunAt.IsZero() {
+			result := v.NotificationResult
+			if result == "" {
+				result = v.LastAssistantMessage
+			}
+			return r.notifications.enqueueTaskNotifications(tx, "schedule_job", v.ID, v.ProjectID, v.Name, trigger, v.LastRunAt, old.NotificationSnapshot, result, v.LastError)
+		}
+		return nil
+	})
+}
+
+// SetScheduleJobEnabled flips only a job's enabled flag, leaving its
+// configuration and the outcome of a run in progress untouched.
+func (r *CatalogRepo) SetScheduleJobEnabled(id string, enabled bool) (domain.ScheduleJob, error) {
+	var out domain.ScheduleJob
+	err := r.DB.Transaction(func(tx *gorm.DB) error {
+		var row scheduleJobRow
+		if err := r.locking(tx).Where("id = ?", id).First(&row).Error; err != nil {
+			return err
+		}
+		if err := json.Unmarshal(row.Payload, &out); err != nil {
+			return err
+		}
+		out.Enabled = enabled
+		out.UpdatedAt = time.Now().UTC()
+		flag := 0
+		if enabled {
+			flag = 1
+		}
+		return tx.Model(&row).Updates(map[string]any{"enabled": flag, "payload": mustJSON(out), "updated_at": timePtr(out.UpdatedAt)}).Error
+	})
+	return out, err
+}
+
+// ErrScheduleJobChanged reports that the stored job no longer matches what
+// the caller checked, e.g. it was edited or moved to another project.
+var ErrScheduleJobChanged = errors.New("任务已被其他人修改或移动，请刷新后重试")
+
+// DisableScheduleJob turns the job off only if unchanged accepts the row as
+// it is stored now, checked under the row lock, and returns the stored job.
+// Nothing else in the row is touched.
+func (r *CatalogRepo) DisableScheduleJob(id string, unchanged func(current domain.ScheduleJob) bool) (domain.ScheduleJob, error) {
+	var current domain.ScheduleJob
+	err := r.DB.Transaction(func(tx *gorm.DB) error {
+		var row scheduleJobRow
+		err := r.locking(tx).Where("id = ?", id).First(&row).Error
+		if err == gorm.ErrRecordNotFound {
+			return ErrScheduleJobChanged
+		}
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(row.Payload, &current); err != nil {
+			return err
+		}
+		if !unchanged(current) {
+			return ErrScheduleJobChanged
+		}
+		current.Enabled = false
+		current.UpdatedAt = time.Now().UTC()
+		return tx.Model(&row).Updates(map[string]any{"enabled": 0, "payload": mustJSON(current), "updated_at": timePtr(current.UpdatedAt)}).Error
+	})
+	if err != nil {
+		return domain.ScheduleJob{}, err
+	}
+	return current, nil
+}
+
+func (r *CatalogRepo) DeleteScheduleJob(id string) error {
+	if _, ok := r.ScheduleJob(id); !ok {
+		return fmt.Errorf("schedule job not found")
+	}
+	return r.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Table("schedule_job_executions").Where("job_id = ?", id).Delete(nil).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("job_id = ?", id).Delete(&scheduleJobExecutionStatRow{}).Error; err != nil {
+			return err
+		}
+		return tx.Table("schedule_jobs").Where("id = ?", id).Delete(nil).Error
+	})
+}
+
+// ---------- Definition revisions ----------
+
+const maxRevisionsPerEntity = 20
+
+// snapshotRevision archives the previous version of a definition before it is
+// overwritten.
+func (r *CatalogRepo) snapshotRevision(kind, entityID, name string, version, revision int, payload any) error {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	item := domain.DefinitionRevision{
+		ID:        fmt.Sprintf("%s-%s-%d-%d-%d", kind, entityID, version, revision, time.Now().UTC().UnixNano()),
+		Kind:      kind,
+		EntityID:  entityID,
+		Version:   version,
+		Revision:  revision,
+		Name:      name,
+		Summary:   fmt.Sprintf("%s v%d #%d", name, version, revision),
+		Payload:   raw,
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := upsert(r.DB, "definition_revisions", map[string]any{
+		"id": item.ID, "kind": item.Kind, "entity_id": item.EntityID, "version": item.Version,
+		"revision": item.Revision, "name": item.Name, "payload": mustJSON(item), "created_at": timePtr(item.CreatedAt),
+	}); err != nil {
+		return err
+	}
+	var dropped []string
+	// MySQL 要求 OFFSET 必须搭配 LIMIT（master 原实现为
+	// LIMIT 18446744073709551615 OFFSET ?）；gorm 在仅有 Offset 时会生成
+	// 非法 SQL。sqlite 不接受超出 int64 的 LIMIT 字面量，故按方言分别处理。
+	if r.isMySQL() {
+		if err := r.DB.Raw(
+			"SELECT id FROM definition_revisions WHERE kind = ? AND entity_id = ? "+
+				"ORDER BY created_at DESC LIMIT 18446744073709551615 OFFSET ?",
+			kind, entityID, maxRevisionsPerEntity).Scan(&dropped).Error; err != nil {
+			return err
+		}
+	} else {
+		if err := r.DB.Table("definition_revisions").Select("id").
+			Where("kind = ? AND entity_id = ?", kind, entityID).
+			Order("created_at DESC").
+			Limit(math.MaxInt64).Offset(maxRevisionsPerEntity).
+			Scan(&dropped).Error; err != nil {
+			return err
+		}
+	}
+	for _, id := range dropped {
+		if err := r.DB.Table("definition_revisions").Where("id = ?", id).Delete(nil).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *CatalogRepo) Revisions(kind, entityID string) []domain.DefinitionRevision {
+	out := payloadList[domain.DefinitionRevision](r.DB, "definition_revisions", "kind = ? AND entity_id = ?", kind, entityID)
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out
+}
+
+func (r *CatalogRepo) Revision(id string) (domain.DefinitionRevision, bool) {
+	return payloadOne[domain.DefinitionRevision](r.DB, "definition_revisions", id)
+}
+
+func (r *CatalogRepo) RestoreWorkflowRevision(id string) (domain.WorkflowDefinition, error) {
+	rev, ok := r.Revision(id)
+	if !ok || rev.Kind != "workflow" {
+		return domain.WorkflowDefinition{}, fmt.Errorf("revision not found")
+	}
+	var wf domain.WorkflowDefinition
+	if err := json.Unmarshal(rev.Payload, &wf); err != nil {
+		return domain.WorkflowDefinition{}, err
+	}
+	current, found := r.Workflow(wf.ID)
+	if !found {
+		return domain.WorkflowDefinition{}, fmt.Errorf("workflow %s not found", wf.ID)
+	}
+	wf.Revision = current.Revision
+	return wf, r.PutWorkflow(wf)
+}
+
+func (r *CatalogRepo) RestoreAgentRevision(id string) (domain.AgentDefinition, error) {
+	rev, ok := r.Revision(id)
+	if !ok || rev.Kind != "agent" {
+		return domain.AgentDefinition{}, fmt.Errorf("revision not found")
+	}
+	var agent domain.AgentDefinition
+	if err := json.Unmarshal(rev.Payload, &agent); err != nil {
+		return domain.AgentDefinition{}, err
+	}
+	if current, found := r.Agent(agent.ID); found {
+		agent.Version = current.Version + 1
+	}
+	return agent, r.PutAgent(agent)
+}
+
+// ---------- Production SOP ids ----------
+
+const (
+	issueFixWorkflowID    = "issue-fix-production"
+	requirementWorkflowID = "requirement-development-production"
+)
+
+// DefaultWorkflowID returns the production SOP to bind when an issue has none.
+// Gongfeng issues use the repair loop; TAPD / local requirements use delivery.
+func DefaultWorkflowID(source, kind string) string {
+	if source == "gongfeng" || kind == "issue" {
+		return issueFixWorkflowID
+	}
+	return requirementWorkflowID
+}
+
+// isRequirement reports whether an issue is a requirement (delivery) rather than
+// a defect/repair item.
+func isRequirement(source, kind string) bool {
+	return source != "gongfeng" && kind != "issue"
+}
+
+// bindDefaultWorkflow assigns the SOP an issue should run when it has none yet.
+func bindDefaultWorkflow(v *domain.Issue, projectWorkflowID, projectIssueWorkflowID string) {
+	if v.Source == "gongfeng" && v.Kind == "" {
+		v.Kind = "issue"
+	}
+	if v.WorkflowID != "" {
+		return
+	}
+	if isRequirement(v.Source, v.Kind) {
+		if wf := strings.TrimSpace(projectWorkflowID); wf != "" {
+			v.WorkflowID = wf
+			return
+		}
+	} else if wf := strings.TrimSpace(projectIssueWorkflowID); wf != "" {
+		v.WorkflowID = wf
+		return
+	} else if wf := strings.TrimSpace(projectWorkflowID); wf != "" && isGenericWorkflowID(wf) {
+		// Projects defaulting to a built-in generic template (e.g. the
+		// LoopForge backend delivery SOP a new project starts with) run their
+		// synced Gongfeng issues on it too; projects bound to a production SOP
+		// keep the production default below.
+		v.WorkflowID = wf
+		return
+	}
+	v.WorkflowID = DefaultWorkflowID(v.Source, v.Kind)
+}
+
+// isGenericWorkflowID reports whether the id is one of the platform generic
+// templates stored in generic_templates.
+func isGenericWorkflowID(id string) bool {
+	switch strings.TrimSpace(id) {
+	case GenericBackendDeliveryWorkflowID, GenericProductDeliveryWorkflowID, GenericFrontendDeliveryWorkflowID:
+		return true
+	default:
+		return false
+	}
+}
+
+// ProjectIssueWorkflowID is the conventional per-project defect SOP id.
+func ProjectIssueWorkflowID(projectID string) string {
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return ""
+	}
+	return projectID + "-issue-fix"
+}
+
+// normalizeSandboxProfile keeps only what a driver uses; the removed local
+// driver becomes native.
+func normalizeSandboxProfile(profile domain.SandboxProfile) domain.SandboxProfile {
+	profile.Driver = strings.TrimSpace(profile.Driver)
+	profile.DockerfileID = ""
+	// Each driver keeps only its own recipe, so switching drivers drops the
+	// other one instead of failing the save.
+	if profile.Driver != domain.SandboxDriverDocker {
+		profile.Dockerfile = nil
+	}
+	switch profile.Driver {
+	case domain.SandboxDriverLocal, domain.SandboxDriverNative, domain.SandboxDriverSeatbelt, domain.SandboxDriverBwrap:
+		profile.Driver = domain.SandboxDriverNative
+		profile.ReadOnlyRootFS = false
+	}
+	return profile
+}
+
+func normalizeWorkflowDefinition(workflow domain.WorkflowDefinition) domain.WorkflowDefinition {
+	if strings.TrimSpace(workflow.SandboxProfileID) == "" {
+		workflow.SandboxProfileID = DefaultSandboxProfileID
+	}
+	for index := range workflow.Nodes {
+		node := &workflow.Nodes[index]
+		if node.Type == "command" {
+			node.Type = "script"
+			if strings.TrimSpace(node.Script) == "" {
+				node.Script = node.Command
+			}
+		}
+		if node.Type == "script" {
+			if strings.TrimSpace(node.ScriptLanguage) == "" {
+				node.ScriptLanguage = "shell"
+			}
+			node.Command = ""
+		}
+	}
+	return workflow
+}

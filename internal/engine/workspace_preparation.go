@@ -1,0 +1,508 @@
+package engine
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"agentflow/internal/domain"
+	"agentflow/internal/procwatch"
+	"agentflow/internal/repo"
+	"agentflow/internal/runtime"
+)
+
+func (e *Engine) workspaceSandboxProfile(run domain.Run) (domain.SandboxProfile, runtime.SandboxResources, error) {
+	spec := run.WorkflowSnapshot.SandboxSnapshot
+	if spec == nil {
+		id := strings.TrimSpace(run.WorkflowSnapshot.SandboxProfileID)
+		if id == "" {
+			id = repo.DefaultSandboxProfileID
+		}
+		profile, ok := e.repo.Sandbox(id)
+		if !ok {
+			return profile, runtime.SandboxResources{}, fmt.Errorf("sandbox profile %q not found", id)
+		}
+		var err error
+		if spec, err = resolveSandbox(profile); err != nil {
+			return profile, runtime.SandboxResources{}, err
+		}
+	}
+	if err := domain.ValidateFrozenSandbox(spec.Profile); err != nil {
+		return domain.SandboxProfile{}, runtime.SandboxResources{}, err
+	}
+	return spec.Profile, sandboxResourcesFromSnapshot(spec), nil
+}
+
+// acquireConversationEnvironment does not acquire or steal the SOP scheduler
+// lease. The workspace-use lease fences cleanup; the sandbox's workspace flock
+// fences another process. An active local scheduler shares its existing handle.
+func (e *Engine) acquireConversationEnvironment(ctx context.Context, run domain.Run) (*runEnvironment, error) {
+	if latest, ok := e.repo.RunState(run.ID); ok {
+		run = latest
+	}
+	if e.foreignWorkspaceBind(run) || e.defaultExecutionRunner(run) != "" {
+		return nil, fmt.Errorf("工作区属于其他执行实例")
+	}
+	if !run.WorkspaceCleanedAt.IsZero() {
+		if meta, saved := e.repo.WorkspaceCheckpoint(run.ID); saved && meta.SavedAt != nil {
+			return nil, fmt.Errorf("工作区已回收，请先恢复快照后再打开环境")
+		}
+	}
+	e.runEnvMu.Lock()
+	defer e.runEnvMu.Unlock()
+	if env := e.runEnvs[run.ID]; env != nil {
+		env.setCredentials(e.resolveRunCredentials(run))
+		return env, nil
+	}
+	profile, resources, err := e.workspaceSandboxProfile(run)
+	if err != nil {
+		return nil, err
+	}
+	requirements, err := workspaceConversationRequirements(e.repo, run.WorkflowSnapshot, false)
+	if err != nil {
+		return nil, err
+	}
+	credentials := e.resolveRunCredentials(run)
+	sb, err := e.sandboxes.AcquireRunIn(ctx, run.ID, workspaceRunID(run), profile, requirements, credentials, resources)
+	if err != nil {
+		return nil, err
+	}
+	env := &runEnvironment{sandbox: sb, credentials: credentials}
+	e.runEnvs[run.ID] = env
+	return env, nil
+}
+
+func (e *Engine) preparationSink(runID string) runtime.EventSink {
+	return func(event domain.TelemetryEvent) {
+		switch event.Name {
+		case "workspace.preparation.started", "workspace.preparation.completed", "workspace.preparation.failed":
+			e.AppendRunEvent(runID, event.Name, event.Message)
+		}
+	}
+}
+
+// withPreparationProgress records clone and image-build steps on the run while
+// they happen. A conversation workspace has no nodes, so these events are the
+// only place a slow or failed checkout or build shows up.
+func (e *Engine) withPreparationProgress(ctx context.Context, runID string) context.Context {
+	return procwatch.WithObserver(ctx, func(event procwatch.Event) {
+		e.AppendRunEvent(runID, "workspace."+event.Stage+"."+string(event.Kind), event.Message)
+	})
+}
+
+func (e *Engine) prepareLocalEnvironment(ctx context.Context, run domain.Run, env *runEnvironment) (runtime.WorkspacePreparationStatus, error) {
+	// The first sandbox call below builds the Docker image when it is missing.
+	ctx = e.withPreparationProgress(ctx, run.ID)
+	env.preparing.Store(true)
+	defer env.preparing.Store(false)
+	// Caller owns env.nodeMu so reconstruction is serialized without turning
+	// environment preparation into business-node attempts.
+	assets := e.resolveScriptMCPAssets(run.ExecutionContext.ProjectID, run.ExecutionContext.ResponsibleUserID)
+	if len(runtime.PreparationNodes(workspacePreparationPlan(run))) > 0 {
+		if err := runtime.ProvisionMCPAssets(ctx, env, env.Workspace(), assets, nil); err != nil {
+			return runtime.WorkspacePreparationStatus{Status: "failed", Error: err.Error(), Steps: []runtime.WorkspacePreparationStep{}}, err
+		}
+	}
+	return runtime.EnsureWorkspacePreparation(e.withSSHKnownHosts(ctx), env.sandbox, workspacePreparationPlan(run), run.RepositoryContexts(), e.preparationSink(run.ID))
+}
+
+func (e *Engine) preparedWorkspaceRequest(run domain.Run, request domain.RunnerWorkspaceRequest) (domain.RunnerWorkspaceRequest, error) {
+	runnerID := e.defaultExecutionRunner(run)
+	if runnerID != "" {
+		if run.ExecutionContext.RunnerWorkspaceLayout != domain.RunnerWorkspaceLayoutShared && len(runtime.PreparationNodes(runtime.WorkspacePreparationWorkflow(run.WorkflowSnapshot))) > 0 {
+			return request, fmt.Errorf("此历史运行使用逐节点工作区，不能自动重建共享环境；请重新发起一次运行")
+		}
+		runner, ok := e.repo.Runner(runnerID)
+		if run.IsWorkspace() && (!ok || !runner.SupportsConversationWorkspace()) {
+			return request, fmt.Errorf("对话工作区需要执行机器升级至 %s", domain.RunnerVersionConversationWorkspace)
+		}
+		if !ok || !runner.SupportsWorkspacePreparation() {
+			return request, fmt.Errorf("执行机器需升级至 %s 才能准备环境或打开沙箱终端", domain.RunnerVersionWorkspacePreparation)
+		}
+		if sharesWorkspace(run) && !runner.SupportsWorkspaceOwnerPreparation() {
+			return request, fmt.Errorf("执行机器需升级至 %s 才能操作共享父工作区中的子 SOP 环境", domain.RunnerVersionWorkspaceOwnerPreparation)
+		}
+	}
+	spec, err := e.runnerSandboxSpec(run)
+	if err != nil {
+		return request, err
+	}
+	request.RunID = run.ID
+	request.RunKind = run.Kind
+	request.WorkspaceRunID = workspaceRunID(run)
+	request.RefreshCleanRepositories = request.Operation == domain.RunnerWorkspaceOperationPrepare && workspaceCanRefreshRepositories(run)
+	request.Sandbox = spec
+	// Requests are constructed from the persisted frozen run, never client JSON.
+	wf := workspacePreparationPlan(run)
+	if request.Operation == domain.RunnerWorkspaceOperationPreparationRecord {
+		wf = runtime.WorkspacePreparationWorkflow(run.WorkflowSnapshot)
+		found := false
+		for _, node := range wf.Nodes {
+			if node.ID == request.PreparationNodeID && node.RunOnWorkspaceRebuild {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return request, fmt.Errorf("节点未启用工作区重建执行")
+		}
+	}
+	request.Workflow = &wf
+	request.Repositories = run.RepositoryContexts()
+	credentials := e.resolveRunCredentials(run)
+	invocation := &domain.RunnerInvocation{}
+	bindRunnerRepositories(invocation, run, credentials.GitUserName, credentials.GitUserEmail)
+	invocation.GitSSHUserID = 0
+	invocation.GitHTTPUserID = 0
+	assets := e.resolveScriptMCPAssets(run.ExecutionContext.ProjectID, run.ExecutionContext.ResponsibleUserID)
+	invocation.Assets = assets
+	invocation.MCPCallServers = assets.MCPServers
+	request.PreparationInvocation = invocation
+	// Status and terminal I/O don't need keys. A separate platform instance
+	// can also resolve its own credentials from the shared store.
+	request.TerminalGitSSHKeys = nil
+	request.TerminalGitHTTPCredentials = nil
+	terminalOpen := request.Operation == domain.RunnerWorkspaceOperationTerminal && request.Terminal != nil && request.Terminal.Operation == "open"
+	if runnerID != "" && (request.Operation == domain.RunnerWorkspaceOperationPrepare || terminalOpen) {
+		invocation.GitHTTPCredentials = credentials.GitHTTPCredentials
+		if len(invocation.GitSSHRemotes()) > 0 {
+			invocation.GitSSHKeys = credentials.GitSSHKeys
+		}
+	}
+	if runnerID != "" && terminalOpen {
+		terminalCredentials := e.WorkspaceTerminalGitCredentials(context.Background(), run, request.TerminalOwner)
+		request.TerminalGitHTTPCredentials = terminalCredentials.HTTPS
+		request.TerminalGitSSHKeys = terminalCredentials.SSHKeys
+	}
+	request.RunStatus = run.Status
+	request.WorkspaceLayout = run.ExecutionContext.RunnerWorkspaceLayout
+	return request, nil
+}
+
+func workspaceCanRefreshRepositories(run domain.Run) bool {
+	if sharesWorkspace(run) {
+		return false
+	}
+	preparation := map[string]bool{}
+	for _, node := range runtime.PreparationNodes(runtime.WorkspacePreparationWorkflow(run.WorkflowSnapshot)) {
+		preparation[node.ID] = true
+	}
+	for id, node := range run.Nodes {
+		if node != nil && node.Attempt > 0 && !preparation[id] {
+			return false
+		}
+	}
+	return true
+}
+
+func (e *Engine) remoteWorkspacePreparation(ctx context.Context, run domain.Run, operation string) (runtime.WorkspacePreparationStatus, error) {
+	request, err := e.preparedWorkspaceRequest(run, domain.RunnerWorkspaceRequest{RunID: run.ID, Operation: operation})
+	if err != nil {
+		return runtime.WorkspacePreparationStatus{}, err
+	}
+	response, err := e.requestWorkspaceCheckpoint(ctx, run, request)
+	if err != nil {
+		return runtime.WorkspacePreparationStatus{}, err
+	}
+	var state runtime.WorkspacePreparationStatus
+	if len(response.Payload) > 0 {
+		_ = json.Unmarshal(response.Payload, &state)
+	}
+	if response.Error != "" {
+		if state.Status == "" {
+			state.Status = "failed"
+		}
+		state.Error = response.Error
+		return state, runnerWorkspaceResponseError(response)
+	}
+	if state.Status == "" {
+		return state, fmt.Errorf("执行端尚不支持工作区准备，请更新执行器")
+	}
+	return state, nil
+}
+
+// WorkspacePreparationStatus reads only the last recorded readiness state.
+// Actual source and environment fingerprints are checked before every use.
+func (e *Engine) WorkspacePreparationStatus(ctx context.Context, id string) (runtime.WorkspacePreparationStatus, error) {
+	run, ok := e.repo.RunState(id)
+	if !ok {
+		return runtime.WorkspacePreparationStatus{}, fmt.Errorf("运行不存在")
+	}
+	if e.defaultExecutionRunner(run) != "" || e.foreignWorkspaceBind(run) {
+		return e.remoteWorkspacePreparation(ctx, run, domain.RunnerWorkspaceOperationPreparationStatus)
+	}
+	root, reason := e.LocalRunWorkspace(run)
+	if reason != "" {
+		return runtime.WorkspacePreparationStatus{Status: "unprepared", Steps: []runtime.WorkspacePreparationStep{}}, nil
+	}
+	e.runEnvMu.Lock()
+	scopeEnv := e.runEnvs[id]
+	e.runEnvMu.Unlock()
+	if scopeEnv == nil {
+		return runtime.WorkspacePreparationStatus{Status: "unprepared", Error: "执行环境尚未检查；文件仍可浏览", Steps: []runtime.WorkspacePreparationStep{}}, nil
+	}
+	state := runtime.ReadWorkspacePreparationStatus(root, scopeEnv.ID())
+	if state.Status == "preparing" {
+		e.runEnvMu.Lock()
+		env := e.runEnvs[id]
+		active := env != nil && env.preparing.Load()
+		e.runEnvMu.Unlock()
+		if !active {
+			state.Status = "unprepared"
+			state.Error = "上次工作区准备已中断，请重新准备"
+		}
+	}
+
+	if state.Status == "ready" {
+		e.runEnvMu.Lock()
+		env := e.runEnvs[id]
+		e.runEnvMu.Unlock()
+		reason := ""
+		if env == nil {
+			reason = "执行环境尚未检查；文件仍可浏览"
+		} else {
+			epoch, err := runtime.ReadSandboxEnvironmentIdentity(ctx, env.sandbox)
+			if err != nil || !runtime.WorkspacePreparationReusable(state, workspacePreparationPlan(run), run.RepositoryContexts(), epoch) {
+				reason = "执行环境或准备配置已变化，需要重新准备"
+			}
+		}
+		if reason != "" {
+			state.Status = "unprepared"
+			state.Error = reason
+			for i := range state.Steps {
+				state.Steps[i].Status = "unprepared"
+			}
+			return state, nil
+		}
+	}
+	return state, nil
+}
+
+// EnsureWorkspaceReady establishes the execution environment after file
+// restoration. It deliberately leaves the run outcome and node history intact.
+func (e *Engine) EnsureWorkspaceReady(ctx context.Context, id string) (runtime.WorkspacePreparationStatus, error) {
+	run, ok := e.repo.RunState(id)
+	if !ok {
+		return runtime.WorkspacePreparationStatus{}, fmt.Errorf("运行不存在")
+	}
+	if e.defaultExecutionRunner(run) != "" || e.foreignWorkspaceBind(run) {
+		return e.remoteWorkspacePreparation(ctx, run, domain.RunnerWorkspaceOperationPrepare)
+	}
+	env, err := e.acquireConversationEnvironment(ctx, run)
+	if err != nil {
+		return runtime.WorkspacePreparationStatus{Status: "failed", Error: err.Error(), Steps: []runtime.WorkspacePreparationStep{}}, err
+	}
+	env.nodeMu.Lock()
+	defer env.nodeMu.Unlock()
+	if current, ok := e.repo.RunState(id); ok {
+		run = current
+	}
+	if run.HasActiveNode() || env.activeExecutions.Load() > 0 || e.workspaceTerminals.HasRunScope(id) || e.WorkspaceActive != nil && e.WorkspaceActive(run) {
+		state := runtime.ReadWorkspacePreparationStatus(env.Workspace(), env.ID())
+		epoch, err := runtime.ReadSandboxEnvironmentIdentity(ctx, env.sandbox)
+		// The environment agents already run in serves the IDE terminal too.
+		if err == nil && runtime.WorkspacePreparationReusable(state, workspacePreparationPlan(run), run.RepositoryContexts(), epoch) {
+			return state, nil
+		}
+		if state.Status != "preparing" && runtime.WorkspacePreparationTrivial(workspacePreparationPlan(run)) {
+			return runtime.WorkspacePreparationStatus{Status: "ready", Steps: []runtime.WorkspacePreparationStep{}}, nil
+		}
+		return runtime.WorkspacePreparationStatus{Status: "unprepared", Error: "成员或终端正在使用工作区，请结束当前操作后重新准备", Steps: []runtime.WorkspacePreparationStep{}}, fmt.Errorf("成员或终端正在使用工作区，请结束当前操作后重新准备")
+	}
+	return e.prepareLocalEnvironment(ctx, run, env)
+}
+
+func (e *Engine) PrepareNodeWorkspace(ctx context.Context, run domain.Run, env *runEnvironment) (runtime.WorkspacePreparationStatus, error) {
+	if len(runtime.PreparationNodes(runtime.WorkspacePreparationWorkflow(run.WorkflowSnapshot))) == 0 {
+		return runtime.WorkspacePreparationStatus{Status: "ready", Steps: []runtime.WorkspacePreparationStep{}}, nil
+	}
+	if e.defaultExecutionRunner(run) != "" {
+		if run.IsWorkspace() {
+			if current, ok := e.repo.RunState(run.ID); ok {
+				run = current
+			}
+		}
+		// A sibling branch, group role, finishing task or snapshot may hold the
+		// runner fence for a moment (or for its whole preparation). That is a
+		// reason to wait, never to fail this node.
+		return e.waitWorkspaceNotBusy(ctx, run, func(run domain.Run) (runtime.WorkspacePreparationStatus, error) {
+			if run.IsWorkspace() {
+				state, statusErr := e.remoteWorkspacePreparation(ctx, run, domain.RunnerWorkspaceOperationPreparationStatus)
+				if statusErr == nil && state.Status == "ready" {
+					return state, nil
+				}
+			}
+			return e.remoteWorkspacePreparation(ctx, run, domain.RunnerWorkspaceOperationPrepare)
+		})
+	}
+	if run.IsWorkspace() && env.activeExecutions.Load() > 0 {
+		state := runtime.ReadWorkspacePreparationStatus(env.Workspace(), env.ID())
+		epoch, err := runtime.ReadSandboxEnvironmentIdentity(ctx, env.sandbox)
+		if err == nil && runtime.WorkspacePreparationReusable(state, workspacePreparationPlan(run), run.RepositoryContexts(), epoch) {
+			return state, nil
+		}
+		return state, fmt.Errorf("正在协作的工作区环境发生变化，请等待当前分工结束后重新准备")
+	}
+	return e.prepareLocalEnvironment(ctx, run, env)
+}
+
+// HandleWorkspaceTerminal uses exactly the same environment and preparation
+// contract as SOP execution. The pool owns the PTY, the Engine owns the sandbox.
+func (e *Engine) HandleWorkspaceTerminal(ctx context.Context, id string, pool *runtime.TerminalPool, scope string, req domain.WorkspaceTerminalRequest, actorID int64) (runtime.TerminalResult, error) {
+	if req.Operation == "open" {
+		if err := e.RestoreConversationWorkspaceIfNeeded(ctx, id); err != nil {
+			return runtime.TerminalResult{}, err
+		}
+		if _, err := e.EnsureWorkspaceReady(ctx, id); err != nil {
+			return runtime.TerminalResult{}, err
+		}
+	}
+	run, _ := e.repo.RunState(id)
+	run.ID = id
+	var credentials runtime.TerminalGitCredentials
+	if req.Operation == "open" {
+		credentials = e.WorkspaceTerminalGitCredentials(ctx, run, actorID)
+	}
+	return e.HandlePreparedWorkspaceTerminal(ctx, run, pool, scope, req, credentials)
+}
+
+// WorkspaceTerminalGitCredentials resolves the opening user's credentials before
+// acquiring an editor transaction on the run.
+func (e *Engine) WorkspaceTerminalGitCredentials(ctx context.Context, run domain.Run, actorID int64) runtime.TerminalGitCredentials {
+	if actorID <= 0 {
+		return runtime.TerminalGitCredentials{}
+	}
+	return runtime.TerminalGitCredentials{
+		HTTPS:   e.repo.GitHTTPCredentialSecrets(ctx, actorID),
+		SSHKeys: e.repo.GitSSHKeysForRemotes(actorID, sshRepositoryURLs(run.RepositoryContexts())),
+	}
+}
+
+// HandlePreparedWorkspaceTerminal takes the run from its caller, which may
+// hold the run row locked: reading it again here would wait on that lock.
+// The run must carry its node states (RunState, not a bare locked row):
+// without them every succeeded preparation step looks pending and the
+// readiness check would be skipped as if there were nothing to prepare.
+func (e *Engine) HandlePreparedWorkspaceTerminal(ctx context.Context, run domain.Run, pool *runtime.TerminalPool, scope string, req domain.WorkspaceTerminalRequest, credentials runtime.TerminalGitCredentials) (runtime.TerminalResult, error) {
+	id := run.ID
+	if req.Operation != "open" {
+		return pool.HandleSandbox(ctx, nil, scope, req, nil)
+	}
+	e.runEnvMu.Lock()
+	env := e.runEnvs[id]
+	e.runEnvMu.Unlock()
+	if env == nil {
+		return runtime.TerminalResult{}, fmt.Errorf("工作区环境尚未准备，请重新打开终端")
+	}
+
+	state := runtime.ReadWorkspacePreparationStatus(env.Workspace(), env.ID())
+	epoch, err := runtime.ReadSandboxEnvironmentIdentity(ctx, env.sandbox)
+	trivial := len(run.WorkflowSnapshot.Nodes) > 0 && runtime.WorkspacePreparationTrivial(workspacePreparationPlan(run))
+	if !trivial && (err != nil || state.Status != "ready" || state.Environment != epoch) {
+		return runtime.TerminalResult{}, fmt.Errorf("工作区执行环境已变化，请重新准备后打开终端")
+	}
+	return pool.HandleSandboxWithGit(e.withSSHKnownHosts(ctx), env.sandbox, scope, req, nil, credentials)
+}
+
+// TrustedWorkspaceRequest attaches frozen execution configuration to an
+// authenticated workspace transport. It is never exposed as user-controlled configuration.
+func (e *Engine) TrustedWorkspaceRequest(id string, request domain.RunnerWorkspaceRequest) (domain.RunnerWorkspaceRequest, error) {
+	run, ok := e.repo.RunState(id)
+	if !ok {
+		return request, fmt.Errorf("运行不存在")
+	}
+	return e.preparedWorkspaceRequest(run, request)
+}
+
+func (e *Engine) WorkspaceRemoteHost(run domain.Run) bool { return e.foreignWorkspaceBind(run) }
+func (e *Engine) ForwardWorkspaceRequest(ctx context.Context, run domain.Run, request domain.RunnerWorkspaceRequest) (domain.RunnerWorkspaceResponse, error) {
+	trusted, err := e.preparedWorkspaceRequest(run, request)
+	if err != nil {
+		return domain.RunnerWorkspaceResponse{}, err
+	}
+	return e.requestWorkspaceCheckpoint(ctx, run, trusted)
+}
+
+// A settled historical workflow may refer to a role removed from the catalog.
+// Opening its files/terminal must not require resurrecting that model role.
+// Execution still uses the strict workflow validation and executor resolution.
+func workspaceConversationRequirements(st *repo.Store, wf domain.WorkflowDefinition, codexLoginRelay bool) (runtime.SandboxRequirements, error) {
+	var items []runtime.SandboxRequirements
+	for _, node := range wf.Nodes {
+		if node.Type != "agent" {
+			continue
+		}
+		agent, ok := workflowAgent(st, wf, node.AgentID)
+		if !ok {
+			continue
+		}
+		executor, err := workflowNodeExecutor(st, wf, node, agent)
+		if err != nil {
+			continue
+		}
+		requirements := runtime.ProviderRequirements(executor.Kind)
+		// Freeze the relay need for the whole workflow so preparation, scripts,
+		// terminals and agents can reuse the same Docker container.
+		requirements.RunnerLoginRelay = codexLoginRelay && executor.Kind == "codex"
+		items = append(items, requirements)
+	}
+	return runtime.MergeSandboxRequirements(items...), nil
+}
+
+// ForwardPreparedWorkspaceRequest is used under an editor transaction after
+// the caller has bound all configuration outside the run-row lock.
+func (e *Engine) ForwardPreparedWorkspaceRequest(ctx context.Context, run domain.Run, request domain.RunnerWorkspaceRequest) (domain.RunnerWorkspaceResponse, error) {
+	run.ExecutionContext.ExecutionMode = domain.ExecutionModeCloud
+	return e.requestWorkspaceCheckpoint(ctx, run, request)
+}
+
+// Only scripts that already succeeded in normal SOP execution can be replayed
+// to reconstruct its environment. Pending/failed/current/downstream nodes keep
+// their ordinary scheduling semantics and are never executed early.
+func workspacePreparationPlan(run domain.Run) domain.WorkflowDefinition {
+	wf := runtime.WorkspacePreparationWorkflow(run.WorkflowSnapshot)
+	wf.Nodes = append([]domain.WorkflowNode(nil), wf.Nodes...)
+	states := run.Nodes
+	for i := range wf.Nodes {
+		if !wf.Nodes[i].RunOnWorkspaceRebuild {
+			continue
+		}
+		state := states[wf.Nodes[i].ID]
+		if state == nil || state.Status != "succeeded" {
+			wf.Nodes[i].RunOnWorkspaceRebuild = false
+		}
+	}
+	wf.CollaborationMode = ""
+	wf.SOPCheckpoint = nil
+	return wf
+}
+
+func (e *Engine) recordNodeWorkspacePreparation(ctx context.Context, run domain.Run, env *runEnvironment, node domain.WorkflowNode, output string) error {
+	if len(output) > 32<<10 {
+		output = output[:32<<10]
+	}
+	if !node.RunOnWorkspaceRebuild {
+		return nil
+	}
+	if e.defaultExecutionRunner(run) != "" {
+		request, err := e.preparedWorkspaceRequest(run, domain.RunnerWorkspaceRequest{RunID: run.ID, Operation: domain.RunnerWorkspaceOperationPreparationRecord, PreparationNodeID: node.ID, PreparationOutput: output})
+		if err != nil {
+			return err
+		}
+		response, err := e.requestWorkspaceCheckpoint(ctx, run, request)
+		if err != nil {
+			return err
+		}
+		if response.Error != "" {
+			return fmt.Errorf("记录工作区重建步骤失败：%s", response.Error)
+		}
+		return nil
+	}
+	// The receipt is read-modify-written; parallel branches no longer hold
+	// nodeMu while executing, so take it for the record itself.
+	env.nodeMu.Lock()
+	defer env.nodeMu.Unlock()
+	_, err := runtime.RecordWorkspacePreparation(ctx, env.sandbox, runtime.WorkspacePreparationWorkflow(run.WorkflowSnapshot), run.RepositoryContexts(), node.ID, output)
+	return err
+}

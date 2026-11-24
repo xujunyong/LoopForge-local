@@ -1,0 +1,386 @@
+package tracker
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"agentflow/internal/domain"
+)
+
+// ErrNoOpenMR reports that no open MR exists for the requested source branch.
+// Callers treat it as a normal outcome (the SOP may deliver without an MR).
+var ErrNoOpenMR = errors.New("no open MR for source branch")
+
+// MergeSourceBranchMR merges the first open Gongfeng MR whose source branch is
+// sourceBranch. Prefer EnsureAndMergeBranchMR when the target branch is known.
+func (s *Service) MergeSourceBranchMR(project, sourceBranch string) (string, error) {
+	return s.EnsureAndMergeBranchMR(project, sourceBranch, "", "", "")
+}
+
+// EnsureAndMergeBranchMR finds or creates a Gongfeng MR from source→target and
+// merges it with a merge commit. The source branch is kept. An empty target
+// only merges an already-open MR for the source (no create). Same source and
+// target is a no-op.
+func (s *Service) EnsureAndMergeBranchMR(project, sourceBranch, targetBranch, title, description string) (string, error) {
+	if strings.HasPrefix(project, "github:") {
+		return s.githubMergeBranch(project, sourceBranch, targetBranch, title, description)
+	}
+	project = strings.TrimSpace(project)
+	src := strings.TrimSpace(sourceBranch)
+	tgt := strings.TrimSpace(targetBranch)
+	if src == "" {
+		return "", errors.New("source branch is required")
+	}
+	if tgt != "" && src == tgt {
+		return "", nil
+	}
+	if tgt != "" && project == "" {
+		return "", errors.New("project, source branch and target branch are required")
+	}
+	client, _, err := s.gongfengClientForRemoteProject(project)
+	if err != nil {
+		return "", err
+	}
+
+	globalID, iid, found, searchErr := s.findOpenBranchMR(client, project, src, tgt)
+	if searchErr != nil {
+		return "", searchErr
+	}
+	if !found {
+		if tgt == "" {
+			return "", ErrNoOpenMR
+		}
+		createTitle := strings.TrimSpace(title)
+		if createTitle == "" {
+			createTitle = fmt.Sprintf("LoopForge: %s → %s", src, tgt)
+		}
+		createDesc := strings.TrimSpace(description)
+		if createDesc == "" {
+			createDesc = fmt.Sprintf("定时 SOP 将 `%s` 合入 `%s`。", src, tgt)
+		}
+		_, createErr := client.Clone(30*time.Second).CallTool("create_merge_request", map[string]any{
+			"project_id":    project,
+			"source_branch": src,
+			"target_branch": tgt,
+			"title":         createTitle,
+			"description":   createDesc,
+		})
+		// Search again even when create returned an error: another instance may
+		// have won the create race and left the reusable MR open.
+		globalID, iid, found, searchErr = s.findOpenBranchMR(client, project, src, tgt)
+		if searchErr != nil {
+			return "", searchErr
+		}
+		if !found {
+			if createErr != nil {
+				return "", fmt.Errorf("create MR %s → %s: %w", src, tgt, createErr)
+			}
+			return "", fmt.Errorf("create_merge_request did not return an id")
+		}
+	}
+	mergeArgs := map[string]any{
+		"project_id":       project,
+		"merge_request_id": globalID,
+		"merge_type":       "merge",
+	}
+	if msg := strings.TrimSpace(title); msg != "" {
+		mergeArgs["merge_commit_message"] = msg
+	}
+	if _, err := client.Clone(60*time.Second).CallTool("merge_merge_request", mergeArgs); err != nil {
+		return "", fmt.Errorf("merge MR !%d: %w", iid, err)
+	}
+	return "!" + strconv.Itoa(iid), nil
+}
+
+func (s *Service) findOpenBranchMR(client *MCPClient, project, sourceBranch, targetBranch string) (globalID, iid int, found bool, err error) {
+	args := map[string]any{
+		"project_id":    project,
+		"source_branch": sourceBranch,
+		"state":         "opened",
+		"per_page":      5,
+	}
+	if targetBranch != "" {
+		args["target_branch"] = targetBranch
+	}
+	raw, err := client.Clone(30*time.Second).CallTool("search_merge_request", args)
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("search MR for %s: %w", sourceBranch, err)
+	}
+	globalID, iid, found = parseGongfengOpenMR(raw, targetBranch)
+	return globalID, iid, found, nil
+}
+
+// parseGongfengMROpenID extracts the (global id, iid) pair of the first open
+// MR in a search_merge_request response. The MCP payload shape varies, so it
+// mirrors parseGongfengMRState's layered decoding.
+func parseGongfengMROpenID(raw string) (globalID, iid int, ok bool) {
+	return parseGongfengOpenMR(raw, "")
+}
+
+type gongfengListedMR struct {
+	ID           int    `json:"id"`
+	IID          int    `json:"iid"`
+	State        string `json:"state"`
+	TargetBranch string `json:"target_branch"`
+	SourceBranch string `json:"source_branch"`
+	MergedAt     string `json:"merged_at"`
+	ResolvedAt   string `json:"resolved_at"`
+	UpdatedAt    string `json:"updated_at"`
+	WebURL       string `json:"web_url"`
+	SHA          string `json:"sha"`
+}
+
+// FindBranchMR returns the delivery MR whose source is sourceBranch: the
+// newest non-closed one, else the newest closed one. It is the authoritative
+// MR of a run repository; agents' MR links in artifacts are only a fallback.
+func (s *Service) FindBranchMR(project, sourceBranch string) (domain.DeliveryMR, bool, error) {
+	if strings.HasPrefix(project, "github:") {
+		return s.githubFindBranch(project, sourceBranch)
+	}
+	project = strings.TrimSpace(project)
+	src := strings.TrimSpace(sourceBranch)
+	if project == "" || src == "" {
+		return domain.DeliveryMR{}, false, nil
+	}
+	client, _, err := s.gongfengClientForRemoteProject(project)
+	if err != nil {
+		return domain.DeliveryMR{}, false, err
+	}
+	raw, err := client.Clone(15*time.Second).CallTool("search_merge_request", map[string]any{
+		"project_id":    project,
+		"source_branch": src,
+		"per_page":      20,
+	})
+	if err != nil {
+		return domain.DeliveryMR{}, false, fmt.Errorf("search MR for %s: %w", src, err)
+	}
+	item, ok := pickBranchMR(parseGongfengMRRecords(raw), src)
+	if !ok {
+		return domain.DeliveryMR{}, false, nil
+	}
+	url := strings.TrimSpace(item.WebURL)
+	if _, _, parsed, ok := domain.ParseGongfengMR(url); ok {
+		url = parsed
+	} else {
+		url = domain.GongfengMRURL(project, item.IID)
+	}
+	return domain.DeliveryMR{
+		Project:       project,
+		IID:           item.IID,
+		URL:           url,
+		TargetBranch:  item.TargetBranch,
+		GongfengState: normalizeMRState(item.State),
+	}, true, nil
+}
+
+// FindBranchMRsInto lists every MR from the query's source branch into its
+// target branch with the head commit the host reports. Unlike FindBranchMR it
+// never answers with an MR into another branch, and it keeps all of them so a
+// caller can tell an earlier merged MR from one that carries the current tip.
+// It reads with the run's credentials: GitHub uses the token the run pushed
+// with, else the Owner of the run's project; Gongfeng uses the MCP binding of
+// the run's project.
+func (s *Service) FindBranchMRsInto(q domain.BranchMRQuery) ([]domain.DeliveryMR, error) {
+	project := strings.TrimSpace(q.RemoteProject)
+	src, target := strings.TrimSpace(q.SourceBranch), strings.TrimSpace(q.TargetBranch)
+	if project == "" || src == "" || target == "" {
+		return nil, nil
+	}
+	if strings.HasPrefix(project, "github:") {
+		g, identity, err := s.githubClientForRun(project, q.ProjectID, q.GitToken)
+		if err != nil {
+			return nil, err
+		}
+		pulls, err := g.listPulls(src, target)
+		if err != nil {
+			return nil, fmt.Errorf("以%s查询 GitHub 失败：%w", identity, err)
+		}
+		return githubPullsInto(pulls, project, src, target), nil
+	}
+	client, source, err := s.gongfengClientForRun(project, q)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := client.Clone(15*time.Second).CallTool("search_merge_request", map[string]any{
+		"project_id":    project,
+		"source_branch": src,
+		"target_branch": target,
+		"per_page":      20,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("以 %s 查询工蜂 MR %s 失败：%w", source, src, err)
+	}
+	return gongfengMRsInto(parseGongfengMRRecords(raw), project, src, target), nil
+}
+
+// gongfengClientForRun queries through the run project's Gongfeng MCP as the
+// run's responsible user; without a run project it falls back to the first
+// project that binds the repository.
+func (s *Service) gongfengClientForRun(project string, q domain.BranchMRQuery) (*MCPClient, string, error) {
+	local := strings.TrimSpace(q.ProjectID)
+	if local == "" || s.projectAuth == nil {
+		return s.gongfengClientForRemoteProject(project)
+	}
+	if q.ResponsibleUserID <= 0 {
+		return s.trackerClientForProject("gongfeng", local)
+	}
+	user, ok := s.projectAuth.User(q.ResponsibleUserID)
+	if !ok {
+		return nil, "none", fmt.Errorf("本轮责任人 %d 不存在", q.ResponsibleUserID)
+	}
+	binding, err := bindProjectUserTrackerMCP("gongfeng", s.cfg.Get(), s.projectAuth.MCPServers(), local, user, "责任人")
+	if err != nil {
+		return nil, binding.Source, err
+	}
+	return NewMCPClient(binding.URL, binding.Headers), binding.Source, nil
+}
+
+func gongfengMRsInto(items []gongfengListedMR, project, sourceBranch, targetBranch string) []domain.DeliveryMR {
+	var out []domain.DeliveryMR
+	for _, item := range items {
+		if s := strings.TrimSpace(item.SourceBranch); s != "" && !domain.SameGitBranch(s, sourceBranch) {
+			continue
+		}
+		if !domain.SameGitBranch(item.TargetBranch, targetBranch) {
+			continue
+		}
+		url := strings.TrimSpace(item.WebURL)
+		if _, _, parsed, ok := domain.ParseGongfengMR(url); ok {
+			url = parsed
+		} else {
+			url = domain.GongfengMRURL(project, item.IID)
+		}
+		out = append(out, domain.DeliveryMR{Project: project, IID: item.IID, URL: url, TargetBranch: item.TargetBranch, GongfengState: normalizeMRState(item.State), HeadSHA: strings.TrimSpace(item.SHA)})
+	}
+	return out
+}
+
+func pickBranchMR(items []gongfengListedMR, sourceBranch string) (gongfengListedMR, bool) {
+	var best gongfengListedMR
+	found, bestClosed := false, false
+	for _, item := range items {
+		if s := strings.TrimSpace(item.SourceBranch); s != "" && !domain.SameGitBranch(s, sourceBranch) {
+			continue
+		}
+		closed := normalizeMRState(item.State) == "closed"
+		switch {
+		case !found:
+		case bestClosed && !closed:
+		case bestClosed == closed && item.IID > best.IID:
+		default:
+			continue
+		}
+		best, found, bestClosed = item, true, closed
+	}
+	return best, found
+}
+
+func parseGongfengMRRecords(raw string) []gongfengListedMR {
+	var out []gongfengListedMR
+	seen := map[int]struct{}{}
+	add := func(items []gongfengListedMR) {
+		for _, item := range items {
+			if item.IID <= 0 {
+				continue
+			}
+			if _, ok := seen[item.IID]; ok {
+				continue
+			}
+			seen[item.IID] = struct{}{}
+			out = append(out, item)
+		}
+	}
+	visitGongfengMRPayload(raw, func(items []gongfengListedMR) bool {
+		add(items)
+		return false
+	})
+	return out
+}
+
+func parseGongfengTime(raw string) time.Time {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}
+	}
+	for _, layout := range []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02 15:04:05",
+		"2006-01-02T15:04:05.000-0700",
+		"2006-01-02T15:04:05-0700",
+	} {
+		if t, err := time.Parse(layout, raw); err == nil {
+			return t.UTC()
+		}
+	}
+	return time.Time{}
+}
+
+// Gongfeng returns resolved_at for merged MRs; some versions use merged_at.
+// updated_at can change after a merge, so it cannot place a merge in a bucket.
+func gongfengMRMergedAt(mr gongfengListedMR) time.Time {
+	if normalizeMRState(mr.State) == "merged" {
+		for _, raw := range []string{mr.MergedAt, mr.ResolvedAt} {
+			if at := parseGongfengTime(raw); !at.IsZero() {
+				return at
+			}
+		}
+	}
+	return time.Time{}
+}
+
+func parseGongfengOpenMR(raw, wantTarget string) (globalID, iid int, ok bool) {
+	first := func(items []gongfengListedMR) (int, int, bool) {
+		want := strings.TrimSpace(wantTarget)
+		for _, item := range items {
+			switch normalizeMRState(item.State) {
+			case "opened", "reopened":
+				if want != "" && strings.TrimSpace(item.TargetBranch) != "" && !strings.EqualFold(strings.TrimSpace(item.TargetBranch), want) {
+					continue
+				}
+				return item.ID, item.IID, item.ID != 0 || item.IID != 0
+			}
+		}
+		return 0, 0, false
+	}
+	visitGongfengMRPayload(raw, func(items []gongfengListedMR) bool {
+		globalID, iid, ok = first(items)
+		return ok
+	})
+	return globalID, iid, ok
+}
+
+// visitGongfengMRPayload hands each candidate MR list of a search_merge_request
+// payload to visit, in order: {"data":[...]}, {"data":{...}}, {"items":[...]},
+// a bare array, then a bare object. It stops as soon as visit returns true.
+func visitGongfengMRPayload(raw string, visit func([]gongfengListedMR) bool) {
+	var wrapped struct {
+		Data  json.RawMessage    `json:"data"`
+		Items []gongfengListedMR `json:"items"`
+	}
+	if json.Unmarshal([]byte(raw), &wrapped) == nil {
+		var list []gongfengListedMR
+		if json.Unmarshal(wrapped.Data, &list) == nil && visit(list) {
+			return
+		}
+		var one gongfengListedMR
+		if json.Unmarshal(wrapped.Data, &one) == nil && visit([]gongfengListedMR{one}) {
+			return
+		}
+		if visit(wrapped.Items) {
+			return
+		}
+	}
+	var list []gongfengListedMR
+	if json.Unmarshal([]byte(raw), &list) == nil && visit(list) {
+		return
+	}
+	var one gongfengListedMR
+	if json.Unmarshal([]byte(raw), &one) == nil {
+		visit([]gongfengListedMR{one})
+	}
+}

@@ -1,0 +1,85 @@
+package repo
+
+import (
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+
+	"agentflow/internal/domain"
+	"gorm.io/gorm"
+)
+
+// ---------- Tasks ----------
+
+func (r *TasksRepo) Tasks() []domain.Task {
+	out := payloadList[domain.Task](r.DB, "tasks", "")
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out
+}
+
+func (r *TasksRepo) Task(id string) (domain.Task, bool) {
+	return payloadOne[domain.Task](r.DB, "tasks", id)
+}
+
+func (r *TasksRepo) PutTask(v domain.Task) error {
+	now := time.Now().UTC()
+	if old, ok := r.Task(v.ID); ok {
+		v.CreatedAt = old.CreatedAt
+	} else {
+		v.CreatedAt = now
+	}
+	v.UpdatedAt = now
+	return upsert(r.DB, "tasks", map[string]any{
+		"id": v.ID, "issue_id": v.IssueID, "run_id": v.RunID, "status": v.Status,
+		"payload": mustJSON(v), "created_at": timePtr(v.CreatedAt), "updated_at": timePtr(v.UpdatedAt),
+	})
+}
+
+// UpdateTaskStatus reconciles an existing task without re-creating it if its
+// issue and execution history were deleted in the meantime.
+func (r *TasksRepo) UpdateTaskStatus(v domain.Task, status string) error {
+	v.Status, v.UpdatedAt = status, time.Now().UTC()
+	return r.DB.Model(&taskRow{}).Where("id = ? AND issue_id = ? AND COALESCE(run_id, '') = ?", v.ID, v.IssueID, v.RunID).
+		Updates(map[string]any{"status": v.Status, "payload": mustJSON(v), "updated_at": timePtr(v.UpdatedAt)}).Error
+}
+
+// createTask uses the task's primary key as the cross-instance idempotency key.
+func (r *TasksRepo) createTask(tx *gorm.DB, v domain.Task) (domain.Task, bool, error) {
+	if strings.TrimSpace(v.ID) == "" || strings.TrimSpace(v.IssueID) == "" {
+		return domain.Task{}, false, fmt.Errorf("task id and issue id are required")
+	}
+	now := time.Now().UTC()
+	v.CreatedAt, v.UpdatedAt = now, now
+	created, err := insertIgnore(tx, "tasks", map[string]any{
+		"id": v.ID, "issue_id": v.IssueID, "run_id": v.RunID, "status": v.Status,
+		"payload": mustJSON(v), "created_at": timePtr(v.CreatedAt), "updated_at": timePtr(v.UpdatedAt),
+	})
+	if err == nil && created {
+		return v, true, nil
+	}
+	if err != nil && !errors.Is(err, gorm.ErrDuplicatedKey) {
+		return domain.Task{}, false, err
+	}
+	existing, ok := payloadOne[domain.Task](tx, "tasks", v.ID)
+	if !ok {
+		return domain.Task{}, false, fmt.Errorf("task reservation was not persisted")
+	}
+	return existing, false, nil
+}
+
+// deleteIssueTasks participates in the issue deletion transaction.
+func (r *TasksRepo) deleteIssueTasks(tx *gorm.DB, issueID string) error {
+	return tx.Where("issue_id = ?", issueID).Delete(&taskRow{}).Error
+}
+
+// IssueHasTasks reports whether the issue was ever dispatched: every SOP
+// dispatch reserves a Task first, and nothing else creates one.
+func (r *TasksRepo) IssueHasTasks(issueID string) (bool, error) {
+	var n int64
+	if err := r.DB.Model(&taskRow{}).Where("issue_id = ?", issueID).Limit(1).Count(&n).Error; err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}

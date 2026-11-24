@@ -1,0 +1,57 @@
+package runtime
+
+import (
+	"context"
+	"fmt"
+	"os"
+	goruntime "runtime"
+	"strings"
+
+	"agentflow/internal/domain"
+)
+
+// OpenRemoteSandbox creates a sandbox at an existing runner task workspace.
+// Unlike Manager.AcquireRun it does not choose a control-plane workspace:
+// the caller owns the exact path and lifecycle on the execution machine.
+func OpenRemoteSandbox(ctx context.Context, id, workspace string, profile domain.SandboxProfile, requirements SandboxRequirements, resources SandboxResources) (Sandbox, error) {
+	if strings.TrimSpace(workspace) == "" {
+		return nil, fmt.Errorf("runner sandbox workspace is required")
+	}
+	var err error
+	if profile.Driver, err = domain.ResolveSandboxDriver(profile.Driver, goruntime.GOOS); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(workspace, 0o700); err != nil {
+		return nil, err
+	}
+	return createDriverSandbox(ctx, "runner sandbox", id, workspace, profile, requirements, resources.Dockerfile)
+}
+
+// WithCommandEnvironment adds task-scoped environment values to a prepared
+// command without exposing CommandSpec's internal execution fields.
+func WithCommandEnvironment(command CommandSpec, values map[string]string) CommandSpec {
+	bound := command
+	bound.environment = mergeEnvironmentMaps(command.environment, values)
+	return bindRunnerLoginLease(bound)
+}
+
+// CommandEnvironment returns a copy of the closed task-scoped environment for
+// runner daemons that spawn a prepared remote command without a Sandbox.Exec
+// binding layer.
+func CommandEnvironment(command CommandSpec) map[string]string {
+	return mergeEnvironmentMaps(nil, command.environment)
+}
+
+// WithSandboxCredentials binds only explicitly requested command credentials to
+// an already-open execution environment. The caller retains sandbox ownership;
+// preparation helpers must not Close this wrapper independently of that owner.
+func WithSandboxCredentials(sandbox Sandbox, credentials RunCredentials) Sandbox {
+	if sandbox == nil {
+		return nil
+	}
+	if managed, ok := sandbox.(*managedSandbox); ok {
+		managed.SetCredentials(credentials)
+		return managed
+	}
+	return &managedSandbox{Sandbox: sandbox, workspace: sandbox.Workspace(), credentials: credentials, slots: make(chan struct{}, 1)}
+}

@@ -1,0 +1,80 @@
+name: validate
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: local
+
+jobs:
+  validate:
+    # ubuntu-latest is Ubuntu 26.04, and actions/setup-python has no 3.8
+    # build for it. Keep the 3.8 cell on 24.04 so the required check name
+    # stays "validate (3.8)".
+    runs-on: ${{ matrix.python-version == '3.8' && 'ubuntu-24.04' || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.8", "3.12"]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v5.6.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: "22"
+      - run: python3 -m pip install pyyaml==6.0.3
+      - run: bash scripts/validate.sh
+      - run: bash scripts/test-observability.sh
+      - run: bash scripts/smoke-install.sh
+      - run: bash scripts/smoke-npm.sh
+
+  tcmcp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v5.6.0
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: "22"
+      - name: Test tcmcp
+        working-directory: local/tools/tcmcp
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install -e '.[dev]'
+          .venv/bin/python -m pytest
+      - name: Build frontend
+        working-directory: local/tools/tcmcp/web
+        run: npm ci && npm run build
+
+  curl-install:
+    # Once per workflow, outside the Python 3.8/3.12 matrix. The script
+    # installs Classic and Portable from a local fake release and does not
+    # contact github.com.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: local
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Smoke-test curl install against a local fake release
+        run: bash scripts/smoke-curl-install.sh
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - run: bash scripts/scan-secrets.sh
+        env:
+          LOOPFORGE_GITLEAKS_TOKEN: ${{ github.token }}

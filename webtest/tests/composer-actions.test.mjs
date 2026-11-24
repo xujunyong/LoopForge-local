@@ -1,0 +1,85 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { loadApp, settle } from '../lib/load-app.mjs';
+
+test('draft restore brings back the description, repositories, branch and target', async (t) => {
+  const app = await loadApp();
+  t.after(app.close);
+  const $ = (s) => app.document.querySelector(s);
+  const draft = { open: true, projectId: 'project-1', input: 'Restored text', target: 'local', repoIds: ['repo-1'], baseBranch: 'feature/keep', workflowId: 'flow-1' };
+  app.evaluate(`sessionStorage.setItem('agentflow.requirementComposer',${JSON.stringify(JSON.stringify(draft))})`);
+  assert.equal(app.evaluate(`restoreRequirementComposer()`), true);
+  assert.ok($('#requirementModal').classList.contains('open'));
+  assert.equal($('#chatInput').value, 'Restored text');
+  assert.equal($('#reqBaseBranch').value, 'feature/keep');
+  assert.equal($('#reqWorkflow').value, 'flow-1', 'an SOP picked before is kept');
+  app.evaluate(`setReqDelivery('none')`);
+  assert.equal(app.evaluate(`JSON.parse(sessionStorage.getItem('agentflow.requirementComposer')).delivery`), 'none');
+  app.evaluate(`state.reqDelivery='sop';applyRequirementComposerDraft(JSON.parse(sessionStorage.getItem('agentflow.requirementComposer')))`);
+  assert.equal($('[data-req-delivery="none"]').getAttribute('aria-checked'), 'true', 'the no-SOP choice is restored');
+  assert.equal($('#reqCreate').disabled, false);
+  const saved = app.evaluate(`JSON.parse(sessionStorage.getItem('agentflow.requirementComposer'))`);
+  assert.equal(saved.input, 'Restored text');
+  assert.equal(saved.repoIds[0], 'repo-1');
+  for (const gone of ['step', 'history', 'answers', 'clarifyResult', 'jobId', 'interrupted']) assert.ok(!(gone in saved), gone);
+
+  app.evaluate(`$('#requirementModal').classList.remove('open');sessionStorage.setItem('agentflow.requirementComposer',JSON.stringify({open:false,input:'x'}))`);
+  assert.equal(app.evaluate(`restoreRequirementComposer()`), false, 'a closed draft is not reopened');
+});
+
+test('repository controls stay in sync and Escape closes the popover before the composer', async (t) => {
+  const app = await loadApp();
+  t.after(app.close);
+  const $ = (s) => app.document.querySelector(s);
+  app.evaluate(`state.data.repositories.push({id:'repo-2',projectId:'project-1',name:'API',defaultBranch:'main'});openRequirementWizard();setReqRepositoryIds(['repo-1'])`);
+  const add = $('#reqRepository select');
+  add.value = 'repo-2';
+  add.dispatchEvent(new app.window.Event('change', { bubbles: true }));
+  assert.deepEqual([...app.evaluate(`selectedReqRepositoryIds()`)], ['repo-1', 'repo-2']);
+  $('[data-remove-req-repo="repo-2"]').click();
+  assert.deepEqual([...app.evaluate(`selectedReqRepositoryIds()`)], ['repo-1']);
+  $('#reqBaseBranch').value = 'feature/x';
+  $('#reqBaseBranch').dispatchEvent(new app.window.Event('input', { bubbles: true }));
+  assert.match($('#reqRepoChipLabel').textContent, /feature\/x/);
+  $('#reqRepoChipToggle').click();
+  app.document.dispatchEvent(new app.window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  assert.equal($('#reqRepoPopover').hidden, true, 'Escape closes the repository popover first');
+  assert.ok($('#requirementModal').classList.contains('open'));
+  app.evaluate(`setReqTarget('tapd')`);
+  assert.equal(app.evaluate(`state.reqTarget`), 'local', 'TAPD cannot be chosen when unconfigured');
+  assert.equal(app.evaluate(`issueCanPushTAPD(state.data.issues[0])`), false);
+  app.evaluate(`state.data.repositories=[];renderReqContext();renderReqFooter()`);
+  assert.equal($('#reqRepoChip').hidden, true);
+  app.evaluate(`state.data.workflows=[];fillReqWorkflow();$('#chatInput').value='x';renderReqFooter()`);
+  assert.equal($('#reqCreate').disabled, false, 'a requirement does not need an SOP to be created');
+  assert.equal($('#reqCreateChat').disabled, false);
+  app.evaluate(`state.reqDelivery='sop';renderReqDelivery()`);
+  assert.equal($('[data-req-delivery="sop"]').disabled, true, 'SOP delivery needs a runnable SOP');
+  assert.equal($('[data-req-delivery="none"]').getAttribute('aria-checked'), 'true');
+  assert.equal($('#reqDeliverySOPHint').textContent, '当前项目还没有可运行的 SOP');
+  assert.equal(app.evaluate(`selectedReqWorkflowId()`), '');
+  app.evaluate(`setReqDelivery('sop')`);
+  assert.equal(app.evaluate(`reqUsesSOP()`), false);
+  app.document.dispatchEvent(new app.window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  await settle(2);
+  assert.equal($('#requirementModal').classList.contains('open'), false);
+});
+
+test('pushing an existing issue to TAPD from the detail page updates it and reports failures', async (t) => {
+  const app = await loadApp();
+  t.after(app.close);
+  const $ = (s) => app.document.querySelector(s);
+  app.evaluate(`pushIssueToTAPDFromDetail('missing')`);
+  await settle(2);
+  assert.match($('#toastContainer').textContent, /未找到工作项/);
+  await app.evaluate(`pushIssueToTAPDFromDetail('issue-1')`);
+  assert.match($('#toastContainer').textContent, /未配置 TAPD/);
+  app.evaluate(`Object.assign(state.data.projects[0],{tapdWorkspaceId:'ws',tapdIterationId:'it'});state.data.syncConfig={tapdMcpUrl:'https://tapd.example/mcp'}`);
+  assert.equal(app.evaluate(`issueCanPushTAPD(state.data.issues[0])`), true);
+  app.router.post('/api/sync/create', (call) => ({ status: 200, body: { ...app.evaluate(`state.data.issues[0]`), id: call.body.issueId, externalRef: { externalId: 'T-42' } } }));
+  await app.evaluate(`pushIssueToTAPDFromDetail('issue-1')`);
+  assert.match($('#toastContainer').textContent, /已在 TAPD 创建需求 T-42/);
+  app.router.post('/api/sync/create', { error: 'tapd down' }, 502);
+  await app.evaluate(`pushIssueToTAPDFromDetail('issue-1')`);
+  assert.match($('#toastContainer').textContent, /tapd down/);
+});

@@ -1,0 +1,116 @@
+import {test,expect} from '@playwright/test';
+import fs from 'node:fs';
+import {password, appReady, switchProject, openSettingsPage} from './helpers.mjs';
+
+async function signIn(page){
+  await page.goto('/login.html');
+  await page.locator('[name="login"]').fill(process.env.LOOPFORGE_TEST_USER || 'admin');
+  await page.locator('[name="password"]').fill(password());
+  await page.locator('button[type="submit"]').click();
+  await appReady(page);
+  await switchProject(page,'welcome');
+}
+
+test('password authentication loads the upstream workspace',async({page,request,baseURL})=>{
+  const errors=[];page.on('pageerror',e=>errors.push(e.message));
+  const anonymous=await request.get('/api/bootstrap');expect(anonymous.status()).toBe(401);
+  const forged=await request.post('/api/auth/password',{headers:{Origin:'https://attacker.invalid'},data:{login:'admin',password:password()}});expect(forged.status()).toBe(403);
+  await signIn(page);
+  await expect(page.locator('.nav[data-view="issues"]')).toBeVisible();
+  await expect(page.locator('#railSettingsEntry')).toBeVisible();
+  expect(errors).toEqual([]);
+  const cookie=(await page.context().cookies(baseURL)).find(c=>c.name==='agentflow_user');
+  expect(cookie.httpOnly).toBe(true);expect(cookie.sameSite).toBe('Lax');
+  await page.request.post('/api/auth/logout');
+  await page.goto('/');
+  await expect(page).toHaveURL(/login\.html$/);
+});
+
+for (const failure of ['server error', 'network error']) {
+  test(`login shows administrator contact when setup status is unavailable (${failure})`, async ({page}) => {
+    await page.route('**/api/auth/setup', route =>
+      failure === 'server error' ? route.fulfill({status: 500}) : route.abort()
+    );
+    await page.goto('/login.html#register');
+    const contact = page.locator('#loginContact');
+    await expect(contact).toBeVisible();
+    await expect(contact).toHaveText('请联系部署管理员创建账号。');
+    await expect(page.locator('#loginSwitch')).toBeHidden();
+    await expect(page.locator('#setupNotice')).toBeHidden();
+    await expect(page.locator('#loginSubmit')).toHaveText('登录');
+  });
+}
+
+test('Chinese/English and light/dark preferences persist across reloads',async({page},info)=>{
+  const errors=[];page.on('pageerror',e=>errors.push(e.message));
+  await signIn(page);
+  await page.locator('.nav[data-view="issues"]').click();
+  await expect(page.locator('html')).toHaveAttribute('lang','zh-CN');
+  await page.screenshot({path:info.outputPath('light-zh.png'),fullPage:true});
+  await page.locator('#userBadge').click();
+  await page.locator('#userProfilePopover [data-theme-pref="dark"]').click();
+  await expect(page.locator('html')).toHaveAttribute('data-theme','dark');
+  await expect(page.locator('#userProfilePopover [data-theme-pref="dark"]')).toHaveAttribute('aria-checked','true');
+  await page.keyboard.press('Escape');
+  await page.mouse.move(800,500);
+  // first-run installs the published image, which still has one toggle button.
+  // This checkout replaces it with a segmented 中 / EN control.
+  const english = page.locator('#langToggle [data-lang-value="en"]');
+  if (await english.count()) await english.click();
+  else await page.locator('#langToggle').click();
+  await expect(page.locator('html')).toHaveAttribute('lang','en');
+  await expect(page.locator('.nav[data-view="issues"]')).toHaveAttribute('aria-label','Requirements');
+  await expect(page.locator('.nav[data-view="issues"]')).toHaveAttribute('data-tooltip','Requirements');
+  await page.screenshot({path:info.outputPath('dark-en.png'),fullPage:true});
+  await page.reload();
+  await expect(page.locator('html')).toHaveAttribute('data-theme','dark');
+  await expect(page.locator('html')).toHaveAttribute('lang','en');
+  if (await english.count()) {
+    await expect(page.locator('#langToggle').getByRole('radio',{name:'EN'})).toBeChecked();
+    await expect(page.locator('#langToggle').getByRole('radio',{name:'中'})).not.toBeChecked();
+  }
+  // Translation must leave source code, editable content and user-marked text intact.
+  await page.evaluate(()=>{
+    for(const tag of ['pre','textarea']){const el=document.createElement(tag);el.id='test-'+tag;el.textContent='需求列表';document.body.append(el)}
+    const el=document.createElement('div');el.id='test-user-text';el.dataset.i18nSkip='';el.textContent='需求列表';document.body.append(el);
+  });
+  await expect(page.locator('#test-pre')).toHaveText('需求列表');
+  await expect(page.locator('#test-textarea')).toHaveValue('需求列表');
+  await expect(page.locator('#test-user-text')).toHaveText('需求列表');
+  expect(errors).toEqual([]);
+});
+
+test('real script artifacts survive UI approval and execution continues',async({page})=>{
+  await signIn(page);
+  const response=await page.request.post('/api/runs',{data:{workflowId:'welcome-workflow',projectId:'welcome',input:'Browser acceptance: artifacts, approval and continuation'}});
+  expect(response.ok()).toBe(true);
+  const run=await response.json();
+  try {
+  const read=async()=>{const r=await page.request.get(`/api/runs/${run.id}`);expect(r.ok()).toBe(true);return r.json()};
+  await expect.poll(async()=>(await read()).status,{timeout:30_000}).toBe('waiting');
+  let detail=await read();expect(detail.nodes.prepare.status).toBe('succeeded');
+  // Fresh MySQL installations need the generated adapter column used by run details.
+  const telemetry=await page.request.get(`/api/runs/${run.id}/telemetry?adapter=live`);
+  expect(telemetry.ok(),await telemetry.text()).toBe(true);
+  const artifact=detail.artifacts.find(a=>a.name==='welcome');expect(artifact).toBeTruthy();
+  const content=await page.request.get(`/api/runs/${run.id}/artifacts/${encodeURIComponent(artifact.id)}`);
+  expect(await content.text()).toContain('LoopForge');
+  await page.goto(`/#/runs/${encodeURIComponent(run.id)}`);
+  await page.locator('[data-run-node="approve"]').click();
+  const decision=page.locator('#runDetail .approval-callout.human');
+  await expect(decision).toBeVisible();
+  await decision.locator('[data-human-context]').fill('Verified the saved report');
+  await decision.locator('[data-approve="approve"]').click();
+  await expect.poll(async()=>(await read()).status,{timeout:30_000}).toBe('succeeded');
+  detail=await read();expect(detail.nodes.finish.status).toBe('succeeded');
+  expect(detail.humanContext).toBe('Verified the saved report');
+  expect(detail.artifacts.some(a=>a.name==='completed')).toBe(true);
+  await openSettingsPage(page,'runs');
+  await expect(page.locator('#runsView')).toBeVisible();
+  } finally {
+    if(!process.env.AGENTFLOW_E2E_KEEP){
+      await page.request.post(`/api/runs/${run.id}/cancel`,{data:{}}).catch(()=>{});
+      await page.request.delete(`/api/runs/${run.id}`).catch(()=>{});
+    }
+  }
+});
