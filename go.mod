@@ -12,10 +12,9 @@ require (
 	github.com/klauspost/compress v1.20.3
 	github.com/zalando/go-keyring v0.2.8
 	golang.org/x/crypto v0.58.0
-	golang.org/x/sys v0.49.0
+	golang.org/x/sys v0.50.0
 	gorm.io/driver/mysql v1.6.0
 	gorm.io/gorm v1.31.2
-	mvdan.cc/sh/v3 v3.14.1
 )
 
 require (
