@@ -38,18 +38,18 @@ async function runCLI(ctx, action, provider, timeout, stdout) {
   try {
     if (signal.aborted) throw signal.reason; // Go：ctx.Err()
     if (action === "status") {
-      const state = await managedcli.readState(root);
+      const state = await managedcli.ReadState(root);
       stdout.write(JSON.stringify(state) + "\n");
       return;
     }
-    const manager = await managedcli.newManager(root);
+    const manager = await managedcli.NewManager(root);
     let report;
     let err = null;
     try {
       report =
         action === "rollback"
-          ? await manager.rollback(signal, provider)
-          : await manager.update(signal);
+          ? await manager.Rollback(signal, provider)
+          : await manager.Update(signal);
     } catch (e) {
       err = e;
     }
