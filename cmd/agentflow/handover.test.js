@@ -1,4 +1,5 @@
 // handover.test.js —— 对应 Go 文件：cmd/agentflow/handover_test.go
+// 作用：handover.go 的测试对照，覆盖监听 socket 继承、平滑交接与 systemd 就绪上报。
 // node:test / node:assert。t.Setenv 用下方小帮手翻译。
 
 "use strict";

@@ -1,4 +1,5 @@
 // handover.js —— 对应 Go 文件：cmd/agentflow/handover.go（学习用对照翻译，非可运行后端）
+// 作用：平滑重启交接，收到 SIGHUP 时老进程把 API 监听 socket 交给新进程，并向 systemd 上报就绪状态。
 // Go 的 (值, error) 多返回值译为：成功 return，失败 throw。
 // time.Duration 译为毫秒数。goroutine + channel 译为 Promise。
 

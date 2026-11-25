@@ -1,4 +1,5 @@
 // main.test.js —— 对应 Go 文件：cmd/agentflow/main_test.go
+// 作用：main.go 与 cli.go 的测试对照，覆盖角色解析、超时默认值、监听绑定与托管 CLI 管理操作。
 // node:test / node:assert。t.Setenv、t.TempDir()、bytes.Buffer 用下方小帮手翻译。
 // 注意：本文件 require 的 main.js / cli.js 引用了尚未转写的 internal 包，
 // 在那些包转写完之前，本文件加载即失败，见 README-JS.md。

@@ -1,4 +1,5 @@
 // main.js —— 对应 Go 文件：cmd/agentflow/main.go（学习用对照翻译，非可运行后端）
+// 作用：程序入口，解析命令行参数，按角色启动 API 服务、Worker 或两者，并处理信号与平滑重启。
 // Go 的 (值, error) 多返回值译为：成功 return，失败 throw。time.Duration 译为毫秒数。
 // struct 译为对象字面量，goroutine 译为不 await 的异步调用，channel 译为 Promise。
 

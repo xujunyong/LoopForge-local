@@ -1,4 +1,5 @@
 // cli.js —— 对应 Go 文件：cmd/agentflow/cli.go（学习用对照翻译，非可运行后端）
+// 作用：在启动任何平台服务之前，执行托管 CLI 的管理操作（status 查状态、update 更新、rollback 回滚），跑完即退出。
 // Go 的 (值, error) 多返回值译为：成功 return，失败 throw。
 // time.Duration 译为毫秒数。context.Context 译为 AbortSignal。
 
