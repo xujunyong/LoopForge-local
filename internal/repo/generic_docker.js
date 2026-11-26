@@ -1,0 +1,87 @@
+// generic_docker.js —— 对应 Go 文件：internal/repo/generic_docker.go
+// 作用：通用后端容器沙箱：平台默认 Dockerfile 与沙箱画像。
+
+"use strict";
+
+const { SandboxProfile, SandboxDockerfile } = require("../domain/assets.js"); // 对应 Go 的 domain.SandboxProfile/SandboxDockerfile，domain 已翻译
+const { GenericDockerSandboxID } = require("./generic_workflows.js"); // 对应 Go 同包常量，generic_workflows.js 本次一同翻译
+
+const genericDockerEpoch = new Date(Date.UTC(2026, 0, 1, 0, 0, 0, 0));
+
+// Go 的反引号原生字符串译为模板字符串，其中的反斜杠与 ${ 已转义。
+const genericBackendDockerfileContent = `FROM node:22-bookworm-slim
+
+ARG CLAUDE_CODE_PACKAGE=@anthropic-ai/claude-code
+ARG CODEX_PACKAGE=@openai/codex
+ARG CODEBUDDY_PACKAGE=@tencent-ai/codebuddy-code
+
+RUN apt-get update \\
+    && apt-get install -y --no-install-recommends bash ca-certificates curl git jq openssh-client python3 ripgrep \\
+    && rm -rf /var/lib/apt/lists/* \\
+    && npm install -g "\${CLAUDE_CODE_PACKAGE}" "\${CODEX_PACKAGE}" \\
+    && if [ -n "\${CODEBUDDY_PACKAGE}" ]; then npm install -g "\${CODEBUDDY_PACKAGE}"; fi
+
+RUN apt-get update \\
+    && apt-get install -y --no-install-recommends gcc libc6-dev \\
+    && rm -rf /var/lib/apt/lists/* \\
+    && gcc --version
+
+ARG GO_VERSION=1.22.12
+RUN set -eu; \\
+    arch="$(dpkg --print-architecture)"; \\
+    case "$arch" in \\
+      amd64) goarch=amd64 ;; \\
+      arm64) goarch=arm64 ;; \\
+      *) echo "unsupported arch: $arch" >&2; exit 1 ;; \\
+    esac; \\
+    tmp="/tmp/go\${GO_VERSION}.linux-\${goarch}.tar.gz"; \\
+    ok=0; \\
+    for url in \\
+      "https://mirrors.cloud.tencent.com/go/go\${GO_VERSION}.linux-\${goarch}.tar.gz" \\
+      "https://dl.google.com/go/go\${GO_VERSION}.linux-\${goarch}.tar.gz" \\
+      "https://go.dev/dl/go\${GO_VERSION}.linux-\${goarch}.tar.gz?download"; do \\
+      echo "download $url"; \\
+      if curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 -o "$tmp" "$url" && gzip -t "$tmp"; then \\
+        ok=1; \\
+        break; \\
+      fi; \\
+      echo "not a gzip archive, try next: $url" >&2; \\
+      rm -f "$tmp"; \\
+    done; \\
+    if [ "$ok" != 1 ]; then echo "failed to download Go \${GO_VERSION}" >&2; exit 1; fi; \\
+    tar -C /usr/local -xzf "$tmp"; \\
+    rm -f "$tmp"; \\
+    ln -sfn /usr/local/go/bin/go /usr/local/bin/go; \\
+    ln -sfn /usr/local/go/bin/gofmt /usr/local/bin/gofmt; \\
+    /usr/local/go/bin/go version
+
+ENV PATH="/usr/local/go/bin:\${PATH}" \\
+    GOROOT=/usr/local/go \\
+    GOPATH=/go \\
+    GOCACHE=/go/cache \\
+    GOMODCACHE=/go/pkg/mod \\
+    GOPROXY="https://goproxy.cn,direct" \\
+    GOSUMDB=sum.golang.google.cn \\
+    GO111MODULE=on \\
+    GOTOOLCHAIN=auto \\
+    CGO_ENABLED=1
+
+RUN mkdir -p /workspace /go/pkg/mod /go/cache /go/bin
+
+WORKDIR /workspace
+
+CMD ["sh", "-lc", "trap : TERM INT; sleep infinity & wait"]
+`;
+
+function GenericDockerSandbox() {
+  return new SandboxProfile({
+    ID: GenericDockerSandboxID,
+    Name: "通用后端容器沙箱",
+    ProjectID: "platform",
+    Shared: true,
+    Driver: "docker",
+    Dockerfile: new SandboxDockerfile({ Content: genericBackendDockerfileContent }),
+  });
+}
+
+module.exports = { genericDockerEpoch, genericBackendDockerfileContent, GenericDockerSandbox };
