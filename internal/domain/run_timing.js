@@ -1,11 +1,32 @@
-// run_timing.js —— 对应 Go 文件：internal/domain/run_timing.go
-// 作用：按事件日志计算运行的执行与墙钟耗时。
+/**
+ * @file internal/domain/run_timing.js
+ * @description 对应 Go 源文件：internal/domain/run_timing.go
+ * 职责边界：依据运行事件日志与节点起止时间，计算运行的实际节点执行耗时、墙钟总耗时、等待耗时以及合并后的非重叠执行区间。
+ * 语法差异说明：
+ * - Go 的 `time.Time` 对应 JS 的 `Date | null`（零值为 `null`）；`time.Duration` 对应毫秒数（`number`）。
+ * - Go 的 `map[string]time.Time`（进行中的节点启动时刻表 `open`）与 `map[string]bool` 均使用普通对象 `{}`。
+ * - Go 的多返回值 `(RunTiming, []RunExecutionInterval, bool)` 等译为对应长度的数组元组。
+ */
 
 "use strict";
 
-// RunTiming：把运行真正执行节点的耗时与自创建起的墙钟分开；墙钟还包含运行失败、暂停、停放或等人的人工等待，可能长达数天。
-// time.Duration 译为毫秒数；time.Time 译为 Date，零值译为 null。
+const { TerminalRunStatus } = require("./run_eval.js");
+
+/**
+ * 运行耗时拆分汇总结构。
+ * 将运行实际执行节点的并集时长与自创建起的墙钟时长（含失败、暂停、停放及人工审批等待）分离展示。
+ */
 class RunTiming {
+  /**
+   * 构造运行耗时汇总实例，未传入字段按 Go 零值初始化。
+   *
+   * @param {object} [init={}] - 初始化字段集合。
+   * @param {number} [init.ExecutionMs=0] - 全部尝试节点执行区间的并集耗时（毫秒；重试计入、并行不重复计）。
+   * @param {number} [init.WallMs=0] - 从运行创建到终态事件（未结束时到 `AsOf`）的墙钟耗时（毫秒）。
+   * @param {number} [init.WaitingMs=0] - 墙钟耗时减去实际执行耗时得到的等待耗时（毫秒）。
+   * @param {boolean} [init.Executing=false] - 在 `AsOf` 时刻是否仍有节点在执行，供前端在刷新间隙本地推进计时。
+   * @param {Date|null} [init.AsOf=null] - 本次计时快照的参考时间点。
+   */
   constructor(init = {}) {
     // ExecutionMs 是全部尝试的节点执行区间的并集，重试计入，并行节点不重复计。
     this.ExecutionMs = init.ExecutionMs ?? 0;
@@ -18,7 +39,7 @@ class RunTiming {
   }
 }
 
-// RunTimingEventTypes：ComputeRunTiming 读取的事件；只为计时加载事件的调用方可按这些过滤。
+// `ComputeRunTiming` 消费的事件类型清单；仅用于计时的查询可据此过滤事件日志。
 const RunTimingEventTypes = [
   "node.started", "node.succeeded", "node.failed", "node.paused", "node.cancelled",
   "node.interrupted", "node.passed", "gate.waiting", "gate.auto_approved",
@@ -36,36 +57,69 @@ const runIntervalClosers = {
 
 const runTerminalEvents = { "run.failed": true, "run.cancelled": true, "run.succeeded": true };
 
-// ComputeRunTiming：从运行事件日志推导计时；节点行只保留最新尝试，审批等待让 FinishedAt 停在决定时间，事件日志是覆盖全部尝试的唯一来源；没有 node.started 事件的运行回退到节点行。
+/**
+ * 根据运行事件日志推导运行耗时汇总（执行耗时、墙钟耗时、等待耗时及活跃标志）。
+ * 由于节点行仅保留最新一次尝试且审批等待会拉长 `FinishedAt`，事件日志是覆盖全部尝试的唯一准确来源；无 `node.started` 事件时自动回退到节点行。
+ *
+ * @param {object} run - 运行实例（Run）。
+ * @param {object[]} events - 运行事件列表（RunEvent[]）。
+ * @param {Date} now - 当前计算基准时间。
+ * @returns {RunTiming} 计算得到的运行耗时汇总对象。
+ */
 function ComputeRunTiming(run, events, now) {
   const [timing] = computeRunTiming(run, events, now);
   return timing;
 }
 
-// RunExecutionInterval：一段观测到的节点执行区间，不含等待。
+/**
+ * 一段观测到的节点执行起止时间区间（不含等待期）。
+ */
 class RunExecutionInterval {
+  /**
+   * 构造执行区间实例，未传入字段按 Go 零值初始化。
+   *
+   * @param {object} [init={}] - 初始化字段集合。
+   * @param {Date|null} [init.StartedAt=null] - 区间开始时间。
+   * @param {Date|null} [init.FinishedAt=null] - 区间结束时间。
+   */
   constructor(init = {}) {
     this.StartedAt = init.StartedAt ?? null;
     this.FinishedAt = init.FinishedAt ?? null;
   }
 }
 
-// RunExecutionIntervals：与 ComputeRunTiming 共享计时计算；布尔值区分观测到的零与缺失的计时证据。返回 [区间, 是否有证据]。
+/**
+ * 提取合并后的运行节点执行时间区间列表，并与 `ComputeRunTiming` 共享同一套计算逻辑。
+ * 返回的布尔值用于区分“观测到零执行时长”和“缺失计时证据”。
+ *
+ * @param {object} run - 运行实例（Run）。
+ * @param {object[]} events - 运行事件列表（RunEvent[]）。
+ * @param {Date} now - 当前计算基准时间。
+ * @returns {[RunExecutionInterval[], boolean]} 二元组 `[合并后的执行区间数组, 是否存在有效计时证据]`。
+ */
 function RunExecutionIntervals(run, events, now) {
   const [, intervals, known] = computeRunTiming(run, events, now);
   return [intervals, known];
 }
 
+/**
+ * 核心计时计算过程：按事件时间稳定排序，追踪节点执行区间的开启与闭合，必要时回退至节点表，并调用区间裁剪合并。
+ *
+ * @param {object} run - 运行实例（Run）。
+ * @param {object[]|null|undefined} events - 运行事件列表（RunEvent[]）。
+ * @param {Date} now - 当前计算基准时间。
+ * @returns {[RunTiming, RunExecutionInterval[], boolean]} 三元组 `[运行耗时汇总, 合并后的执行区间数组, 是否存在有效计时证据]`。
+ */
 function computeRunTiming(run, events, now) {
   let intervals = [];
-  let open = new Map();
+  let open = {};
   let lastEvent = null;
   let terminalAt = null;
   let started = false;
   const closeNode = (nodeID, at) => {
-    if (open.has(nodeID)) {
-      intervals.push({ start: open.get(nodeID), end: at });
-      open.delete(nodeID);
+    if (Object.prototype.hasOwnProperty.call(open, nodeID)) {
+      intervals.push({ start: open[nodeID], end: at });
+      delete open[nodeID];
     }
   };
   const sorted = [...(events ?? [])];
@@ -79,11 +133,11 @@ function computeRunTiming(run, events, now) {
     if (ev.Type === "node.started" && ev.NodeID !== "") {
       started = true;
       closeNode(ev.NodeID, at);
-      open.set(ev.NodeID, at);
+      open[ev.NodeID] = at;
     } else if (nodeIntervalClosers[ev.Type] && ev.NodeID !== "") {
       closeNode(ev.NodeID, at);
     } else if (runIntervalClosers[ev.Type]) {
-      for (const nodeID of [...open.keys()]) {
+      for (const nodeID of Object.keys(open)) {
         closeNode(nodeID, at);
       }
     }
@@ -98,7 +152,7 @@ function computeRunTiming(run, events, now) {
   const end = runTimingEnd(run, terminalAt, lastEvent, now);
   if (!started) {
     intervals = [];
-    open = new Map();
+    open = {};
     for (const [nodeID, node] of Object.entries(run.Nodes ?? {})) {
       if (node == null || node.StartedAt == null) {
         continue;
@@ -106,16 +160,16 @@ function computeRunTiming(run, events, now) {
       if (node.FinishedAt != null) {
         intervals.push({ start: node.StartedAt, end: node.FinishedAt });
       } else if (node.Status === "running") {
-        open.set(nodeID, node.StartedAt);
+        open[nodeID] = node.StartedAt;
       }
     }
   }
   let openEnd = lastEvent;
   if (run.Status === "running") {
     openEnd = end;
-    out.Executing = open.size > 0;
+    out.Executing = Object.keys(open).length > 0;
   }
-  for (const start of open.values()) {
+  for (const start of Object.values(open)) {
     if (openEnd != null && openEnd.getTime() > start.getTime()) {
       intervals.push({ start, end: openEnd });
     }
@@ -133,7 +187,16 @@ function computeRunTiming(run, events, now) {
   return [out, merged, known];
 }
 
-// runTimingEnd：选运行计时的停止时刻：运行未结束时为 now，否则取终态运行事件，回退到最后一个事件、运行的 UpdatedAt，最后是 now。
+/**
+ * 确定运行计时的截止时间点。
+ * 运行未处于终态时返回 `now`；已处于终态时按优先级依次取终态事件时间、最后事件时间、运行 `UpdatedAt`，最终回退到 `now`。
+ *
+ * @param {object} run - 运行实例（Run）。
+ * @param {Date|null} terminalAt - 观测到的终态运行事件时间。
+ * @param {Date|null} lastEvent - 日志中最后一个有效事件的时间。
+ * @param {Date} now - 当前计算基准时间。
+ * @returns {Date} 选定的运行计时截止时间。
+ */
 function runTimingEnd(run, terminalAt, lastEvent, now) {
   if (!TerminalRunStatus(run.Status)) {
     return now;
@@ -146,8 +209,15 @@ function runTimingEnd(run, terminalAt, lastEvent, now) {
   return now;
 }
 
-// mergeExecutionIntervals：把区间裁到 [createdAt, end]，合并重叠区间，返回合并后的区间与总时长；
-// known 报告是否有区间是有效观测，以便把观测到的零与缺失的计时证据区分开。返回 [合并区间, 总毫秒数, 是否有证据]。
+/**
+ * 将原始执行区间裁剪到 `[createdAt, end]` 范围内，并对重叠区间求并集，汇总总执行毫秒数。
+ * 返回的 `known` 标志用于区分“观测到有效零时长”和“没有任何有效计时观测”。
+ *
+ * @param {Array.<{start: Date|null, end: Date|null}>} intervals - 原始节点执行区间列表。
+ * @param {Date|null} createdAt - 运行创建时间（裁剪下界）。
+ * @param {Date} end - 运行计时截止时间（裁剪上界）。
+ * @returns {[RunExecutionInterval[], number, boolean]} 三元组 `[合并后的执行区间数组, 总执行毫秒数, 是否有有效计时观测]`。
+ */
 function mergeExecutionIntervals(intervals, createdAt, end) {
   const clipped = [];
   let known = false;

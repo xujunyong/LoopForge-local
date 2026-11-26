@@ -1,13 +1,27 @@
-// token_pricing.js —— 对应 Go 文件：internal/domain/token_pricing.go
-// 作用：公开标准 token 单价，按模型与用量估算成本。
+/**
+ * @file internal/domain/token_pricing.js
+ * @description 对应 Go 文件：internal/domain/token_pricing.go
+ * 职责与边界：维护公开标准模型每百万 token 单价表与美元/人民币汇率常量，
+ * 提供模型名称归一化、免费混元模型判定，以及不改写原始计费事实的用量成本估算函数。
+ * 语法差异说明：
+ * - Go 的 `regexp.ReplaceAllString` 对应带全局标志 `/g` 的正则替换，以保证与 Go 全量替换语义一致。
+ * - 导出未导出函数 `pricingModel` 供同包 `schedule_execution.js` 引用。
+ */
 
 "use strict";
 
 const AnalyticsUSDToCNY = 7.0;
 const AnalyticsPricingVersion = "public-standard-2026-11-05";
 
-// TokenPrice：每百万 token 的公开标准短上下文单价。
+/**
+ * 描述单个模型的公开标准短上下文单价（每百万 token），保留原生计价币种（USD 或 CNY）。
+ */
 class TokenPrice {
+  /**
+   * 构造模型单价实例，未提供的字段按 Go 零值初始化。
+   * @param {Object} [init={}] - 可选初始字段映射。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.Currency = init.Currency ?? "";
     this.Input = init.Input ?? 0;
@@ -72,9 +86,15 @@ const publicTokenPrices = {
 };
 
 const pricingSnapshotSuffix = /-(?:\d{8}|\d{4}-\d{2}-\d{2})$/;
-const claudeVersionDots = /(claude-(?:opus|sonnet|haiku|fable)-\d+)\.(\d+)/;
+const claudeVersionDots = /(claude-(?:opus|sonnet|haiku|fable)-\d+)\.(\d+)/g;
 const hyVersionedModel = /^hy\d/;
 
+/**
+ * 将原始模型标识规范化为价目表查询键（剥离自定义前缀、内网/长上下文后缀、快照日期，并统一别名与版本号分隔符）。
+ * 供 `AnalyticsPricedUsage` 及同包 `schedule_execution.js` 调用。
+ * @param {string} model - 原始模型名称字符串。
+ * @returns {string} 规范化后的价目表模型键名。
+ */
 function pricingModel(model) {
   model = model.toLowerCase().trim();
   model = model.startsWith("custom-local:") ? model.slice("custom-local:".length) : model;
@@ -104,12 +124,25 @@ function pricingModel(model) {
   }
 }
 
+/**
+ * 判断模型标识是否属于平台免费计价的混元（Hy / Hunyuan）系列模型。
+ * 在成本估算及费用分析过滤中调用。
+ * @param {string} model - 模型名称字符串。
+ * @returns {boolean} 属于混元系列模型时返回 `true`，否则返回 `false`。
+ */
 function IsHYModel(model) {
   model = model.toLowerCase().trim();
   return model === "hy" || model.startsWith("hy-") || model.startsWith("hy.") || hyVersionedModel.test(model) || model.startsWith("hunyuan");
 }
 
-// AnalyticsPricedUsage：不改动已存计费事实，只给用量估算成本。
+/**
+ * 按公开价目表对单次调用的 `TokenUsage` 估算折算美元成本并返回新副本，不修改原始计费记录。
+ * 人民币单价模型会按 `AnalyticsUSDToCNY` 折算为美元等价写入 `CostUSD` 以保持统计接口兼容。
+ * @param {string} model - 调用使用的模型标识。
+ * @param {Object} usage - 原始 `TokenUsage` 对象。
+ * @param {boolean} inclusiveInput - `usage.InputTokens` 是否已包含缓存读写 token（Codex/外部 API 为 `true`，Anthropic 为 `false`）。
+ * @returns {Object} 带有估算结果 `CostUSD` 与 `CostStatus`（`"estimated"` 或 `"unknown"`）的新对象。
+ */
 function AnalyticsPricedUsage(model, usage, inclusiveInput) {
   const out = { ...usage };
   out.CostUSD = 0;

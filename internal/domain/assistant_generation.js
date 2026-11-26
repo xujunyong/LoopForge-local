@@ -1,10 +1,29 @@
-// assistant_generation.js —— 对应 Go 文件：internal/domain/assistant_generation.go
-// 作用：一轮助手生成占用的会话槽位、转向消息与流快照。
+/**
+ * @file internal/domain/assistant_generation.js
+ * 对应 Go 源文件：internal/domain/assistant_generation.go
+ *
+ * 作用与职责边界：
+ * 定义单轮助手后台生成任务（Generation）的领域模型，包括会话槽位状态、
+ * 运行中用户插话转向消息（Steer）、断线重连用的流式快照投影以及有序事件帧。
+ * 不负责流推送传输或数据库租约管理。
+ *
+ * 语法差异说明：
+ * - Go 指针字段、`time.Time` 与 `json.RawMessage` 零值统一初始化为 `null`。
+ */
 
 "use strict";
 
-// AssistantGeneration：一轮生成占用一个私有或共享会话槽位，与浏览器无关。
+/**
+ * 表示占据私有或共享会话槽位的一轮后台助手生成任务，其生命周期独立于前端浏览器连接。
+ * 记录触发来源、执行状态、事件缓冲、流快照、最终回复、运行中转向请求与取消标记。
+ */
 class AssistantGeneration {
+  /**
+   * 构造并初始化助手生成任务实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.StartedAt = init.StartedAt ?? null;
     this.Trigger = init.Trigger ?? "";
@@ -32,8 +51,17 @@ class AssistantGeneration {
   }
 }
 
-// AssistantSteer：在不丢弃已写内容的前提下重定向正在运行的回复。
+/**
+ * 表示用户在回复仍在生成期间发送的转向（插话）消息。
+ * 当前轮次保留已产出内容后，依据该转向内容和参数继续后续生成。
+ */
 class AssistantSteer {
+  /**
+   * 构造并初始化助手转向消息实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.Content = init.Content ?? "";
     this.Attachments = init.Attachments ?? [];
@@ -49,8 +77,17 @@ class AssistantSteer {
   }
 }
 
-// AssistantStreamSnapshot：有界投影，旧 token 事件淘汰后仍可存活并重连。
+/**
+ * 表示生成流的有界状态投影。
+ * 当早期细粒度 token 事件被淘汰或客户端断线重连时，前端可据此恢复当前已生成的回答、草稿与活动流。
+ */
 class AssistantStreamSnapshot {
+  /**
+   * 构造并初始化流式快照投影实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.Sequence = init.Sequence ?? 0;
     this.Answer = init.Answer ?? "";
@@ -60,7 +97,16 @@ class AssistantStreamSnapshot {
   }
 }
 
+/**
+ * 表示带递增序号的单条生成流事件帧，用于增量推送与游标补拉。
+ */
 class AssistantGenerationEvent {
+  /**
+   * 构造并初始化生成流事件帧实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.Sequence = init.Sequence ?? 0;
     this.Data = init.Data ?? null;

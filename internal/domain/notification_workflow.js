@@ -1,9 +1,24 @@
-// notification_workflow.js —— 对应 Go 文件：internal/domain/notification_workflow.go
-// 作用：SOP 级通知选择与全流程通知正文拼装。
+/**
+ * @file internal/domain/notification_workflow.js
+ * @description 对应 Go 源文件：internal/domain/notification_workflow.go
+ * 职责边界：负责从工作流定义中筛选生效的 SOP 级通知机器人、派生节点异常/等待提醒绑定，以及按节点图顺序汇总整条流程的通知正文。
+ * 语法差异说明：
+ * - Go 整数除法 `6000 / count` 在 JS 中使用 `Math.trunc(6000 / count)` 保持一致。
+ * - Go 的 `json.Marshal(content)` 按 struct json tag 输出小写键并在 `Simulated` 为 `false` 时省略该字段，JS 中按相同字段名显式构造序列化对象。
+ */
 
 "use strict";
 
-// WorkflowNotifications：选一个 SOP 机器人，兼容旧版节点绑定；显式 SOP 配置优先于全部节点配置。
+const { NotificationBinding } = require("./notification.js");
+const { AINotificationContent, NotificationText, ParseNotificationResult } = require("./notification_template.js");
+
+/**
+ * 从工作流定义中选出唯一生效的 SOP 级通知绑定，并兼容旧版节点级绑定配置。
+ * 优先级：显式 SOP 级 `w.Notifications` > 节点上 `Scope === "run"` 的旧版配置 > 首个配置了通知的节点。
+ *
+ * @param {object} w - 工作流定义对象（WorkflowDefinition）。
+ * @returns {object[]|null} 规范化后的单元素通知绑定数组；若未找到有效机器人配置则返回 `null`。
+ */
 function WorkflowNotifications(w) {
   let selected = null;
   if (w.Notifications.length > 0) {
@@ -46,7 +61,13 @@ function WorkflowNotifications(w) {
   return [selected];
 }
 
-// NodeReminderBindings：节点提醒恒用平台状态，绝不复用 AI 完成报告。
+/**
+ * 基于 SOP 级通知绑定派生节点级等待与失败提醒绑定。
+ * 节点提醒始终使用平台状态固定模板，不复用 AI 完成报告。
+ *
+ * @param {NotificationBinding[]} bindings - SOP 级通知绑定数组。
+ * @returns {NotificationBinding[]} 派生出的节点提醒绑定数组。
+ */
 function NodeReminderBindings(bindings) {
   const out = [];
   for (const b of bindings) {
@@ -56,7 +77,13 @@ function NodeReminderBindings(bindings) {
   return out;
 }
 
-// BuildWorkflowNotificationResult：按图顺序合并每个节点的贡献；数据库事务内与通知重试时不发生模型调用。
+/**
+ * 按工作流快照中的节点顺序汇总各节点状态、输出摘要与失败原因，拼装整条运行的通知结果文本。
+ * 该函数为纯文本组装，不触发模型调用，可在数据库事务或通知重试期间安全调用。
+ *
+ * @param {object} run - 运行记录对象（Run）。
+ * @returns {string} 汇总后的 Markdown 正文；若任一节点产出过 AI 通知块，则在末尾附加 `notification` JSON 代码块。
+ */
 function BuildWorkflowNotificationResult(run) {
   const sections = [];
   let generatedAny = false;

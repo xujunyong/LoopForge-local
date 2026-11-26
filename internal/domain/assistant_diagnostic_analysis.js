@@ -1,11 +1,29 @@
-// assistant_diagnostic_analysis.js —— 对应 Go 文件：internal/domain/assistant_diagnostic_analysis.go
-// 作用：对导出的助手诊断文件做确定性分析，区分已确认事实与未知原因。
+/**
+ * @file internal/domain/assistant_diagnostic_analysis.js
+ * 对应 Go 源文件：internal/domain/assistant_diagnostic_analysis.go
+ *
+ * 作用与职责边界：
+ * 对导出的单轮助手诊断对象（`AssistantDiagnostics`）执行确定性离线分析，
+ * 不访问数据库或外部服务，仅依据诊断文件中的进程状态、退出码、错误元数据与工具记录，
+ * 生成覆盖范围说明（`Coverage`）及结构化评估结论（`Assessment`），严格区分已观测事实与未知原因。
+ *
+ * 语法差异说明：
+ * - Go 的 `map[string]bool` 集合（`requestIDs`、`traceIDs`）转写为普通对象 `{}`（值为 `true`），使用 `Object.keys(...).length` 判断非空。
+ * - Go 的 `time.UTC().Format("2006-01-02T15:04:05Z")` 转写为 `toISOString().replace(/\.\d{3}Z$/, "Z")`。
+ */
 
 "use strict";
 
 const { AssistantDiagnosticAssessment } = require("./assistant_diagnostics.js"); // 对应 Go 同包类型，assistant_diagnostics.js 翻译后补齐
 
-// AnalyzeAssistantDiagnostics：确定性分析，无需数据库访问。
+/**
+ * 对导出的助手诊断数据执行确定性分析，原地填充 `d.Assessment` 与 `d.Coverage`，
+ * 并将非运行态下尚未结束的进程/工具状态补标为中断或未完成。
+ * 适用于导出诊断报告或界面查看诊断摘要时调用；若入参为空或诊断版本低于 2 则直接返回。
+ *
+ * @param {Object|null} d - 待分析的助手诊断对象（`AssistantDiagnostics`）。
+ * @returns {void} 无返回值（结果直接写入 `d` 及其子对象）。
+ */
 function AnalyzeAssistantDiagnostics(d) {
   if (d == null || d.Version < 2) {
     return;
@@ -17,8 +35,8 @@ function AnalyzeAssistantDiagnostics(d) {
     "未采集提示词、思考正文、工具参数、成功工具输出、完整 stdout、环境变量或凭证。",
     "CLI 未暴露的内部网络等待、死锁或上游账号状态无法从本文件确认。",
   ];
-  const requestIDs = new Set();
-  const traceIDs = new Set();
+  const requestIDs = {};
+  const traceIDs = {};
   const pending = analyzeDiagnosticTools(d, a, requestIDs, traceIDs);
   let hasEarlyError = false;
   for (let i = 0; i < d.Attempts.length; i++) {
@@ -36,10 +54,10 @@ function AnalyzeAssistantDiagnostics(d) {
         desc = `${desc} (HTTP ${attempt.FirstError.StatusCode})`;
       }
       if (attempt.FirstError.RequestID !== "") {
-        requestIDs.add(attempt.FirstError.RequestID);
+        requestIDs[attempt.FirstError.RequestID] = true;
       }
       if (attempt.FirstError.TraceID !== "") {
-        traceIDs.add(attempt.FirstError.TraceID);
+        traceIDs[attempt.FirstError.TraceID] = true;
       }
       a.Evidence.push(`调用 ${attempt.ID} 首次捕获异常事件：${desc}`);
     }
@@ -62,10 +80,10 @@ function AnalyzeAssistantDiagnostics(d) {
     }
     for (const e of attempt.Events) {
       if (e.RequestID !== "") {
-        requestIDs.add(e.RequestID);
+        requestIDs[e.RequestID] = true;
       }
       if (e.TraceID !== "") {
-        traceIDs.add(e.TraceID);
+        traceIDs[e.TraceID] = true;
       }
     }
   }
@@ -88,7 +106,6 @@ function AnalyzeAssistantDiagnostics(d) {
     a.Evidence.push("平台记录的结束原因：" + d.Termination.Code);
     if (d.Termination.Code === "CHECKPOINT_LOST") {
       if (d.LastCheckpointAt != null) {
-        // Go time.Format 版式译为 toISOString 去毫秒。
         a.Evidence.push("最后一次运行实例心跳时间：" + d.LastCheckpointAt.toISOString().replace(/\.\d{3}Z$/, "Z"));
       }
       a.Unknowns = appendUniqueDiagnostic(a.Unknowns, "只确认平台未继续保存执行状态；无法仅凭此记录区分进程崩溃、服务重启、OOM 或数据库写入中断。");
@@ -139,10 +156,10 @@ function AnalyzeAssistantDiagnostics(d) {
         break;
     }
   }
-  if (requestIDs.size > 0) {
+  if (Object.keys(requestIDs).length > 0) {
     a.NextSteps = appendUniqueDiagnostic(a.NextSteps, "记录中包含真实 requestId，可据此关联上游模型服务或网关日志。");
   }
-  if (traceIDs.size > 0) {
+  if (Object.keys(traceIDs).length > 0) {
     a.NextSteps = appendUniqueDiagnostic(a.NextSteps, "记录中包含真实 traceId，可据此关联分布式链路日志。");
   }
   if (d.Status !== "completed" && d.Environment != null && d.Environment.InstanceID !== "") {
@@ -156,8 +173,16 @@ function AnalyzeAssistantDiagnostics(d) {
   }
 }
 
-// analyzeDiagnosticTools：记录工具失败与未完成工具证据，返回待处理工具数。
-// Go map[string]bool 译为 Set。
+/**
+ * 扫描诊断记录中的工具调用列表，汇总失败工具与未结束工具证据，并收集工具关联的 `requestId` 和 `traceId`。
+ * 若整轮生成已不再处于运行中，会将仍为 `running` 的工具状态改写为 `unfinished`。由 `AnalyzeAssistantDiagnostics` 内部调用。
+ *
+ * @param {Object} d - 助手诊断对象（`AssistantDiagnostics`）。
+ * @param {AssistantDiagnosticAssessment} a - 正在构建的诊断评估结论对象。
+ * @param {Object<string, boolean>} requestIDs - 用于去重收集真实请求 ID 的集合对象（值为 `true`）。
+ * @param {Object<string, boolean>} traceIDs - 用于去重收集真实链路追踪 ID 的集合对象（值为 `true`）。
+ * @returns {number} 仍处于运行中或未完成状态的工具数量。
+ */
 function analyzeDiagnosticTools(d, a, requestIDs, traceIDs) {
   let toolFailures = 0;
   let pending = 0;
@@ -178,10 +203,10 @@ function analyzeDiagnosticTools(d, a, requestIDs, traceIDs) {
       a.Evidence.push(`工具 ${t.Name}（${t.ID}，来源：${t.Source}）有开始记录，未收到结束记录`);
     }
     if (t.RequestID !== "") {
-      requestIDs.add(t.RequestID);
+      requestIDs[t.RequestID] = true;
     }
     if (t.TraceID !== "") {
-      traceIDs.add(t.TraceID);
+      traceIDs[t.TraceID] = true;
     }
   }
   if (toolFailures > 0) {
@@ -190,6 +215,14 @@ function analyzeDiagnosticTools(d, a, requestIDs, traceIDs) {
   return pending;
 }
 
+/**
+ * 在不区分大小写去重的前提下，向诊断说明列表追加一条文本。
+ * 若列表中已存在相同内容（忽略大小写），则原样返回原数组，避免在 `Unknowns` / `NextSteps` 中出现重复提示。
+ *
+ * @param {string[]} items - 现有的诊断文本列表。
+ * @param {string} value - 待追加的文本内容。
+ * @returns {string[]} 追加后的文本列表（若已存在则返回原数组，否则返回追加新元素后的新数组）。
+ */
 function appendUniqueDiagnostic(items, value) {
   for (const item of items) {
     if (item.toLowerCase() === value.toLowerCase()) {

@@ -1,13 +1,36 @@
-// analytics.js —— 对应 Go 文件：internal/domain/analytics.go
-// 作用：平台运营分析的筛选条件、汇总、趋势与交付等数据结构。
+/**
+ * @file internal/domain/analytics.js
+ * 对应 Go 源文件：internal/domain/analytics.go
+ *
+ * 作用与职责边界：
+ * 定义平台运营分析模块所需的全部领域数据结构，包括分析筛选条件、总览汇总指标、
+ * 时间趋势点、星期×小时热力格、MR 合并证据、多维度拆解、失败分类、观测覆盖度、
+ * 需求交付明细与汇总、工作流版本对比、用户/项目用量、演示指标、追踪摘要、会话活跃度及完整分析快照。
+ * 不负责数据库聚合查询或 HTTP 参数解析。
+ *
+ * 语法差异说明：
+ * - Go 结构体匿名嵌入（如 `AnalyticsActivityPoint` 嵌入 `AnalyticsActivity`）转写为类继承（`extends`）。
+ * - Go 指针字段和 `time.Time` 字段零值统一初始化为 `null`；切片字段初始化为 `[]`；映射字段初始化为 `{}`。
+ */
 
 "use strict";
 
-// AnalyticsFilter：平台分析的筛选范围，不与 HTTP 耦合。
+/**
+ * 表示平台运营分析的查询筛选条件，使数据访问层不与 HTTP 请求结构耦合。
+ * 用于限定数据来源、项目范围、时间窗口、统计粒度、时区及需求口径。
+ */
 class AnalyticsFilter {
+  /**
+   * 构造并初始化分析筛选条件实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.Origin = init.Origin ?? "";
-    this.ProjectIDs = init.ProjectIDs ?? null;
+    // 切片字段按零值规则初始化为空数组；在 Go 中 nil 表示不限项目、空切片表示无可见项目，
+    // 调用方如需表示“不限项目”可显式传入 ProjectIDs: null。
+    this.ProjectIDs = init.ProjectIDs ?? [];
     this.ProjectID = init.ProjectID ?? "";
     this.WorkflowID = init.WorkflowID ?? "";
     this.From = init.From ?? null;
@@ -20,7 +43,14 @@ class AnalyticsFilter {
     this.TimeZone = init.TimeZone ?? "";
   }
 
-  // MatchesProject：非空空范围表示没有项目，绝不表示全部项目。
+  /**
+   * 判断给定项目 ID 是否命中当前筛选条件。
+   * 在聚合或过滤运行、需求与交付数据时调用；当 `ProjectIDs` 为非空（非 `null`/`undefined`）的空数组时，
+   * 视为没有任何允许访问的项目，绝不回退为全部项目。
+   *
+   * @param {string} id - 待匹配的项目 ID。
+   * @returns {boolean} 项目符合筛选范围时返回 `true`，否则返回 `false`。
+   */
   MatchesProject(id) {
     if (this.ProjectID !== "" && this.ProjectID !== id) {
       return false;
@@ -32,7 +62,18 @@ class AnalyticsFilter {
   }
 }
 
+/**
+ * 表示平台运营分析的核心总览指标。
+ * 涵盖 SOP 运行计数与成功率、墙钟与纯执行耗时分位数、Token 四分项与缓存命中率、
+ * 成本覆盖率与金额、会话直改代码工作区统计、需求吞吐与合并 MR 计数。
+ */
 class AnalyticsSummary {
+  /**
+   * 构造并初始化分析总览汇总实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.ExternalRuns = init.ExternalRuns ?? 0;
     this.QualityRuns = init.QualityRuns ?? 0;
@@ -100,7 +141,17 @@ class AnalyticsSummary {
   }
 }
 
+/**
+ * 表示按日/周/月分桶的时间序列趋势数据点。
+ * 记录单时间桶内的运行量、成败返工数、耗时、Token 四分项、成本、需求数、合并 MR 数及会话工作区占比。
+ */
 class AnalyticsTrendPoint {
+  /**
+   * 构造并初始化趋势数据点实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.CostUnknownRuns = init.CostUnknownRuns ?? 0;
     this.Date = init.Date ?? "";
@@ -127,8 +178,17 @@ class AnalyticsTrendPoint {
   }
 }
 
-// AnalyticsWeekHourCell：请求时区内一个非空的星期 × 小时格。
+/**
+ * 表示请求时区下的一个非空“星期 × 小时”热力图单元格。
+ * `Weekday` 从周一（0）计到周日（6），用于在运营面板绘制活跃时段分布。
+ */
 class AnalyticsWeekHourCell {
+  /**
+   * 构造并初始化星期×小时热力格实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.Weekday = init.Weekday ?? 0;
     this.Hour = init.Hour ?? 0;
@@ -139,8 +199,17 @@ class AnalyticsWeekHourCell {
   }
 }
 
-// AnalyticsMRMerge：保留 MR 计数所用的时间戳证据。
+/**
+ * 表示单条 MR 合并计数所对应的审计时间戳证据。
+ * 用于运营看板核验合并 MR 统计口径及跳转具体 MR 与关联需求。
+ */
 class AnalyticsMRMerge {
+  /**
+   * 构造并初始化 MR 合并证据实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.MRProject = init.MRProject ?? "";
     this.MRIID = init.MRIID ?? 0;
@@ -152,7 +221,17 @@ class AnalyticsMRMerge {
   }
 }
 
+/**
+ * 表示按单一维度（工作流、角色、执行器、模型、节点、需求来源或分类）分组的统计拆解项。
+ * 包含该维度的运行量、成功率、取消率、返工率、耗时、Token/成本占比以及编排画像信息。
+ */
 class AnalyticsBreakdown {
+  /**
+   * 构造并初始化维度统计拆解项实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.CostUnknownRuns = init.CostUnknownRuns ?? 0;
     this.QualityUnknownRuns = init.QualityUnknownRuns ?? 0;
@@ -197,7 +276,17 @@ class AnalyticsBreakdown {
   }
 }
 
+/**
+ * 表示按错误码与失败节点聚合的失败频次统计项。
+ * 用于运营分析中排查高频失败原因。
+ */
 class AnalyticsFailure {
+  /**
+   * 构造并初始化失败统计项实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.Code = init.Code ?? "";
     this.NodeID = init.NodeID ?? "";
@@ -205,7 +294,17 @@ class AnalyticsFailure {
   }
 }
 
+/**
+ * 表示可观测性数据（遥测事件与日志记录）在运行样本中的覆盖统计。
+ * 用于评估分析看板指标的数据完整度。
+ */
 class AnalyticsCoverage {
+  /**
+   * 构造并初始化观测覆盖度实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.RunsWithTelemetry = init.RunsWithTelemetry ?? 0;
     this.RunsWithLogs = init.RunsWithLogs ?? 0;
@@ -214,7 +313,18 @@ class AnalyticsCoverage {
   }
 }
 
+/**
+ * 表示单个需求维度的交付分析明细行。
+ * 聚合该需求关联的全部 SOP 运行及会话直改代码工作区，记录 MR 状态、交付结果、
+ * 澄清/开发/测试各阶段耗时、证据链路与按角色拆分的泳道信息。
+ */
 class AnalyticsDelivery {
+  /**
+   * 构造并初始化需求交付明细实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.IssueID = init.IssueID ?? "";
     this.ExternalID = init.ExternalID ?? "";
@@ -260,7 +370,17 @@ class AnalyticsDelivery {
   }
 }
 
+/**
+ * 表示需求各交付阶段（澄清、开发、测试及推断归类）观测到的样本计数。
+ * 用于区分“实际耗时为 0”与“该阶段未采集到样本”。
+ */
 class AnalyticsPhaseSamples {
+  /**
+   * 构造并初始化阶段样本计数实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.Clarification = init.Clarification ?? 0;
     this.Development = init.Development ?? 0;
@@ -269,7 +389,17 @@ class AnalyticsPhaseSamples {
   }
 }
 
+/**
+ * 表示单条阶段耗时与运行节点之间的溯源证据记录。
+ * 用于把澄清边界或开发/测试耗时精确关联到对应的运行 ID 与节点 ID。
+ */
 class AnalyticsPhaseEvidence {
+  /**
+   * 构造并初始化阶段耗时证据实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.RunID = init.RunID ?? "";
     this.NodeID = init.NodeID ?? "";
@@ -281,7 +411,17 @@ class AnalyticsPhaseEvidence {
   }
 }
 
+/**
+ * 表示筛选窗口内需求交付漏斗与周期的全局汇总统计。
+ * 涵盖 SOP 交付、会话直改交付、MR 关联与合入数量、去重完成需求数、节点求和耗时分位数及分类计数。
+ */
 class AnalyticsDeliverySummary {
+  /**
+   * 构造并初始化交付汇总实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.Issues = init.Issues ?? 0;
     this.SOPSucceeded = init.SOPSucceeded ?? 0;
@@ -308,8 +448,17 @@ class AnalyticsDeliverySummary {
   }
 }
 
-// AnalyticsWorkflowVersion：对比同一 SOP 不同版本的执行效果。
+/**
+ * 表示同一 SOP 工作流不同版本号的执行效果对比行。
+ * 当运行次数低于样本阈值（< 5）时标记 `InsufficientSample` 为 `true`。
+ */
 class AnalyticsWorkflowVersion {
+  /**
+   * 构造并初始化工作流版本对比实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.CostUnknownRuns = init.CostUnknownRuns ?? 0;
     this.WorkflowID = init.WorkflowID ?? "";
@@ -328,8 +477,17 @@ class AnalyticsWorkflowVersion {
   }
 }
 
-// AnalyticsUserUsage：每用户每日用量。
+/**
+ * 表示“责任人 × 自然日”维度的每用户每日资源与运行用量记录。
+ * 用于个人效率与成本明细报表展示。
+ */
 class AnalyticsUserUsage {
+  /**
+   * 构造并初始化每用户每日用量实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.UserID = init.UserID ?? "";
     this.Date = init.Date ?? "";
@@ -349,8 +507,17 @@ class AnalyticsUserUsage {
   }
 }
 
-// AnalyticsProjectUsage：按项目汇总用量。
+/**
+ * 表示按项目维度汇总的运行、需求与成本用量。
+ * 在跨项目查看整体或个人数据时用于拆分各项目贡献，也作为业务域项目用量结构的基类。
+ */
 class AnalyticsProjectUsage {
+  /**
+   * 构造并初始化项目用量汇总实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.ProjectID = init.ProjectID ?? "";
     this.Runs = init.Runs ?? 0;
@@ -364,8 +531,17 @@ class AnalyticsProjectUsage {
   }
 }
 
-// AnalyticsDemoSummary：首个 Loop 演示指标，分母明确可审计。
+/**
+ * 表示最小闭环演示指标汇总，所有分母均显式输出以便审计。
+ * 工具成功率仅统计已结束的工具观测；自动化率指无人工决策事件介入的成功运行占比。
+ */
 class AnalyticsDemoSummary {
+  /**
+   * 构造并初始化演示指标汇总实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.CoveredRuns = init.CoveredRuns ?? 0;
     this.CoveredSucceededRuns = init.CoveredSucceededRuns ?? 0;
@@ -381,8 +557,17 @@ class AnalyticsDemoSummary {
   }
 }
 
-// AnalyticsRunTrace：TAPD -> workflow task -> Run -> trace 的精简行。
+/**
+ * 表示看板用于下钻索引的精简链路追踪行（外部需求 → 工作流任务 → 运行 → Trace）。
+ * 完整事件流仍通过运行详情端点按游标分页拉取。
+ */
 class AnalyticsRunTrace {
+  /**
+   * 构造并初始化运行链路追踪摘要实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.ExecutionDurationMs = init.ExecutionDurationMs ?? null;
     this.Origin = init.Origin ?? "";
@@ -413,8 +598,17 @@ class AnalyticsRunTrace {
   }
 }
 
-// AnalyticsActivity：独立统计会话、需求与顶层需求 SOP 执行。
+/**
+ * 表示独立于运行/Token 覆盖口径的平台活跃度统计。
+ * 统计持久化会话数、协作会话数、创建需求数、顶层需求 SOP 执行数及回复 Token 用量。
+ */
 class AnalyticsActivity {
+  /**
+   * 构造并初始化平台活跃度统计实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.Sessions = init.Sessions ?? 0;
     this.CollaborativeSessions = init.CollaborativeSessions ?? 0;
@@ -425,8 +619,17 @@ class AnalyticsActivity {
   }
 }
 
-// CollaborativeUsage 是 SessionUsage 的子集，不是额外计费。
+/**
+ * 表示按回复时间统计的会话 Token 用量及上报完整度。
+ * 协作会话用量是总会话用量的子集，不构成重复计费。
+ */
 class AnalyticsSessionUsage {
+  /**
+   * 构造并初始化会话用量统计实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.Tokens = init.Tokens ?? 0;
     this.InputTokens = init.InputTokens ?? 0;
@@ -439,15 +642,34 @@ class AnalyticsSessionUsage {
   }
 }
 
-// Go 嵌入 AnalyticsActivity 译为继承。
+/**
+ * 表示按日期分桶的平台活跃度趋势数据点。
+ * 对应 Go 中 `AnalyticsActivityPoint` 嵌入 `AnalyticsActivity`，在 JS 中通过继承复用全部活跃度字段。
+ */
 class AnalyticsActivityPoint extends AnalyticsActivity {
+  /**
+   * 构造并初始化活跃度趋势数据点实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     super(init);
     this.Date = init.Date ?? "";
   }
 }
 
+/**
+ * 表示一次运营分析查询返回的完整分析快照。
+ * 汇总筛选条件、总览、活跃度、趋势、多维拆解、交付明细、版本对比、用户/项目用量及热力图数据。
+ */
 class AnalyticsSnapshot {
+  /**
+   * 构造并初始化完整分析快照实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.Activity = init.Activity ?? new AnalyticsActivity();
     this.ActivityTrend = init.ActivityTrend ?? [];

@@ -1,11 +1,26 @@
-// public_repository.js —— 对应 Go 文件：internal/domain/public_repository.go
-// 作用：公开托管仓库链接解析。
+/**
+ * @file internal/domain/public_repository.js
+ * @description 对应 Go 源文件：internal/domain/public_repository.go
+ * 职责边界：解析公开托管平台（GitHub）的仓库链接及带前缀标识，并在非 GitHub 地址时回退到共峰仓库链接解析。
+ * 语法差异说明：
+ * - Go 的 `net/url` 解析译为全局 WHATWG `URL`。
+ * - Go 的 `(GongfengRepoInfo, bool)` 返回译为 `[GongfengRepoInfo, boolean]` 二元数组。
+ * - `githubRepositoryPath` 虽为 Go 未导出变量，但同包 `mr.js` 引用了它，因此一并导出。
+ */
 
 "use strict";
 
+const { GongfengRepoInfo, IsGongfengHost, ParseGongfengRepoURL } = require("./project.js");
+
 const githubRepositoryPath = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 
-// ParseRepositoryURL：接入公开托管，不改动上游适配器；带前缀的远端标识防止与企业项目 ID 冲突。返回 [信息, 是否成功]。
+/**
+ * 解析 GitHub 公开仓库或共峰仓库的链接、SSH 克隆串与 `git clone` 命令。
+ * 对 GitHub 仓库会生成带 `"github:"` 前缀的 `Project` 标识以防止与企业内项目 ID 冲突；非 GitHub 地址在主机校验通过后交由 `ParseGongfengRepoURL` 解析。
+ *
+ * @param {string} raw - 用户输入的原始仓库链接、SSH 地址、`github:owner/repo` 或 `git clone` 命令。
+ * @returns {[GongfengRepoInfo, boolean]} 二元组 `[解析出的仓库信息, 是否解析成功]`。
+ */
 function ParseRepositoryURL(raw) {
   let s = raw.trim();
   if (s.startsWith("git clone ")) {
@@ -53,4 +68,4 @@ function ParseRepositoryURL(raw) {
   return ParseGongfengRepoURL(raw);
 }
 
-module.exports = { ParseRepositoryURL };
+module.exports = { githubRepositoryPath, ParseRepositoryURL };

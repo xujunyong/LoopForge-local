@@ -1,10 +1,31 @@
-// assistant_diagnostics.js —— 对应 Go 文件：internal/domain/assistant_diagnostics.go
-// 作用：一轮助手生成的有界脱敏诊断记录：尝试、工具、时间线与评估。
+/**
+ * @file internal/domain/assistant_diagnostics.js
+ * 对应 Go 源文件：internal/domain/assistant_diagnostics.go
+ *
+ * 作用与职责边界：
+ * 定义单轮助手生成的有界、脱敏诊断数据结构，涵盖用户可见的失败摘要、诊断主对象、
+ * 构建与实例环境信息、终止记录、确定性评估结论、CLI 进程状态、工具调用记录、
+ * CLI 调用尝试明细及诊断时间线事件。
+ * 仅定义数据结构，不包含敏感提示词、环境变量、凭证采集或分析算法（分析逻辑见 `assistant_diagnostic_analysis.js`）。
+ *
+ * 语法差异说明：
+ * - Go 指针字段（`*bool`、`*int`、`*time.Time` 等）与 `time.Time` 零值统一初始化为 `null`。
+ * - Go 切片字段初始化为 `[]`，映射字段（`Dropped`）初始化为 `{}`。
+ */
 
 "use strict";
 
-// AssistantFailure：可随回复展示的安全失败信息。
+/**
+ * 表示可安全展示在助手回复旁的结构化失败信息。
+ * 不包含原始上游追踪 ID（原生 `requestId`/`traceId` 仅保存在诊断报告中）。
+ */
 class AssistantFailure {
+  /**
+   * 构造并初始化助手失败摘要实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.Code = init.Code ?? "";
     this.Phase = init.Phase ?? "";
@@ -13,8 +34,17 @@ class AssistantFailure {
   }
 }
 
-// AssistantDiagnostics：一轮的有界脱敏记录，不含提示词、命令参数、环境与原始厂商流。
+/**
+ * 表示单轮助手生成的有界、脱敏诊断报告主结构。
+ * 不包含提示词、命令行参数、环境变量或厂商原始输出流，供故障排查与导出使用。
+ */
 class AssistantDiagnostics {
+  /**
+   * 构造并初始化助手诊断报告实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.Version = init.Version ?? 0;
     this.GenerationID = init.GenerationID ?? "";
@@ -37,8 +67,17 @@ class AssistantDiagnostics {
   }
 }
 
-// 事实可跨环境携带：无需主机名、用户身份、安装路径或环境转储即可识别构建与执行实例。
+/**
+ * 表示可跨环境安全导出的构建与运行实例元信息。
+ * 不含主机名、用户身份、安装路径或环境变量转储，仅用于定位平台版本与服务实例日志。
+ */
 class AssistantDiagnosticEnvironment {
+  /**
+   * 构造并初始化诊断环境元信息实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.PlatformVersion = init.PlatformVersion ?? "";
     this.Revision = init.Revision ?? "";
@@ -51,7 +90,16 @@ class AssistantDiagnosticEnvironment {
   }
 }
 
+/**
+ * 表示平台侧记录的本轮生成终止事实（如用户主动停止、转向或心跳丢失）。
+ */
 class AssistantDiagnosticTermination {
+  /**
+   * 构造并初始化诊断终止记录实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.At = init.At ?? null;
     this.Code = init.Code ?? "";
@@ -60,8 +108,17 @@ class AssistantDiagnosticTermination {
   }
 }
 
-// Assessment：只描述观察到的证据，绝不编造厂商根因。
+/**
+ * 表示由离线分析产出的诊断评估结论。
+ * 严格区分已观测证据（`Evidence`）、无法确认项（`Unknowns`）与排查建议（`NextSteps`），不臆测上游根因。
+ */
 class AssistantDiagnosticAssessment {
+  /**
+   * 构造并初始化诊断评估结论实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.Outcome = init.Outcome ?? "";
     this.Summary = init.Summary ?? "";
@@ -71,7 +128,17 @@ class AssistantDiagnosticAssessment {
   }
 }
 
+/**
+ * 表示单次 CLI 调用对应的子进程生命周期与输出统计信息。
+ * 包含进程号、状态、信号、CPU 耗时以及 stdout/stderr 行数与首末输出时间。
+ */
 class AssistantDiagnosticProcess {
+  /**
+   * 构造并初始化诊断进程状态实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.PID = init.PID ?? 0;
     this.State = init.State ?? "";
@@ -89,7 +156,16 @@ class AssistantDiagnosticProcess {
   }
 }
 
+/**
+ * 表示诊断报告中单次工具调用的状态与脱敏错误元数据。
+ */
 class AssistantDiagnosticTool {
+  /**
+   * 构造并初始化诊断工具记录实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.ID = init.ID ?? "";
     this.AttemptID = init.AttemptID ?? "";
@@ -107,7 +183,17 @@ class AssistantDiagnosticTool {
   }
 }
 
+/**
+ * 表示一轮助手生成中对底层 CLI 执行器的一次完整调用尝试记录。
+ * 记录所用引擎、模型、版本来源、进程状态、退出码、stderr 片段、首个异常事件及原生会话标识。
+ */
 class AssistantCLIAttempt {
+  /**
+   * 构造并初始化 CLI 调用尝试实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.ID = init.ID ?? "";
     this.Engine = init.Engine ?? "";
@@ -135,7 +221,17 @@ class AssistantCLIAttempt {
   }
 }
 
+/**
+ * 表示诊断时间线或 CLI 尝试明细中的单条脱敏事件。
+ * 记录事件时间戳、类型、脱敏消息、错误分类、上游请求/链路 ID、HTTP 状态码及是否可重试。
+ */
 class AssistantDiagnosticEvent {
+  /**
+   * 构造并初始化诊断事件实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.At = init.At ?? null;
     this.Kind = init.Kind ?? "";

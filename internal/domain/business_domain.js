@@ -1,12 +1,32 @@
-// business_domain.js —— 对应 Go 文件：internal/domain/business_domain.go
-// 作用：业务域（管理型汇报维度）及其用量与交付报表结构。
+/**
+ * @file internal/domain/business_domain.js
+ * 对应 Go 源文件：internal/domain/business_domain.go
+ *
+ * 作用与职责边界：
+ * 定义业务域（管理型汇报维度）及其项目归属变更审计、按项目与按业务域聚合的资源用量、
+ * 独立于运行创建时间的交付指标与交付趋势点，以及完整业务域运营报表的数据模型。
+ * 仅描述领域结构，不负责权限判定或报表查询计算。
+ *
+ * 语法差异说明：
+ * - Go 结构体匿名嵌入（`BusinessDomainProjectUsage` 嵌入 `AnalyticsProjectUsage`）转写为类继承（`extends`）。
+ * - Go 指针字段和 `time.Time` 字段零值初始化为 `null`。
+ */
 
 "use strict";
 
 const { AnalyticsProjectUsage, AnalyticsSummary, AnalyticsDeliverySummary, AnalyticsTrendPoint } = require("./analytics.js"); // 对应 Go 同包类型，analytics.js 已翻译
 
-// BusinessDomain：管理型汇报维度，与项目执行权限无关。
+/**
+ * 表示用于管理汇报的业务域实体，独立于项目的日常执行权限控制。
+ * 记录业务域基本信息、启用状态以及管理员和查看者用户 ID 列表。
+ */
 class BusinessDomain {
+  /**
+   * 构造并初始化业务域实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.ID = init.ID ?? "";
     this.Name = init.Name ?? "";
@@ -19,7 +39,16 @@ class BusinessDomain {
   }
 }
 
+/**
+ * 表示项目在不同业务域之间划转的归属变更审计记录。
+ */
 class BusinessDomainAssignment {
+  /**
+   * 构造并初始化项目业务域划转记录实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.ID = init.ID ?? 0;
     this.ProjectID = init.ProjectID ?? "";
@@ -31,8 +60,17 @@ class BusinessDomainAssignment {
   }
 }
 
-// Go 嵌入 AnalyticsProjectUsage 译为继承。
+/**
+ * 表示业务域报表中的单个项目用量与交付指标行。
+ * 对应 Go 中嵌入 `AnalyticsProjectUsage`，通过继承复用项目级运行与成本字段，并补充项目名、所属业务域及交付指标。
+ */
 class BusinessDomainProjectUsage extends AnalyticsProjectUsage {
+  /**
+   * 构造并初始化业务域项目用量实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     super(init);
     this.Name = init.Name ?? "";
@@ -41,7 +79,16 @@ class BusinessDomainProjectUsage extends AnalyticsProjectUsage {
   }
 }
 
+/**
+ * 表示按业务域聚合的资源用量、需求交付量及交付周期指标汇总行。
+ */
 class BusinessDomainUsage {
+  /**
+   * 构造并初始化业务域汇总用量实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.ID = init.ID ?? "";
     this.Name = init.Name ?? "";
@@ -60,8 +107,17 @@ class BusinessDomainUsage {
   }
 }
 
-// BusinessDeliveryMetrics：完成与合并时钟相互独立，分位数按单个已完成工作项计算。
+/**
+ * 表示按需求完成时间与 MR 合并时间独立口径计算的业务交付指标。
+ * 周期均值与 P50/P95 分位数均基于单个已完成工作项计算，并记录缺失时间或倒挂样本计数以便审计。
+ */
 class BusinessDeliveryMetrics {
+  /**
+   * 构造并初始化业务交付指标实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.CompletionToMergeSamples = init.CompletionToMergeSamples ?? 0;
     this.AverageCompletionToMergeMs = init.AverageCompletionToMergeMs ?? 0;
@@ -86,7 +142,17 @@ class BusinessDeliveryMetrics {
   }
 }
 
+/**
+ * 表示业务域交付趋势图中的单个时间桶数据点。
+ * 记录该时间桶内的完成需求数、合并 MR 数以及端到端周期与纯执行耗时均值。
+ */
 class BusinessDeliveryTrendPoint {
+  /**
+   * 构造并初始化业务交付趋势点实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.Date = init.Date ?? "";
     this.CompletedIssues = init.CompletedIssues ?? 0;
@@ -98,7 +164,17 @@ class BusinessDeliveryTrendPoint {
   }
 }
 
+/**
+ * 表示一次业务域运营分析查询返回的完整报表载荷。
+ * 整合归因口径、统计时间窗、平台总览与交付汇总、运行趋势、项目明细、业务域明细、交付指标及交付趋势。
+ */
 class BusinessDomainReport {
+  /**
+   * 构造并初始化业务域报表实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.Attribution = init.Attribution ?? "";
     this.GeneratedAt = init.GeneratedAt ?? null;

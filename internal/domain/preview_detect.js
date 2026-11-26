@@ -1,5 +1,12 @@
-// preview_detect.js —— 对应 Go 文件：internal/domain/preview_detect.go
-// 作用：检测工作区是否为前端工程。
+/**
+ * @file internal/domain/preview_detect.js
+ * @description 对应 Go 源文件：internal/domain/preview_detect.go
+ * 职责边界：通过受限深度与文件数上限的目录扫描，判断给定工作区是否包含前端工程或静态站点产物，并返回命中证据，用于非前端仓库自动跳过预览构建。
+ * 语法差异说明：
+ * - Go 的 `os`、`io/fs` 与 `path/filepath` 对应 Node.js 内置模块 `node:fs` 与 `node:path`。
+ * - Go 的 `(bool, string)` 双返回值译为 `[boolean, string]` 二元数组。
+ * - Go 的 `map[string]bool` 集合统一译为普通对象 `{}`（值为 `true`）。
+ */
 
 "use strict";
 
@@ -99,16 +106,35 @@ const frontendScriptTokens = [
   "parcel",
 ];
 
+/**
+ * 解析 `package.json` 时使用的轻量依赖与脚本结构。
+ * 仅提取依赖声明和 scripts 字段以识别前端框架或构建工具。
+ */
 class npmPackageJSON {
+  /**
+   * 构造 `package.json` 局部解析结果，未传入字段按 Go 零值初始化。
+   *
+   * @param {object} [init={}] - 初始化字段集合。
+   * @param {Object.<string, string>} [init.Dependencies={}] - 运行时依赖映射。
+   * @param {Object.<string, string>} [init.DevDependencies={}] - 开发依赖映射。
+   * @param {Object.<string, string>} [init.PeerDependencies={}] - 对等依赖映射。
+   * @param {Object.<string, string>} [init.Scripts={}] - npm 脚本命令映射。
+   */
   constructor(init = {}) {
-    this.Dependencies = init.Dependencies ?? null;
-    this.DevDependencies = init.DevDependencies ?? null;
-    this.PeerDependencies = init.PeerDependencies ?? null;
-    this.Scripts = init.Scripts ?? null;
+    this.Dependencies = init.Dependencies ?? {};
+    this.DevDependencies = init.DevDependencies ?? {};
+    this.PeerDependencies = init.PeerDependencies ?? {};
+    this.Scripts = init.Scripts ?? {};
   }
 }
 
-// DetectFrontendProject：报告工作区是否像前端工程（或已构建好的静态站点）；非前端仓库应跳过预览，而不是编造页面或让 SOP 失败。返回 [是否前端, 证据]。
+/**
+ * 检测给定工作区根目录是否包含前端工程或已构建的静态站点。
+ * 供预览构建流程在启动前判断，使非前端仓库跳过预览而不是编造页面或导致 SOP 失败。
+ *
+ * @param {string} root - 待检测的工作区根目录绝对或相对路径。
+ * @returns {[boolean, string]} 二元组 `[是否为前端工程, 命中证据或未命中原因说明]`。
+ */
 function DetectFrontendProject(root) {
   root = root.trim();
   if (root === "") {
@@ -166,7 +192,14 @@ function DetectFrontendProject(root) {
   return [false, "未发现 Vite/webpack/Next 配置、前端依赖或 index.html"];
 }
 
-// previewDetectSkipDir：报告 rel 处目录是否应剪枝：已知的依赖、缓存、版本控制目录，或达到 maxPreviewDetectDepth 深度。
+/**
+ * 判断扫描过程中遇到的目录是否应当剪枝跳过。
+ * 命中常见依赖、缓存、版本控制目录，或相对深度达到 `maxPreviewDetectDepth` 时返回 `true`。
+ *
+ * @param {string} name - 目录名。
+ * @param {string} rel - 相对工作区根目录的正斜杠路径。
+ * @returns {boolean} 需要跳过该目录时返回 `true`，否则返回 `false`。
+ */
 function previewDetectSkipDir(name, rel) {
   if (previewDetectSkipDirs[name.toLowerCase()]) {
     return true;
@@ -174,7 +207,15 @@ function previewDetectSkipDir(name, rel) {
   return (rel.match(/\//g) || []).length >= maxPreviewDetectDepth;
 }
 
-// frontendFileEvidence：报告 path 处文件（rel 为相对工作区根目录的路径）是否标志工作区为前端，并给出证据串：首页或打包器配置给出斜杠路径，含前端依赖或脚本的 package.json 给出 "<rel> (<原因>)"。
+/**
+ * 检查单个文件是否足以证明工作区包含前端工程，并返回对应证据说明。
+ * 命中首页或构建器配置文件时返回其相对路径；命中带前端依赖或脚本的 `package.json` 时返回 `"<rel> (<原因>)"`。
+ *
+ * @param {string} filePath - 文件的完整路径。
+ * @param {string} rel - 文件相对工作区根目录的正斜杠路径。
+ * @param {string} name - 文件名。
+ * @returns {[boolean, string]} 二元组 `[是否命中前端特征, 命中证据字符串]`。
+ */
 function frontendFileEvidence(filePath, rel, name) {
   const lower = name.toLowerCase();
   if (frontendIndexNames[lower] || frontendConfigFiles[lower]) {
@@ -190,6 +231,12 @@ function frontendFileEvidence(filePath, rel, name) {
   return [false, ""];
 }
 
+/**
+ * 读取并解析 `package.json`，检查其依赖列表或构建脚本中是否包含已知前端框架/打包工具。
+ *
+ * @param {string} filePath - `package.json` 文件路径。
+ * @returns {[boolean, string]} 二元组 `[是否包含前端特征, 命中的依赖名或 "scripts:<关键字>"]`。
+ */
 function packageJSONFrontend(filePath) {
   let raw;
   try {
@@ -207,10 +254,10 @@ function packageJSONFrontend(filePath) {
     return [false, ""];
   }
   const pkg = new npmPackageJSON({
-    Dependencies: parsed.dependencies ?? null,
-    DevDependencies: parsed.devDependencies ?? null,
-    PeerDependencies: parsed.peerDependencies ?? null,
-    Scripts: parsed.scripts ?? null,
+    Dependencies: parsed.dependencies ?? {},
+    DevDependencies: parsed.devDependencies ?? {},
+    PeerDependencies: parsed.peerDependencies ?? {},
+    Scripts: parsed.scripts ?? {},
   });
   for (const group of [pkg.Dependencies, pkg.DevDependencies, pkg.PeerDependencies]) {
     for (const name of Object.keys(group ?? {})) {
