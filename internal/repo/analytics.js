@@ -1,5 +1,20 @@
-// analytics.js —— 对应 Go 文件：internal/repo/analytics.go
-// 作用：运营分析只读视图：汇总、趋势、维度拆解与交付明细。
+/**
+ * @file internal/repo/analytics.js
+ * 对应 Go 源文件：internal/repo/analytics.go
+ *
+ * 作用与职责边界：
+ * 提供平台只读运营分析核心视图的聚合逻辑，负责拉取并整合平台运行、外部洞察运行、
+ * 需求、工作流/智能体/执行器定义、工具与人工干预信号、观测覆盖度与 MR 合并记录，
+ * 输出包含总览指标、趋势、星期×小时热力图、多维拆解、版本对比、用户/项目用量、追踪列表与交付汇总的完整快照。
+ *
+ * 语法差异说明：
+ * - `AnalyticsRepo` 定义于 `repo.js`（继承 `deps`），本文件通过 `AnalyticsRepo.prototype` 挂载其分析方法并保留导出兼容。
+ * - Go 的 `defer applyAnalyticsCNY(&out)` 在 JS 中通过 `try { ... } finally { applyAnalyticsCNY(out); }` 1:1 表达。
+ * - Go 的 `time.Time` 对应 `Date`（零值为 `null`），通过 `isZeroTime`/`timeMs`/`timeBefore`/`timeAfter`/`timeEqual` 保持与 Go 零值时间的比较一致。
+ * - Go 的 `(值, error)` 与 `(值1, 值2, error)` 在成功时返回值或二元组、失败时抛出错误；`(值, bool)` 或 `(string, string)` 译为二元组。
+ * - Go 的整数除法使用 `Math.trunc(...)` 保持向零截断语义；`map[string]V` 与 `map[string]struct{}` 统一使用普通对象 `{}`。
+ * - 与 `analytics_pricing.js`、`analytics_insights.js` 存在同包循环引用，调用处采用函数内延迟 `require`。
+ */
 
 "use strict";
 
@@ -11,39 +26,105 @@ const { RunProjectID } = require("../domain/catalog.js"); // 对应 Go 的 domai
 const { IsRequirementWorkItem } = require("../domain/sop_lane.js"); // 对应 Go 的 domain.IsRequirementWorkItem，domain 已翻译
 const { SummarizeDeliveries } = require("../domain/mr.js"); // 对应 Go 的 domain.SummarizeDeliveries，domain 已翻译
 require("../domain/delivery_mr.js"); // Issue.prototype.DeliveryMRList 的原型方法，domain 已翻译
+const { AnalyticsRepo } = require("./repo.js"); // 对应 Go 同包类型，repo.js 已翻译
 const { parallel, runDuration, runExecutionDuration, runWaitDuration, runEndedAt, runArtifactCount, queryAnalyticsWorkflowSnapshots } = require("./runs.js"); // 对应 Go 同包函数，runs.js 待翻译
 const { countDeliveryGroups } = require("./delivery.js"); // 对应 Go 同包函数，delivery.js 待翻译
 
-// applyAnalyticsCNY、analyticsPricedRun 在 analytics_pricing.js 中定义，
-// accumulateInsightModels 在 analytics_insights.js 中定义；三处与本文件循环引用，调用时现取。
+/**
+ * 延迟调用 `analytics_pricing.js` 中的 `applyAnalyticsCNY`，避免同包循环引用。
+ * 在 `analyticsWithRuns` 返回前将分析快照中的美元金额按汇率换算并写入人民币字段。
+ *
+ * @param {AnalyticsSnapshot} out - 待回填人民币成本字段的分析快照对象。
+ * @returns {void} 无返回值。
+ */
 function applyAnalyticsCNY(out) {
   require("./analytics_pricing.js").applyAnalyticsCNY(out);
 }
+
+/**
+ * 延迟调用 `analytics_pricing.js` 中的 `analyticsPricedRun`，避免同包循环引用。
+ * 在分析聚合前对单条平台运行按模型价目表重算分析用成本。
+ *
+ * @param {import("../domain/run.js").Run} run - 待重定价的运行记录。
+ * @returns {import("../domain/run.js").Run} 更新分析成本后的运行记录。
+ */
 function analyticsPricedRun(run) {
   return require("./analytics_pricing.js").analyticsPricedRun(run);
 }
+
+/**
+ * 延迟调用 `analytics_insights.js` 中的 `accumulateInsightModels`，避免同包循环引用。
+ * 将外部洞察执行记录中的模型用量累加到模型维度拆解表中。
+ *
+ * @param {Object<string, analyticsAccumulator>} models - 按模型名索引的维度累加器映射。
+ * @param {import("../domain/insights.js").InsightExecution} execution - 外部洞察执行记录。
+ * @returns {void} 无返回值。
+ */
 function accumulateInsightModels(models, execution) {
   require("./analytics_insights.js").accumulateInsightModels(models, execution);
 }
 
-// Go 的 time.Time 零值译为 null；timeMs 把 null 换算为 Go 零值时间的毫秒数。
+/**
+ * 判断时间对象是否为 Go 语境下的零值时间（即 `null` 或 `undefined`）。
+ * 用于对照 Go 的 `t.IsZero()`。
+ *
+ * @param {Date|null|undefined} t - 待检查的时间对象。
+ * @returns {boolean} 为零值时返回 `true`，否则返回 `false`。
+ */
 function isZeroTime(t) {
   return t == null;
 }
+
+/**
+ * 将 `Date` 或零值时间换算为与 Go `time.Time` 一致的毫秒时间戳（零值对应公元 0001-01-01 UTC）。
+ * 用于时间先后比较与差值计算。
+ *
+ * @param {Date|null|undefined} t - 待转换的时间对象。
+ * @returns {number} 毫秒时间戳。
+ */
 function timeMs(t) {
   return t == null ? -62135596800000 : t.getTime();
 }
+
+/**
+ * 判断时间 `a` 是否严格早于时间 `b`（对应 Go 的 `a.Before(b)`）。
+ *
+ * @param {Date|null|undefined} a - 左侧时间。
+ * @param {Date|null|undefined} b - 右侧时间。
+ * @returns {boolean} `a` 早于 `b` 时返回 `true`，否则返回 `false`。
+ */
 function timeBefore(a, b) {
   return timeMs(a) < timeMs(b);
 }
+
+/**
+ * 判断时间 `a` 是否严格晚于时间 `b`（对应 Go 的 `a.After(b)`）。
+ *
+ * @param {Date|null|undefined} a - 左侧时间。
+ * @param {Date|null|undefined} b - 右侧时间。
+ * @returns {boolean} `a` 晚于 `b` 时返回 `true`，否则返回 `false`。
+ */
 function timeAfter(a, b) {
   return timeMs(a) > timeMs(b);
 }
+
+/**
+ * 判断时间 `a` 与时间 `b` 是否表示同一时刻（对应 Go 的 `a.Equal(b)`）。
+ *
+ * @param {Date|null|undefined} a - 左侧时间。
+ * @param {Date|null|undefined} b - 右侧时间。
+ * @returns {boolean} 两者相等时返回 `true`，否则返回 `false`。
+ */
 function timeEqual(a, b) {
   return timeMs(a) === timeMs(b);
 }
 
-// zeroTimeDate：Go 的 time.Time{}，即公元 1 年 1 月 1 日。
+/**
+ * 构造表示 Go 零值时间（公元 0001-01-01 00:00:00 UTC）的 `Date` 实例。
+ * 用于在零值时间参与格式化或时区平移时保持与 Go 输出一致。
+ *
+ * @returns {Date} 公元 1 年 1 月 1 日零点 UTC 对应的 `Date` 实例。
+ */
 function zeroTimeDate() {
   const d = new Date(0);
   d.setUTCFullYear(1, 0, 1);
@@ -51,7 +132,13 @@ function zeroTimeDate() {
   return d;
 }
 
-// formatDayUTC：Go 的 t.Format("2006-01-02")，用 UTC 取值；零值译为 0001-01-01。
+/**
+ * 按 UTC 将时间格式化为 `YYYY-MM-DD` 日期字符串（对应 Go 的 `t.Format("2006-01-02")`）。
+ * 零值时间格式化为 `"0001-01-01"`。
+ *
+ * @param {Date|null|undefined} t - 待格式化的时间对象。
+ * @returns {string} `YYYY-MM-DD` 格式日期字符串。
+ */
 function formatDayUTC(t) {
   if (t == null) {
     return "0001-01-01";
@@ -61,7 +148,13 @@ function formatDayUTC(t) {
   return `${t.getUTCFullYear()}-${mm}-${dd}`;
 }
 
-// formatMonthUTC：Go 的 t.Format("2006-01")，用 UTC 取值；零值译为 0001-01。
+/**
+ * 按 UTC 将时间格式化为 `YYYY-MM` 月份字符串（对应 Go 的 `t.Format("2006-01")`）。
+ * 零值时间格式化为 `"0001-01"`。
+ *
+ * @param {Date|null|undefined} t - 待格式化的时间对象。
+ * @returns {string} `YYYY-MM` 格式月份字符串。
+ */
 function formatMonthUTC(t) {
   if (t == null) {
     return "0001-01";
@@ -70,7 +163,13 @@ function formatMonthUTC(t) {
   return `${t.getUTCFullYear()}-${mm}`;
 }
 
-// isoWeek：Go 的 t.ISOWeek()，入参用 UTC 取值，返回 [年, 周]。
+/**
+ * 计算给定 UTC 时间对应的 ISO-8601 周年与周序号（对应 Go 的 `t.ISOWeek()`）。
+ * 在按周粒度聚合趋势分桶时调用。
+ *
+ * @param {Date} d - 待计算周序号的时间对象（按 UTC 字段取值）。
+ * @returns {[number, number]} 二元组 `[ISO 年份, ISO 周序号]`。
+ */
 function isoWeek(d) {
   const date = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
   const day = (date.getUTCDay() + 6) % 7;
@@ -83,7 +182,13 @@ function isoWeek(d) {
   return [year, week];
 }
 
-// loadTimeLocation：Go 的 time.LoadLocation；无效时区名抛错，空名取 UTC。
+/**
+ * 校验并加载 IANA 时区描述对象（对应 Go 的 `time.LoadLocation`）。
+ * 空名称返回 UTC，`"Local"` 返回本地时区标记，无效时区名称由 `Intl.DateTimeFormat` 抛出错误。
+ *
+ * @param {string|null|undefined} name - IANA 时区名称（如 `"Asia/Shanghai"`）、`"Local"` 或空字符串。
+ * @returns {{name: string, offsetMs?: number}} 时区描述对象。
+ */
 function loadTimeLocation(name) {
   if (name == null || name === "") {
     return { name: "UTC" };
@@ -95,7 +200,14 @@ function loadTimeLocation(name) {
   return { name };
 }
 
-// inLocation：Go 的 t.In(loc)，返回墙钟字段与 UTC 取值相等的平移后 Date；零值返回零值日期。
+/**
+ * 将时间戳转换到目标时区，并返回一个 UTC 墙钟字段等于目标时区本地墙钟字段的 `Date`（对应 Go 的 `t.In(loc)`）。
+ * 便于调用方统一用 `getUTC*` 方法读取目标时区的年月日、星期与小时；零值时间返回零值日期。
+ *
+ * @param {Date|null|undefined} date - 原始时间点。
+ * @param {{name: string, offsetMs?: number}|null|undefined} loc - 由 `loadTimeLocation` 或固定偏移构造的时区描述对象。
+ * @returns {Date} 墙钟字段已平移到目标时区的 `Date` 实例。
+ */
 function inLocation(date, loc) {
   if (date == null) {
     return zeroTimeDate();
@@ -114,7 +226,34 @@ function inLocation(date, loc) {
   return new Date(Date.UTC(get("year"), get("month") - 1, get("day"), get("hour"), get("minute"), get("second"), date.getMilliseconds()));
 }
 
+/**
+ * 多维拆解项累加器（用于工作流、分类、需求来源、模型、节点、智能体、执行器等维度）。
+ * 暂存耗时样本切片、Token 四分项、节点重试/返工与唯一需求集合，汇总阶段由 `finalizeBreakdowns` 转为最终拆解项。
+ */
 class analyticsAccumulator {
+  /**
+   * 构造多维拆解项累加器实例，未提供字段严格按 Go 零值初始化。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射。
+   * @param {AnalyticsBreakdown} [init.item] - 对应的输出拆解项。
+   * @param {number[]} [init.durations=[]] - 墙钟耗时样本列表（毫秒）。
+   * @param {number} [init.duration=0] - 墙钟耗时累计和（毫秒）。
+   * @param {number[]} [init.execDurations=[]] - 执行耗时样本列表（毫秒）。
+   * @param {number} [init.execDuration=0] - 执行耗时累计和（毫秒）。
+   * @param {number} [init.inputTokens=0] - 输入 Token 累计值。
+   * @param {number} [init.outputTokens=0] - 输出 Token 累计值。
+   * @param {number} [init.cacheReadTokens=0] - 缓存读取 Token 累计值。
+   * @param {number} [init.cacheWriteTokens=0] - 缓存写入 Token 累计值。
+   * @param {number} [init.toolCalls=0] - 工具调用次数累计值。
+   * @param {number} [init.nodeRuns=0] - 节点执行次数累计值。
+   * @param {number} [init.retriedNodes=0] - 发生重试的节点次数。
+   * @param {number} [init.reworkNodes=0] - 发生返工的节点次数。
+   * @param {Object<string, number>} [init.models={}] - 模型调用次数分布映射。
+   * @param {Object<string, number>} [init.nodeTypes={}] - 工作流节点类型分布映射。
+   * @param {number} [init.nodeCount=0] - 工作流定义的节点总数。
+   * @param {Object<string, boolean>} [init.issueIDs={}] - 成功覆盖的唯一需求 ID 集合。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.item = init.item ?? new AnalyticsBreakdown();
     this.durations = init.durations ?? [];
@@ -129,14 +268,28 @@ class analyticsAccumulator {
     this.nodeRuns = init.nodeRuns ?? 0;
     this.retriedNodes = init.retriedNodes ?? 0;
     this.reworkNodes = init.reworkNodes ?? 0;
-    this.models = init.models ?? null;
-    this.nodeTypes = init.nodeTypes ?? null;
+    this.models = init.models ?? {};
+    this.nodeTypes = init.nodeTypes ?? {};
     this.nodeCount = init.nodeCount ?? 0;
-    this.issueIDs = init.issueIDs ?? null;
+    this.issueIDs = init.issueIDs ?? {};
   }
 }
 
+/**
+ * 工作流版本维度累加器，暂存单个 SOP 版本的墙钟与执行耗时样本。
+ */
 class analyticsVersionAccumulator {
+  /**
+   * 构造工作流版本累加器实例，未提供字段严格按 Go 零值初始化。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射。
+   * @param {AnalyticsWorkflowVersion} [init.item] - 对应的工作流版本统计项。
+   * @param {number[]} [init.durations=[]] - 墙钟耗时样本列表（毫秒）。
+   * @param {number} [init.duration=0] - 墙钟耗时累计和（毫秒）。
+   * @param {number[]} [init.execDurations=[]] - 执行耗时样本列表（毫秒）。
+   * @param {number} [init.execDuration=0] - 执行耗时累计和（毫秒）。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.item = init.item ?? new AnalyticsWorkflowVersion();
     this.durations = init.durations ?? [];
@@ -146,20 +299,53 @@ class analyticsVersionAccumulator {
   }
 }
 
+/**
+ * 用户按日用量累加器包装结构。
+ */
 class analyticsUserAccumulator {
+  /**
+   * 构造用户按日用量累加器实例，未提供字段严格按 Go 零值初始化。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射。
+   * @param {AnalyticsUserUsage} [init.item] - 对应的用户每日用量项。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.item = init.item ?? new AnalyticsUserUsage();
   }
 }
 
+/**
+ * 项目用量累加器，记录项目运行汇总与覆盖的唯一需求集合。
+ */
 class analyticsProjectAccumulator {
+  /**
+   * 构造项目用量累加器实例，未提供字段严格按 Go 零值初始化。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射。
+   * @param {AnalyticsProjectUsage} [init.item] - 对应的项目用量统计项。
+   * @param {Object<string, boolean>} [init.issues={}] - 该项目覆盖的唯一需求 ID 集合。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.item = init.item ?? new AnalyticsProjectUsage();
-    this.issues = init.issues ?? null;
+    this.issues = init.issues ?? {};
   }
 }
 
+/**
+ * 单条运行的工具调用成败与人工干预信号计数结构。
+ */
 class analyticsRunSignals {
+  /**
+   * 构造运行信号计数实例，未提供字段严格按 Go 零值初始化。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射。
+   * @param {number} [init.toolSucceeded=0] - 观测到的成功工具调用次数。
+   * @param {number} [init.toolFailed=0] - 观测到的失败工具调用次数。
+   * @param {number} [init.interventions=0] - 显式人工决策干预次数。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.toolSucceeded = init.toolSucceeded ?? 0;
     this.toolFailed = init.toolFailed ?? 0;
@@ -167,38 +353,35 @@ class analyticsRunSignals {
   }
 }
 
-// AnalyticsRepo：只读运营分析视图，对应 Go 的 repo.go 中的同名类型（repo.js 待翻译）。
-// Go 的 *deps 嵌入提供 DB 与 isMySQL、sqlPayloadJSONText，JS 里随 repo.js 补齐。
-class AnalyticsRepo {
-  constructor(init = {}) {
-    this.DB = init.DB ?? null;
-    this.runs = init.runs ?? null;
-    this.catalog = init.catalog ?? null;
-    this.delivery = init.delivery ?? null;
-    this.issues = init.issues ?? null;
-    this.tasks = init.tasks ?? null;
-    this.projects = init.projects ?? null;
-    this.insights = init.insights ?? null;
-  }
+/**
+ * 返回跨运行的只读、厂商中立的平台运营分析快照。
+ * 作为对外运营分析查询入口调用，内部委托给 `analyticsWithRuns(filter, null)` 执行自行取数路径。
+ *
+ * @param {import("../domain/analytics.js").AnalyticsFilter} filter - 分析查询筛选条件。
+ * @returns {AnalyticsSnapshot} 完整或概览级别的运营分析快照。
+ */
+AnalyticsRepo.prototype.Analytics = function (filter) {
+  return this.analyticsWithRuns(filter, null);
+};
 
-  // Analytics returns a read-only, vendor-neutral operational view across runs.
-  Analytics(filter) {
-    return this.analyticsWithRuns(filter, null);
-  }
-
-  // analyticsWithRuns is Analytics with an optional pre-fetched run list. Prefetched
-  // runs must cover filter.ProjectIDs without a created_at window; the time window is
-  // still applied in Go by the same predicates, so every aggregate is identical to
-  // the self-fetching path. Nil keeps the original behavior.
-  analyticsWithRuns(filter, prefetched) {
-    const overview = filter.Scope === "overview";
-    const now = new Date();
-    const out = new AnalyticsSnapshot({
-      Filter: filter,
-      Summary: new AnalyticsSummary({ GeneratedAt: now }),
-      Coverage: new AnalyticsCoverage({ AdapterEvents: {}, LogLevels: {} }),
-    });
-    // Go 用 defer applyAnalyticsCNY(&out)；JS 在每个返回点前显式调用。
+/**
+ * 基于筛选条件（及可选预取运行列表）计算运营分析快照。
+ * 供 `Analytics` 与 `BusinessDomainReport` 共用；传入 `prefetched` 时覆盖 `filter.ProjectIDs` 且不预先裁剪时间窗，
+ * 时间窗仍由本方法按同一谓词在内存中过滤，确保与自行查询结果完全一致；传 `null` 保持原有自查询行为。
+ *
+ * @param {import("../domain/analytics.js").AnalyticsFilter} filter - 分析查询筛选条件。
+ * @param {import("../domain/run.js").Run[]|null} prefetched - 可选预取的全量运行摘要列表；为 `null` 时由内部查询。
+ * @returns {AnalyticsSnapshot} 包含总览、活跃度、趋势、热力图、多维拆解、交付汇总与人民币成本的快照。
+ */
+AnalyticsRepo.prototype.analyticsWithRuns = function (filter, prefetched) {
+  const overview = filter.Scope === "overview";
+  const now = new Date();
+  const out = new AnalyticsSnapshot({
+    Filter: filter,
+    Summary: new AnalyticsSummary({ GeneratedAt: now }),
+    Coverage: new AnalyticsCoverage({ AdapterEvents: {}, LogLevels: {} }),
+  });
+  try {
     const trends = {};
     const trendIssues = {};
     const weekHourZone = analyticsWeekHourLocation(filter.TimeZone);
@@ -239,25 +422,33 @@ class AnalyticsRepo {
     if (overview) {
       // 概览用轻量需求列 + 当前 SOP 目录，避免拉全量 payload / 每条 Run 的冻结快照。
       parallel(
-        () => { runList = this.runs.RunSummariesFor(filter, ""); return null; },
-        () => { issueList = this.issues.IssueAnalyticsViews(); return null; },
-        () => { workflowList = this.catalog.Workflows(); return null; },
+        () => {
+          try {
+            runList = this.runs.RunSummariesFor(filter, "") ?? [];
+          } catch {
+            runList = [];
+          }
+        },
+        () => { issueList = this.issues.IssueAnalyticsViews(); },
+        () => { workflowList = this.catalog.Workflows(); },
       );
     } else {
       parallel(
-        () => { agentList = this.catalog.Agents(); return null; },
-        () => { executorList = this.catalog.Executors(); return null; },
-        () => { workflowList = this.catalog.Workflows(); return null; },
-        () => { issueList = this.issues.Issues(); return null; },
+        () => { agentList = this.catalog.Agents(); },
+        () => { executorList = this.catalog.Executors(); },
+        () => { workflowList = this.catalog.Workflows(); },
+        () => { issueList = this.issues.Issues(); },
         () => {
           if (prefetched != null) {
-            // Runs are priced and given snapshots in place below; copy so a
-            // list shared across several reports is not modified.
+            // 下方会就地重定价并回填工作流快照，先浅拷贝列表避免修改多份报表共享的预取切片。
             runList = [...prefetched];
-            return null;
+            return;
           }
-          runList = this.runs.RunSummariesFor(filter, "");
-          return null;
+          try {
+            runList = this.runs.RunSummariesFor(filter, "") ?? [];
+          } catch {
+            runList = [];
+          }
         },
       );
     }
@@ -278,9 +469,8 @@ class AnalyticsRepo {
     for (const issue of issueList) {
       issuesByID[issue.ID] = issue;
     }
-    // RunSummaries intentionally omits workflow snapshots on MySQL list paths.
-    // Full scans need the frozen name/version/category/node bindings; overview
-    // uses the live workflow catalog instead so the page does not hydrate every snapshot.
+    // RunSummaries 在 MySQL 列表路径上有意省略工作流快照；
+    // 完整扫描需要冻结的名称/版本/分类/节点绑定，而概览模式直接使用实时目录避免逐条回水。
     if (this.DB != null && !overview) {
       const runIDs = [];
       for (const run of runList) {
@@ -323,7 +513,6 @@ class AnalyticsRepo {
       this.analyticsActivity(filter, issueList, platformRuns, out);
     } catch {
       out.DataErrors = ["会话统计读取失败"];
-      applyAnalyticsCNY(out);
       return out;
     }
     if (filter.Origin === "external") {
@@ -337,10 +526,9 @@ class AnalyticsRepo {
       [externalRuns, externalMetadata] = this.analyticsInsightRuns(filter);
     } catch {
       out.DataErrors = ["外部用量读取失败"];
-      applyAnalyticsCNY(out);
       return out;
     }
-    runList = [...(runList ?? []), ...externalRuns];
+    runList = [...(runList ?? []), ...(externalRuns ?? [])];
     let qualityTerminal = 0;
     let executionMeasured = 0;
     const conversationIssues = {};
@@ -637,9 +825,8 @@ class AnalyticsRepo {
       }
     }
 
-    // Tool outcome and human-decision facts live in append-only event tables,
-    // not in Run summary columns. Load only matching tool-finish telemetry and
-    // compact control events, then join them back to each auditable Run row.
+    // 工具结果与人工决策事件保存在只追加的事件表中，不在运行摘要列上；
+    // 仅查询匹配的工具结束遥测与轻量控制事件，再回填至每条可审计的运行追踪行。
     const signals = this.analyticsRunSignals(includedRunIDs);
     for (const [runID, signal] of Object.entries(signals)) {
       const index = runTraceIndex[runID];
@@ -688,9 +875,7 @@ class AnalyticsRepo {
       }
       return timeAfter(a.CreatedAt, b.CreatedAt) ? -1 : 1;
     });
-    // Coverage counts adapter/level distributions over the included runs. On
-    // MySQL the generated columns make this an indexed GROUP BY; other
-    // dialects (tests) compute the same numbers from the payloads.
+    // 观测覆盖度按包含的运行统计适配器与日志级别分布：MySQL 走生成列索引分组，其他方言（测试库）从原始载荷计算。
     if (!overview && includedRunIDs.length > 0) {
       if (this.isMySQL()) {
         let coverageResult = null;
@@ -802,7 +987,6 @@ class AnalyticsRepo {
         out.Delivery.Issues = countDeliveryGroups(filter, platformRuns, issuesByID);
       }
       out.Summary.InProgressIssues = countInProgressIssues(issueList, filter);
-      applyAnalyticsCNY(out);
       return out;
     }
     out.Agents = finalizeBreakdowns(agents);
@@ -815,98 +999,14 @@ class AnalyticsRepo {
     out.Delivery = SummarizeDeliveries(out.Deliveries);
     applyWeeklyThroughput(out.Summary, out.Deliveries, now);
     out.Summary.InProgressIssues = countInProgressIssues(issueList, filter);
+    return out;
+  } finally {
     applyAnalyticsCNY(out);
-    return out;
   }
+};
 
-  // analyticsHumanEventTypes are explicit human decisions. run.paused / run.resumed
-  // are excluded: they fire on user pause, but also on lease takeover and service
-  // recovery, and a single approval often emits pause+resume+gate together.
-  // （常量定义在类外，见 analyticsHumanEventTypes。）
-
-  // analyticsRunSignals reads only the append-only facts needed by the Loop
-  // demo. It deliberately avoids hydrating logs, output, artifacts, and ordinary
-  // progress telemetry into the analytics request.
-  analyticsRunSignals(runIDs) {
-    const out = {};
-    for (let start = 0; start < runIDs.length; start += 500) {
-      const batch = runIDs.slice(start, Math.min(start + 500, runIDs.length));
-      this.accumulateToolSignals(out, batch);
-
-      const eventRows = []; // Go: var eventRows []runEventRow（models.go 待翻译）
-      const err = this.DB.Select("run_id", "type").Where("run_id IN ? AND type IN ?", batch, analyticsHumanEventTypes).Find(eventRows).Error;
-      if (err == null) {
-        for (const row of eventRows) {
-          const signal = out[row.RunID] ?? new analyticsRunSignals();
-          signal.interventions++;
-          out[row.RunID] = signal;
-        }
-      }
-    }
-    return out;
-  }
-
-  accumulateToolSignals(out, batch) {
-    if (batch.length === 0 || this.DB == null) {
-      return;
-    }
-    let successExpr = "CASE WHEN json_extract(payload, '$.tool.success') IS NOT NULL THEN json_extract(payload, '$.tool.success') ELSE (CASE WHEN lower(coalesce(json_extract(payload, '$.level'), '')) = 'error' THEN 0 ELSE 1 END) END";
-    let filter = "json_extract(payload, '$.category') = ? AND json_extract(payload, '$.name') = ? AND json_extract(payload, '$.phase') = ?";
-    if (this.isMySQL()) {
-      successExpr = "CASE WHEN JSON_EXTRACT(payload, '$.tool.success') IS NOT NULL THEN JSON_EXTRACT(payload, '$.tool.success') ELSE (LOWER(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(payload, '$.level')), '')) <> 'error') END";
-      filter = "JSON_UNQUOTE(JSON_EXTRACT(payload, '$.category')) = ? AND JSON_UNQUOTE(JSON_EXTRACT(payload, '$.name')) = ? AND JSON_UNQUOTE(JSON_EXTRACT(payload, '$.phase')) = ?";
-    }
-    const rows = []; // Go: var rows []toolRow（本函数内定义的行类型）
-    const err = this.DB.Table("run_telemetry")
-      .Select("run_id, SUM(" + successExpr + ") AS succeeded, SUM(1-(" + successExpr + ")) AS failed")
-      .Where("run_id IN ? AND " + filter, batch, "tool", "tool.call", "finish")
-      .Group("run_id")
-      .Scan(rows).Error;
-    if (err != null) {
-      return;
-    }
-    for (const row of rows) {
-      const signal = out[row.RunID] ?? new analyticsRunSignals();
-      signal.toolSucceeded += row.Succeeded;
-      signal.toolFailed += row.Failed;
-      out[row.RunID] = signal;
-    }
-  }
-
-  // computeAnalyticsCoverage derives adapter/level coverage from raw payloads
-  // for dialects without the generated columns (test sqlite databases).
-  computeAnalyticsCoverage(runIDs, coverage) {
-    for (const runID of runIDs) {
-      let telemetry;
-      try {
-        telemetry = this.runs.loadRunTelemetryAll(runID);
-      } catch {
-        continue;
-      }
-      for (const event of telemetry) {
-        let adapter = event.Source.Adapter;
-        if (adapter === "") {
-          adapter = "unknown";
-        }
-        coverage.AdapterEvents[adapter] = (coverage.AdapterEvents[adapter] ?? 0) + 1;
-      }
-      let logs;
-      try {
-        logs = this.runs.loadRunLogsAll(runID);
-      } catch {
-        continue;
-      }
-      for (const record of logs) {
-        let level = record.Level;
-        if (level === "") {
-          level = "info";
-        }
-        coverage.LogLevels[level] = (coverage.LogLevels[level] ?? 0) + 1;
-      }
-    }
-  }
-}
-
+// 显式人工决策事件列表；排除 run.paused / run.resumed，因为它们也会在租约接管和服务恢复时触发，
+// 且单次审批常常同时产生 pause + resume + gate 事件。
 const analyticsHumanEventTypes = [
   "gate.approved",
   "node.passed",
@@ -915,8 +1015,136 @@ const analyticsHumanEventTypes = [
   "agent.turns.declined",
 ];
 
-// queryAnalyticsCoverage groups telemetry adapters and log levels using the
-// MySQL generated columns.
+/**
+ * 按每批 500 条查询指定运行的工具调用成败遥测与显式人工干预事件计数。
+ * 在分析快照回填演示指标与运行追踪信号时调用，避免加载完整日志、输出与普通进度遥测。
+ *
+ * @param {string[]} runIDs - 待统计信号的平台运行 ID 列表。
+ * @returns {Object<string, analyticsRunSignals>} 按运行 ID 索引的信号计数映射。
+ */
+AnalyticsRepo.prototype.analyticsRunSignals = function (runIDs) {
+  const out = {};
+  for (let start = 0; start < runIDs.length; start += 500) {
+    const batch = runIDs.slice(start, Math.min(start + 500, runIDs.length));
+    this.accumulateToolSignals(out, batch);
+
+    const eventRows = []; // Go: var eventRows []runEventRow（models.go 待翻译）
+    const err = this.DB.Select("run_id", "type").Where("run_id IN ? AND type IN ?", batch, analyticsHumanEventTypes).Find(eventRows).Error;
+    if (err == null) {
+      for (const row of eventRows) {
+        const signal = out[row.RunID] ?? new analyticsRunSignals();
+        signal.interventions++;
+        out[row.RunID] = signal;
+      }
+    }
+  }
+  return out;
+};
+
+/**
+ * 从 `run_telemetry` 表按批次聚合单次工具调用结束（`category=tool, name=tool.call, phase=finish`）的成败次数。
+ * 供 `analyticsRunSignals` 分批调用，并根据数据库方言切换 SQLite 与 MySQL 的 JSON 提取表达式。
+ *
+ * @param {Object<string, analyticsRunSignals>} out - 按运行 ID 索引的信号映射（就地累加）。
+ * @param {string[]} batch - 当前批次的运行 ID 列表。
+ * @returns {void} 无返回值。
+ */
+AnalyticsRepo.prototype.accumulateToolSignals = function (out, batch) {
+  if (batch.length === 0 || this.DB == null) {
+    return;
+  }
+  let successExpr = "CASE WHEN json_extract(payload, '$.tool.success') IS NOT NULL THEN json_extract(payload, '$.tool.success') ELSE (CASE WHEN lower(coalesce(json_extract(payload, '$.level'), '')) = 'error' THEN 0 ELSE 1 END) END";
+  let filter = "json_extract(payload, '$.category') = ? AND json_extract(payload, '$.name') = ? AND json_extract(payload, '$.phase') = ?";
+  if (this.isMySQL()) {
+    successExpr = "CASE WHEN JSON_EXTRACT(payload, '$.tool.success') IS NOT NULL THEN JSON_EXTRACT(payload, '$.tool.success') ELSE (LOWER(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(payload, '$.level')), '')) <> 'error') END";
+    filter = "JSON_UNQUOTE(JSON_EXTRACT(payload, '$.category')) = ? AND JSON_UNQUOTE(JSON_EXTRACT(payload, '$.name')) = ? AND JSON_UNQUOTE(JSON_EXTRACT(payload, '$.phase')) = ?";
+  }
+  const rows = []; // Go: var rows []toolRow（本函数内定义的行类型）
+  const err = this.DB.Table("run_telemetry")
+    .Select("run_id, SUM(" + successExpr + ") AS succeeded, SUM(1-(" + successExpr + ")) AS failed")
+    .Where("run_id IN ? AND " + filter, batch, "tool", "tool.call", "finish")
+    .Group("run_id")
+    .Scan(rows).Error;
+  if (err != null) {
+    return;
+  }
+  for (const row of rows) {
+    const signal = out[row.RunID] ?? new analyticsRunSignals();
+    signal.toolSucceeded += row.Succeeded;
+    signal.toolFailed += row.Failed;
+    out[row.RunID] = signal;
+  }
+};
+
+/**
+ * 提取运行中按节点 ID 字典序排在首位的出错节点及其归一化错误摘要。
+ * 在构造 `AnalyticsRunTrace` 运行追踪记录时调用。
+ *
+ * @param {import("../domain/run.js").Run} run - 待提取错误信息的运行对象。
+ * @returns {[string, string]} 二元组 `[出错节点 ID, 归一化错误消息]`；无错误节点时返回 `["", ""]`。
+ */
+function analyticsRunError(run) {
+  const ids = [];
+  for (const [id, node] of Object.entries(run.Nodes ?? {})) {
+    if (node != null && node.Error.trim() !== "") {
+      ids.push(id);
+    }
+  }
+  if (ids.length === 0) {
+    return ["", ""];
+  }
+  ids.sort();
+  const node = run.Nodes[ids[0]];
+  return [ids[0], normalizeFailure(node.Error)];
+}
+
+/**
+ * 在不支持 MySQL 生成列的数据库方言（如测试 SQLite）下，从原始遥测与日志载荷中统计适配器与日志级别覆盖度。
+ * 供 `analyticsWithRuns` 在非 MySQL 完整扫描路径调用。
+ *
+ * @param {string[]} runIDs - 纳入统计的平台运行 ID 列表。
+ * @param {AnalyticsCoverage} coverage - 目标观测覆盖度对象（就地累加 `AdapterEvents` 与 `LogLevels`）。
+ * @returns {void} 无返回值。
+ */
+AnalyticsRepo.prototype.computeAnalyticsCoverage = function (runIDs, coverage) {
+  for (const runID of runIDs) {
+    let telemetry;
+    try {
+      telemetry = this.runs.loadRunTelemetryAll(runID);
+    } catch {
+      continue;
+    }
+    for (const event of telemetry) {
+      let adapter = event.Source.Adapter;
+      if (adapter === "") {
+        adapter = "unknown";
+      }
+      coverage.AdapterEvents[adapter] = (coverage.AdapterEvents[adapter] ?? 0) + 1;
+    }
+    let logs;
+    try {
+      logs = this.runs.loadRunLogsAll(runID);
+    } catch {
+      continue;
+    }
+    for (const record of logs) {
+      let level = record.Level;
+      if (level === "") {
+        level = "info";
+      }
+      coverage.LogLevels[level] = (coverage.LogLevels[level] ?? 0) + 1;
+    }
+  }
+};
+
+/**
+ * 利用 MySQL 的生成列索引通过单条 `UNION ALL` 分组查询遥测适配器分布与日志级别分布。
+ * 供 `analyticsWithRuns` 在 MySQL 完整扫描路径调用。
+ *
+ * @param {Object} db - gorm 数据库句柄。
+ * @param {string[]} runIDs - 纳入统计的平台运行 ID 列表。
+ * @returns {[Object<string, number>, Object<string, number>]} 二元组 `[适配器事件计数映射, 日志级别计数映射]`；SQL 执行失败时抛出错误。
+ */
 function queryAnalyticsCoverage(db, runIDs) {
   const adapters = {};
   const levels = {};
@@ -943,6 +1171,13 @@ function queryAnalyticsCoverage(db, runIDs) {
   return [adapters, levels];
 }
 
+/**
+ * 汇总单次运行所有节点的返工次数总和。
+ * 在分析聚合统计返工次数与一次通过率时调用。
+ *
+ * @param {import("../domain/run.js").Run} run - 运行对象。
+ * @returns {number} 该运行全部节点的 `ReworkCount` 之和。
+ */
 function runReworks(run) {
   let total = 0;
   for (const node of Object.values(run.Nodes ?? {})) {
@@ -951,12 +1186,26 @@ function runReworks(run) {
   return total;
 }
 
+/**
+ * 计算单次运行的墙钟持续时长（毫秒）并判定是否已进入终态（`succeeded`/`failed`/`cancelled`）。
+ * 在分析主流程累加终态耗时与分位数样本时调用。
+ *
+ * @param {import("../domain/run.js").Run} run - 运行对象。
+ * @param {Date} now - 当前统计基准时间。
+ * @returns {[number, boolean]} 二元组 `[运行持续毫秒数, 是否已终态]`。
+ */
 function analyticsRunDuration(run, now) {
   const complete = run.Status === "succeeded" || run.Status === "failed" || run.Status === "cancelled";
   return [runDuration(run, now), complete];
 }
 
-// analyticsWeekHourLocation resolves the heatmap zone; unknown or empty zones fall back to Asia/Shanghai.
+/**
+ * 解析星期×小时热力图使用的时区描述对象；空值、`"Local"` 或无法识别的时区均回退到 `"Asia/Shanghai"`（最终兜底为东八区固定偏移）。
+ * 在分析主流程构建 `WeekHour` 热力图前调用。
+ *
+ * @param {string|null|undefined} name - 筛选条件中传入的时区名称。
+ * @returns {{name: string, offsetMs?: number}} 可用于 `inLocation` 的时区描述对象。
+ */
 function analyticsWeekHourLocation(name) {
   name = (name ?? "").trim();
   if (name === "" || name === "Local") {
@@ -975,6 +1224,14 @@ function analyticsWeekHourLocation(name) {
   return { name: "Asia/Shanghai", offsetMs: 8 * 3600 * 1000 };
 }
 
+/**
+ * 根据时间粒度（`week`/`month`/`all`/默认按日）将时间映射为趋势分桶键字符串。
+ * 用于运营趋势、活跃度趋势、交付趋势与 MR 合并趋势的时间轴对齐。
+ *
+ * @param {Date|null|undefined} at - 待分桶的时间对象（按 UTC 字段取值）。
+ * @param {string|null|undefined} grain - 统计粒度（`"day"`、`"week"`、`"month"`、`"all"`）。
+ * @returns {string} 趋势分桶键（如 `"2026-09-01"`、`"2026-W36"`、`"2026-09"`）。
+ */
 function analyticsTrendBucket(at, grain) {
   const d = at ?? zeroTimeDate();
   switch ((grain ?? "").toLowerCase().trim()) {
@@ -990,7 +1247,14 @@ function analyticsTrendBucket(at, grain) {
   }
 }
 
-// analyticsTrendEntry 取用 bucket 对应的趋势点，缺失时新建并存回。
+/**
+ * 获取趋势映射中指定分桶键对应的趋势点，不存在时创建新点并存回映射。
+ * 在累加运行趋势、会话工作区趋势或 MR 合并趋势时调用。
+ *
+ * @param {Object<string, AnalyticsTrendPoint>} trends - 按时间桶键索引的趋势点映射。
+ * @param {string} bucket - 时间桶键。
+ * @returns {AnalyticsTrendPoint} 该时间桶对应的趋势点对象。
+ */
 function analyticsTrendEntry(trends, bucket) {
   let point = trends[bucket];
   if (point == null) {
@@ -1000,7 +1264,15 @@ function analyticsTrendEntry(trends, bucket) {
   return point;
 }
 
-// addAnalyticsTrendIssue 把需求 ID 记入 bucket 的需求集合；issueID 为空时不登记。
+/**
+ * 将需求 ID 登记到指定时间桶的需求集合中；`issueID` 为空时直接忽略。
+ * 用于统计每个趋势时间桶覆盖的去重需求数。
+ *
+ * @param {Object<string, Object<string, boolean>>} trendIssues - 按时间桶键索引的需求 ID 集合映射。
+ * @param {string} bucket - 时间桶键。
+ * @param {string} issueID - 需求 ID。
+ * @returns {void} 无返回值。
+ */
 function addAnalyticsTrendIssue(trendIssues, bucket, issueID) {
   if (issueID === "") {
     return;
@@ -1011,7 +1283,14 @@ function addAnalyticsTrendIssue(trendIssues, bucket, issueID) {
   trendIssues[bucket][issueID] = true;
 }
 
-// analyticsRunInWindow 保持与既有行为一致：按 Run 创建时间过滤。
+/**
+ * 按运行创建时间判断是否命中分析筛选条件的时间窗口 `[From, To]`（含边界）。
+ * 保持与既有分析口径一致，在加载快照与遍历运行前过滤。
+ *
+ * @param {import("../domain/run.js").Run} run - 待判断的运行对象。
+ * @param {import("../domain/analytics.js").AnalyticsFilter} filter - 包含 `From` 与 `To` 的筛选条件。
+ * @returns {boolean} 命中时间窗口返回 `true`，否则返回 `false`。
+ */
 function analyticsRunInWindow(run, filter) {
   if (!isZeroTime(filter.From) && timeBefore(run.CreatedAt, filter.From)) {
     return false;
@@ -1022,6 +1301,15 @@ function analyticsRunInWindow(run, filter) {
   return true;
 }
 
+/**
+ * 判断单次运行是否匹配指定的用户 ID 筛选条件（匹配执行责任人或关联需求的经办人）。
+ * 在按成员筛选运行、活跃度与 MR 合并数据时调用。
+ *
+ * @param {import("../domain/run.js").Run} run - 运行对象。
+ * @param {string|null|undefined} userID - 目标用户 ID 字符串；为空时不限制。
+ * @param {Issue} issue - 该运行关联的需求对象。
+ * @returns {boolean} 匹配返回 `true`，否则返回 `false`。
+ */
 function analyticsRunMatchesUser(run, userID, issue) {
   const want = (userID ?? "").trim();
   if (want === "") {
@@ -1033,7 +1321,14 @@ function analyticsRunMatchesUser(run, userID, issue) {
   return issue.AssigneeUserID !== 0 && String(issue.AssigneeUserID) === want;
 }
 
-// analyticsRunUserID 返回执行责任人；未写入时回退到需求责任人。
+/**
+ * 解析运行的责任人 ID 字符串；执行上下文未记录责任人时回退到关联需求的经办人。
+ * 在按“责任人 × 自然日”汇总用户用量时调用。
+ *
+ * @param {import("../domain/run.js").Run} run - 运行对象。
+ * @param {Issue} issue - 关联需求对象。
+ * @returns {string} 责任人 ID 字符串；均不存在时返回 `""`。
+ */
 function analyticsRunUserID(run, issue) {
   if (run.ExecutionContext.ResponsibleUserID !== 0) {
     return String(run.ExecutionContext.ResponsibleUserID);
@@ -1044,6 +1339,14 @@ function analyticsRunUserID(run, issue) {
   return "";
 }
 
+/**
+ * 判断需求来源是否匹配筛选条件（忽略大小写与首尾空白，空来源归一为 `"local"`）。
+ * 在按需求来源过滤运行、需求、会话与 MR 时调用。
+ *
+ * @param {Issue} issue - 需求对象。
+ * @param {string|null|undefined} source - 目标来源标识；为空时不限制。
+ * @returns {boolean} 匹配返回 `true`，否则返回 `false`。
+ */
 function analyticsIssueMatchesSource(issue, source) {
   const want = (source ?? "").toLowerCase().trim();
   if (want === "") {
@@ -1056,12 +1359,24 @@ function analyticsIssueMatchesSource(issue, source) {
   return got === want;
 }
 
+/**
+ * 判断给定对象是否为有效的需求类工作项（具备非空 ID 且满足 `IsRequirementWorkItem`）。
+ * 在 `RequirementsOnly` 过滤与需求活跃度统计时调用。
+ *
+ * @param {Issue} issue - 待判断的需求对象。
+ * @returns {boolean} 是有效需求工作项返回 `true`，否则返回 `false`。
+ */
 function analyticsIsRequirementIssue(issue) {
   return issue.ID !== "" && IsRequirementWorkItem(issue);
 }
 
-// usageCostKnown 区分"成本为 0"与"成本未识别"：显式上报/估算视为已识别，
-// 旧数据（无 costStatus）按是否有成本金额判定。
+/**
+ * 判断 Token 用量的成本是否已识别，区分“真实成本为 0”与“成本未知”。
+ * 显式标记为 `"reported"`/`"estimated"` 视为已识别，`"unknown"` 视为未知，旧数据无状态时按 `CostUSD > 0` 判定。
+ *
+ * @param {import("../domain/run.js").TokenUsage} usage - Token 用量与成本对象。
+ * @returns {boolean} 成本已识别返回 `true`，未知返回 `false`。
+ */
 function usageCostKnown(usage) {
   switch ((usage.CostStatus ?? "").toLowerCase().trim()) {
     case "reported":
@@ -1075,7 +1390,14 @@ function usageCostKnown(usage) {
   return usage.CostUSD > 0;
 }
 
-// analyticsWorkflowCategory 取 SOP 的受控统计标签，优先使用 Run 冻结的快照。
+/**
+ * 获取工作流的受控统计分类标签，优先取运行冻结快照中的 `MetricCategory`，缺失时回退到目录定义。
+ * 在工作流与分类维度拆解时调用。
+ *
+ * @param {WorkflowDefinition} snapshot - 运行时冻结的工作流快照。
+ * @param {WorkflowDefinition} fallback - 目录中的当前工作流定义。
+ * @returns {string} 去除首尾空白后的分类标签字符串。
+ */
 function analyticsWorkflowCategory(snapshot, fallback) {
   const category = (snapshot.MetricCategory ?? "").trim();
   if (category !== "") {
@@ -1084,6 +1406,13 @@ function analyticsWorkflowCategory(snapshot, fallback) {
   return (fallback.MetricCategory ?? "").trim();
 }
 
+/**
+ * 统计工作流节点定义列表按节点类型分组的数量分布（空类型归为 `"unknown"`）。
+ * 用于在工作流维度拆解中附带流程结构画像。
+ *
+ * @param {WorkflowNode[]|null|undefined} nodes - 工作流节点定义列表。
+ * @returns {Object<string, number>} 按节点类型索引的节点数量映射。
+ */
 function analyticsNodeTypes(nodes) {
   const out = {};
   for (const node of nodes ?? []) {
@@ -1096,6 +1425,13 @@ function analyticsNodeTypes(nodes) {
   return out;
 }
 
+/**
+ * 对按需求 ID 索引的计数字典求和。
+ * 用于计算平均每需求的运行次数与失败次数。
+ *
+ * @param {Object<string, number>} values - 需求 ID 到计数的映射。
+ * @returns {number} 全部计数的总和。
+ */
 function sumIssueCounts(values) {
   let total = 0;
   for (const count of Object.values(values)) {
@@ -1104,6 +1440,13 @@ function sumIssueCounts(values) {
   return total;
 }
 
+/**
+ * 提取按需求 ID 索引的执行耗时映射中的全部数值，生成用于分位数计算的数组。
+ * 在计算需求维度 P50/P95 执行耗时前调用。
+ *
+ * @param {Object<string, number>} values - 需求 ID 到累计执行耗时（毫秒）的映射。
+ * @returns {number[]} 耗时样本数组。
+ */
 function issueExecValues(values) {
   const out = [];
   for (const value of Object.values(values)) {
@@ -1112,7 +1455,14 @@ function issueExecValues(values) {
   return out;
 }
 
-// countInProgressIssues 统计仍未闭环的需求数（WIP 快照）。
+/**
+ * 统计符合筛选条件且尚未闭环的在制需求数（WIP 快照）。
+ * 在概览模式与完整扫描模式结尾回填 `Summary.InProgressIssues` 时调用。
+ *
+ * @param {Issue[]|null|undefined} issues - 需求列表。
+ * @param {import("../domain/analytics.js").AnalyticsFilter} filter - 分析查询筛选条件。
+ * @returns {number} 仍处于进行中的需求总数。
+ */
 function countInProgressIssues(issues, filter) {
   let total = 0;
   for (const issue of issues ?? []) {
@@ -1139,6 +1489,13 @@ function countInProgressIssues(issues, filter) {
   return total;
 }
 
+/**
+ * 判断单条需求是否仍处于未闭环（进行中）状态。
+ * 已合并交付（`DeliveryState === "merged"`）或状态为 `done`/`closed`/`cancelled`/`canceled` 时视为已闭环。
+ *
+ * @param {Issue} issue - 需求对象。
+ * @returns {boolean} 未闭环返回 `true`，已闭环返回 `false`。
+ */
 function issueInProgress(issue) {
   if ((issue.DeliveryState ?? "").trim().toLowerCase() === "merged") {
     return false;
@@ -1155,7 +1512,15 @@ function issueInProgress(issue) {
   return true;
 }
 
-// applyWeeklyThroughput 计算近 7 天的人均吞吐：唯一交付需求数 ÷ 有交付的成员数。
+/**
+ * 计算近 7 天的已交付唯一需求数、活跃贡献人数与人均周吞吐，并回填至总览汇总对象。
+ * 在完整扫描模式生成交付明细列表后调用。
+ *
+ * @param {AnalyticsSummary} summary - 目标分析总览对象（就地修改）。
+ * @param {import("../domain/analytics.js").AnalyticsDelivery[]|null|undefined} deliveries - 交付明细列表。
+ * @param {Date} now - 当前统计基准时间。
+ * @returns {void} 无返回值。
+ */
 function applyWeeklyThroughput(summary, deliveries, now) {
   const since = new Date(now.getTime());
   since.setUTCDate(since.getUTCDate() - 7);
@@ -1181,21 +1546,20 @@ function applyWeeklyThroughput(summary, deliveries, now) {
   }
 }
 
-function analyticsRunError(run) {
-  const ids = [];
-  for (const [id, node] of Object.entries(run.Nodes ?? {})) {
-    if (node != null && node.Error.trim() !== "") {
-      ids.push(id);
-    }
-  }
-  if (ids.length === 0) {
-    return ["", ""];
-  }
-  ids.sort();
-  const node = run.Nodes[ids[0]];
-  return [ids[0], normalizeFailure(node.Error)];
-}
-
+/**
+ * 将单次运行的计数、返工、工具调用、Token/成本、状态与耗时累加到指定维度的累加器中。
+ * 供工作流维度与分类维度统计调用。
+ *
+ * @param {Object<string, analyticsAccumulator>} values - 维度键到累加器的映射。
+ * @param {string} key - 维度唯一键。
+ * @param {string} name - 维度展示名称（非空时更新）。
+ * @param {import("../domain/run.js").Run} run - 运行对象。
+ * @param {number} reworks - 本次运行的返工总次数。
+ * @param {number} duration - 本次运行的墙钟耗时（毫秒）。
+ * @param {boolean} complete - 本次运行是否已终态。
+ * @param {number} execDuration - 本次运行的纯执行耗时（毫秒）。
+ * @returns {void} 无返回值。
+ */
 function accumulateBreakdown(values, key, name, run, reworks, duration, complete, execDuration) {
   let value = values[key];
   if (value == null) {
@@ -1215,8 +1579,14 @@ function accumulateBreakdown(values, key, name, run, reworks, duration, complete
   }
 }
 
-// accumulateBreakdownUsage 把单次执行的用量累加到维度累加器：Token/成本总量、
-// 成本未识别计数与 Token 四分项。dimension 维度（SOP、节点、模型等）共用。
+/**
+ * 将单次运行或节点的 Token 总量、成本总额、成本未识别计数与 Token 四分项累加到维度累加器。
+ * 供工作流、分类、节点、模型、智能体、执行器等拆解维度共用。
+ *
+ * @param {analyticsAccumulator} value - 目标维度累加器（就地修改）。
+ * @param {import("../domain/run.js").TokenUsage} usage - Token 与成本用量对象。
+ * @returns {void} 无返回值。
+ */
 function accumulateBreakdownUsage(value, usage) {
   if (!usageCostKnown(usage)) {
     value.item.CostUnknownRuns++;
@@ -1229,7 +1599,15 @@ function accumulateBreakdownUsage(value, usage) {
   value.cacheWriteTokens += usage.CacheWriteTokens;
 }
 
-// countBreakdownStatus 按执行状态累加维度终态计数，active 由调用方按各自的状态词表判定。
+/**
+ * 按状态字符串累加拆解项的终态计数（`succeeded`/`failed`/`cancelled`）以及活跃计数。
+ * 供运行级与节点级累加器共用，`active` 判定由调用方按各自的状态词表传入。
+ *
+ * @param {AnalyticsBreakdown} item - 目标拆解项（就地修改）。
+ * @param {string} status - 运行或节点状态字符串。
+ * @param {boolean} active - 是否计入活跃状态数。
+ * @returns {void} 无返回值。
+ */
 function countBreakdownStatus(item, status, active) {
   switch (status) {
     case "succeeded":
@@ -1249,7 +1627,14 @@ function countBreakdownStatus(item, status, active) {
   }
 }
 
-// accumulateBreakdownDuration 记录一次有效耗时样本，供均值与 P95 使用。
+/**
+ * 向维度累加器追加一次有效终态的墙钟耗时与执行耗时样本，供后续计算均值与 P95。
+ *
+ * @param {analyticsAccumulator} value - 目标维度累加器（就地修改）。
+ * @param {number} duration - 墙钟耗时样本（毫秒）。
+ * @param {number} execDuration - 执行耗时样本（毫秒）。
+ * @returns {void} 无返回值。
+ */
 function accumulateBreakdownDuration(value, duration, execDuration) {
   value.duration += duration;
   value.durations.push(duration);
@@ -1257,6 +1642,18 @@ function accumulateBreakdownDuration(value, duration, execDuration) {
   value.execDurations.push(execDuration);
 }
 
+/**
+ * 将单个节点执行的用量、重试、返工、模型分布、状态与耗时累加到目标维度（节点、模型、智能体或执行器）。
+ * 供分析主流程遍历运行节点及外部洞察模型拆解调用。
+ *
+ * @param {Object<string, analyticsAccumulator>} values - 维度键到累加器的映射。
+ * @param {string} key - 维度唯一键。
+ * @param {string} name - 维度展示名称（非空时更新）。
+ * @param {import("../domain/run.js").NodeRun} node - 节点运行记录。
+ * @param {number} duration - 节点耗时（毫秒）。
+ * @param {boolean} complete - 节点是否具备完整起止时间。
+ * @returns {void} 无返回值。
+ */
 function accumulateNode(values, key, name, node, duration, complete) {
   let value = values[key];
   if (value == null) {
@@ -1293,7 +1690,21 @@ function accumulateNode(values, key, name, node, duration, complete) {
   }
 }
 
-// accumulateVersion 按 SOP 版本聚合，用于版本对比（样本不足时前端标注）。
+/**
+ * 按“工作流 ID + 版本号”聚合运行指标，用于 SOP 版本间效果对比。
+ * 优先取运行冻结快照中的版本号，不大于 0 时回退至目录当前版本号。
+ *
+ * @param {Object<string, analyticsVersionAccumulator>} values - 版本键到累加器的映射。
+ * @param {string} workflowID - 工作流 ID。
+ * @param {string} workflowName - 工作流名称。
+ * @param {number} snapshotVersion - 运行快照冻结的版本号。
+ * @param {number} fallbackVersion - 目录中的兜底版本号。
+ * @param {import("../domain/run.js").Run} run - 运行对象。
+ * @param {number} duration - 墙钟耗时（毫秒）。
+ * @param {boolean} complete - 是否已终态。
+ * @param {number} execDuration - 执行耗时（毫秒）。
+ * @returns {void} 无返回值。
+ */
 function accumulateVersion(values, workflowID, workflowName, snapshotVersion, fallbackVersion, run, duration, complete, execDuration) {
   let version = snapshotVersion;
   if (version <= 0) {
@@ -1335,7 +1746,15 @@ function accumulateVersion(values, workflowID, workflowName, snapshotVersion, fa
   }
 }
 
-// analyticsUserEntry 返回"责任人 × 自然日"的累加器，不存在时新建；空责任人归为 unassigned。
+/**
+ * 获取“责任人 × 自然日”对应的用户用量累加器，缺失时新建并存入映射；空责任人归入 `"unassigned"`。
+ * 供 SOP 运行与会话工作区累加用户用量时共用。
+ *
+ * @param {Object<string, analyticsUserAccumulator>} values - 复合键到用户用量累加器的映射。
+ * @param {string} userID - 责任人 ID 字符串。
+ * @param {string} day - `YYYY-MM-DD` 自然日字符串。
+ * @returns {analyticsUserAccumulator} 对应的用户用量累加器。
+ */
 function analyticsUserEntry(values, userID, day) {
   if (userID === "") {
     userID = "unassigned";
@@ -1349,7 +1768,19 @@ function analyticsUserEntry(values, userID, day) {
   return value;
 }
 
-// accumulateUserUsage 按"责任人 × 自然日"聚合用量。
+/**
+ * 按“责任人 × 自然日”累加单次运行的次数、Token 四分项、成本、成败数与耗时。
+ * 在分析主流程处理平台及外部运行时调用。
+ *
+ * @param {Object<string, analyticsUserAccumulator>} values - 用户用量累加器映射。
+ * @param {string} userID - 责任人 ID 字符串。
+ * @param {string} day - `YYYY-MM-DD` 自然日字符串。
+ * @param {import("../domain/run.js").Run} run - 运行对象。
+ * @param {number} duration - 墙钟耗时（毫秒）。
+ * @param {boolean} complete - 是否已终态。
+ * @param {number} execDuration - 执行耗时（毫秒）。
+ * @returns {void} 无返回值。
+ */
 function accumulateUserUsage(values, userID, day, run, duration, complete, execDuration) {
   const value = analyticsUserEntry(values, userID, day);
   value.item.Runs++;
@@ -1374,6 +1805,13 @@ function accumulateUserUsage(values, userID, day, run, duration, complete, execD
   }
 }
 
+/**
+ * 将维度累加器映射收口为最终的拆解项数组，计算成功率、取消率、返工率、重试率、均值与 P95 耗时，并按运行数降序、名称升序排列。
+ * 在各拆解维度累计完成后调用。
+ *
+ * @param {Object<string, analyticsAccumulator>} values - 维度累加器映射。
+ * @returns {AnalyticsBreakdown[]} 排序后的拆解项数组。
+ */
 function finalizeBreakdowns(values) {
   const out = [];
   for (const value of Object.values(values)) {
@@ -1426,6 +1864,12 @@ function finalizeBreakdowns(values) {
   return out;
 }
 
+/**
+ * 将工作流版本累加器映射收口为最终列表，计算成功率、平均耗时并标注样本不足（运行数 `< 5`），按工作流 ID 升序、版本号降序排列。
+ *
+ * @param {Object<string, analyticsVersionAccumulator>} values - 工作流版本累加器映射。
+ * @returns {AnalyticsWorkflowVersion[]} 排序后的工作流版本统计数组。
+ */
 function finalizeWorkflowVersions(values) {
   const out = [];
   for (const value of Object.values(values)) {
@@ -1452,6 +1896,12 @@ function finalizeWorkflowVersions(values) {
   return out;
 }
 
+/**
+ * 将用户按日用量累加器映射收口为列表，并按日期降序、Token 总量降序排列。
+ *
+ * @param {Object<string, analyticsUserAccumulator>} values - 用户用量累加器映射。
+ * @returns {AnalyticsUserUsage[]} 排序后的用户按日用量数组。
+ */
 function finalizeUserUsage(values) {
   const out = [];
   for (const value of Object.values(values)) {
@@ -1461,12 +1911,19 @@ function finalizeUserUsage(values) {
     if (a.Date === b.Date) {
       return a.Tokens > b.Tokens ? -1 : a.Tokens < b.Tokens ? 1 : 0;
     }
-    return a.Date > b.Date ? -1 : a.Date < b.Date ? 1 : 0;
+    return a.Date > b.Date ? -1 : 1;
   });
   return out;
 }
 
-// analyticsProjectEntry 返回项目的累加器，不存在时新建；空项目归为 unassigned。
+/**
+ * 获取项目对应的用量累加器，不存在时新建并存入映射；空项目 ID 归为 `"unassigned"`。
+ * 供 SOP 运行与会话工作区汇总项目用量时共用。
+ *
+ * @param {Object<string, analyticsProjectAccumulator>} values - 项目 ID 到累加器的映射。
+ * @param {string} projectID - 项目 ID。
+ * @returns {analyticsProjectAccumulator} 对应的项目用量累加器。
+ */
 function analyticsProjectEntry(values, projectID) {
   if (projectID === "") {
     projectID = "unassigned";
@@ -1479,6 +1936,16 @@ function analyticsProjectEntry(values, projectID) {
   return value;
 }
 
+/**
+ * 将单次运行的次数、Token、成本、成败数及关联需求 ID 累加到对应项目的累加器中。
+ * 在分析主流程处理平台及外部运行时调用。
+ *
+ * @param {Object<string, analyticsProjectAccumulator>} values - 项目用量累加器映射。
+ * @param {string} projectID - 归属项目 ID。
+ * @param {string} issueID - 关联需求 ID（为空时不计入去重需求集合）。
+ * @param {import("../domain/run.js").Run} run - 运行对象。
+ * @returns {void} 无返回值。
+ */
 function accumulateProjectUsage(values, projectID, issueID, run) {
   const value = analyticsProjectEntry(values, projectID);
   value.item.Runs++;
@@ -1498,6 +1965,12 @@ function accumulateProjectUsage(values, projectID, issueID, run) {
   }
 }
 
+/**
+ * 将项目用量累加器映射收口为列表，回填唯一需求数并按 Token 总量降序、运行数降序排列。
+ *
+ * @param {Object<string, analyticsProjectAccumulator>} values - 项目用量累加器映射。
+ * @returns {AnalyticsProjectUsage[]} 排序后的项目用量数组。
+ */
 function finalizeProjectUsage(values) {
   const out = [];
   for (const value of Object.values(values)) {
@@ -1513,7 +1986,15 @@ function finalizeProjectUsage(values) {
   return out;
 }
 
-// applyBreakdownShares 回填各维度占全局 Token/成本的比例，用于占比结构展示。
+/**
+ * 按全局 Token 总量与美元成本总量，为拆解项列表逐项回填 `TokenSharePct` 与 `CostSharePct` 占比百分比。
+ * 在各拆解维度收口后调用。
+ *
+ * @param {AnalyticsBreakdown[]} list - 拆解项列表（就地回填占比字段）。
+ * @param {number} totalTokens - 全局总 Token 数。
+ * @param {number} totalCostUSD - 全局总美元成本。
+ * @returns {void} 无返回值。
+ */
 function applyBreakdownShares(list, totalTokens, totalCostUSD) {
   for (let i = 0; i < list.length; i++) {
     if (totalTokens > 0) {
@@ -1525,7 +2006,13 @@ function applyBreakdownShares(list, totalTokens, totalCostUSD) {
   }
 }
 
-// analyticsIssueSource 归一需求来源，未标注的本地需求归为 local。
+/**
+ * 归一化需求的来源标识（转小写去空白），未标注的本地需求归为 `"local"`。
+ * 在构造追踪记录与来源维度拆解时调用。
+ *
+ * @param {Issue} issue - 需求对象。
+ * @returns {string} 归一化后的来源字符串。
+ */
 function analyticsIssueSource(issue) {
   const source = (issue.Source ?? "").toLowerCase().trim();
   if (source === "") {
@@ -1534,7 +2021,13 @@ function analyticsIssueSource(issue) {
   return source;
 }
 
-// analyticsSourceEntry 返回需求来源的累加器，不存在时新建；空来源归为 local。
+/**
+ * 获取需求来源对应的拆解累加器，不存在时新建并存入映射；空来源归为 `"local"`。
+ *
+ * @param {Object<string, analyticsAccumulator>} values - 需求来源到累加器的映射。
+ * @param {string} source - 需求来源标识。
+ * @returns {analyticsAccumulator} 对应的维度累加器。
+ */
 function analyticsSourceEntry(values, source) {
   if (source === "") {
     source = "local";
@@ -1547,7 +2040,16 @@ function analyticsSourceEntry(values, source) {
   return value;
 }
 
-// accumulateIssueSource 按需求来源聚合执行量、Token、成本与执行耗时。
+/**
+ * 按需求来源维度累加执行次数、Token 四分项、成本、工具调用、终态计数、成功需求去重集合与执行耗时。
+ * 在分析主流程处理绑定需求的平台运行时调用。
+ *
+ * @param {Object<string, analyticsAccumulator>} values - 需求来源累加器映射。
+ * @param {string} source - 归一化后的需求来源标识。
+ * @param {import("../domain/run.js").Run} run - 运行对象。
+ * @param {number} execDuration - 本次运行的纯执行耗时（毫秒）。
+ * @returns {void} 无返回值。
+ */
 function accumulateIssueSource(values, source, run, execDuration) {
   const value = analyticsSourceEntry(values, source);
   value.item.Runs++;
@@ -1577,6 +2079,14 @@ function accumulateIssueSource(values, source, run, execDuration) {
   }
 }
 
+/**
+ * 计算整数样本切片的向上取整分位数（如 P50、P95、P99），不修改原数组。
+ * 在总览、维度拆解与业务域交付周期分位数计算时调用；空数组返回 0。
+ *
+ * @param {number[]} values - 数值样本数组。
+ * @param {number} pct - 百分位数值（1～100，如 50、95、99）。
+ * @returns {number} 对应百分位处的样本值。
+ */
 function percentile(values, pct) {
   if (values.length === 0) {
     return 0;
@@ -1593,8 +2103,15 @@ function percentile(values, pct) {
   return copyValues[index];
 }
 
+/**
+ * 归一化失败错误信息：取第一行并去除首尾空白，超长时截断至 160 字符，为空时返回 `"unknown failure"`。
+ * 用于失败原因聚类与运行追踪错误摘要展示。
+ *
+ * @param {string} message - 原始错误消息。
+ * @returns {string} 归一化后的单行错误摘要。
+ */
 function normalizeFailure(message) {
-  message = message.trim().split("\n")[0];
+  message = message.split("\n")[0].trim();
   if (message.length > 160) {
     message = message.slice(0, 160);
   }
@@ -1604,6 +2121,13 @@ function normalizeFailure(message) {
   return message;
 }
 
+/**
+ * 按 ID 查找智能体展示名称，未命中或名称为空时回退返回原 ID。
+ *
+ * @param {Object<string, import("../domain/agent.js").AgentDefinition>} values - 按 ID 索引的智能体定义映射。
+ * @param {string} id - 智能体 ID。
+ * @returns {string} 展示名称或回退 ID。
+ */
 function agentName(values, id) {
   const value = values[id];
   if (value != null && value.Name !== "") {
@@ -1611,6 +2135,14 @@ function agentName(values, id) {
   }
   return id;
 }
+
+/**
+ * 按 ID 查找执行器展示名称，未命中或名称为空时回退返回原 ID。
+ *
+ * @param {Object<string, ExecutorDefinition>} values - 按 ID 索引的执行器定义映射。
+ * @param {string} id - 执行器 ID。
+ * @returns {string} 展示名称或回退 ID。
+ */
 function executorName(values, id) {
   const value = values[id];
   if (value != null && value.Name !== "") {
@@ -1619,11 +2151,23 @@ function executorName(values, id) {
   return id;
 }
 
-// accumulateConversationRun counts a conversation workspace: its model usage
-// joins the token and cost totals, trend, user, project and requirement-source
-// breakdowns, while run counts, statuses, durations and the SOP requirement
-// counts stay SOP-only. Its requirements are counted apart, per trend bucket in
-// trendIssues.
+/**
+ * 统计单条会话直改代码工作区（`run.IsWorkspace()`）的模型用量与关联需求。
+ * 其 Token 与成本计入全局总览、趋势、用户、项目与需求来源拆解，但不计入 SOP 运行次数、状态、耗时与 SOP 需求数；
+ * 关联的需求单独记入 `issues` 与各时间桶的 `trendIssues` 集合中。
+ *
+ * @param {AnalyticsSummary} summary - 总览汇总对象（就地累加会话工作区与全局用量字段）。
+ * @param {Object<string, boolean>} issues - 会话工作区覆盖的唯一需求 ID 集合（就地修改）。
+ * @param {Object<string, AnalyticsTrendPoint>} trends - 趋势点映射（就地修改）。
+ * @param {Object<string, Object<string, boolean>>} trendIssues - 各时间桶会话工作区覆盖的需求 ID 集合映射（就地修改）。
+ * @param {Object<string, analyticsUserAccumulator>} users - 用户按日用量累加器映射（就地修改）。
+ * @param {Object<string, analyticsProjectAccumulator>} projects - 项目用量累加器映射（就地修改）。
+ * @param {Object<string, analyticsAccumulator>} sources - 需求来源拆解累加器映射（就地修改）。
+ * @param {import("../domain/run.js").Run} run - 会话工作区运行对象。
+ * @param {Issue} issue - 关联需求对象。
+ * @param {string} grain - 趋势时间粒度。
+ * @returns {void} 无返回值。
+ */
 function accumulateConversationRun(summary, issues, trends, trendIssues, users, projects, sources, run, issue, grain) {
   const usage = run.Usage;
   const issueID = run.ExecutionContext.IssueID.trim();
@@ -1642,7 +2186,7 @@ function accumulateConversationRun(summary, issues, trends, trendIssues, users, 
     issues[issueID] = true;
     summary.ConversationLinkedWorkspaces++;
   }
-  // Same timestamp the analytics window filters on.
+  // 使用与分析时间窗过滤一致的时间戳。
   const at = run.CreatedAt;
   const bucket = analyticsTrendBucket(at, grain);
   const point = analyticsTrendEntry(trends, bucket);
@@ -1682,4 +2226,4 @@ function accumulateConversationRun(summary, issues, trends, trendIssues, users, 
   value.cacheWriteTokens += usage.CacheWriteTokens;
 }
 
-module.exports = { AnalyticsRepo, analyticsAccumulator, analyticsVersionAccumulator, analyticsUserAccumulator, analyticsProjectAccumulator, analyticsRunSignals, analyticsHumanEventTypes, queryAnalyticsCoverage, runReworks, analyticsRunDuration, analyticsWeekHourLocation, analyticsTrendBucket, analyticsTrendEntry, addAnalyticsTrendIssue, analyticsRunInWindow, analyticsRunMatchesUser, analyticsRunUserID, analyticsIssueMatchesSource, analyticsIsRequirementIssue, usageCostKnown, analyticsWorkflowCategory, analyticsNodeTypes, sumIssueCounts, issueExecValues, countInProgressIssues, issueInProgress, applyWeeklyThroughput, analyticsRunError, accumulateBreakdown, accumulateBreakdownUsage, countBreakdownStatus, accumulateBreakdownDuration, accumulateNode, accumulateVersion, analyticsUserEntry, accumulateUserUsage, finalizeBreakdowns, finalizeWorkflowVersions, finalizeUserUsage, analyticsProjectEntry, accumulateProjectUsage, finalizeProjectUsage, applyBreakdownShares, analyticsIssueSource, analyticsSourceEntry, accumulateIssueSource, percentile, normalizeFailure, agentName, executorName, accumulateConversationRun, isZeroTime, timeMs, timeBefore, timeAfter, timeEqual, formatDayUTC, formatMonthUTC, loadTimeLocation, inLocation };
+module.exports = { AnalyticsRepo, analyticsAccumulator, analyticsVersionAccumulator, analyticsUserAccumulator, analyticsProjectAccumulator, analyticsRunSignals, analyticsHumanEventTypes, queryAnalyticsCoverage, runReworks, analyticsRunDuration, analyticsWeekHourLocation, analyticsTrendBucket, analyticsTrendEntry, addAnalyticsTrendIssue, analyticsRunInWindow, analyticsRunMatchesUser, analyticsRunUserID, analyticsIssueMatchesSource, analyticsIsRequirementIssue, usageCostKnown, analyticsWorkflowCategory, analyticsNodeTypes, sumIssueCounts, issueExecValues, countInProgressIssues, issueInProgress, applyWeeklyThroughput, analyticsRunError, accumulateBreakdown, accumulateBreakdownUsage, countBreakdownStatus, accumulateBreakdownDuration, accumulateNode, accumulateVersion, analyticsUserEntry, accumulateUserUsage, finalizeBreakdowns, finalizeWorkflowVersions, finalizeUserUsage, analyticsProjectEntry, accumulateProjectUsage, finalizeProjectUsage, applyBreakdownShares, analyticsIssueSource, analyticsSourceEntry, accumulateIssueSource, percentile, normalizeFailure, agentName, executorName, accumulateConversationRun, isZeroTime, zeroTimeDate, timeMs, timeBefore, timeAfter, timeEqual, formatDayUTC, formatMonthUTC, loadTimeLocation, inLocation };

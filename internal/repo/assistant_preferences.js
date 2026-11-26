@@ -1,5 +1,17 @@
-// assistant_preferences.js —— 对应 Go 文件：internal/repo/assistant_preferences.go
-// 作用：读写用户的 Main Bot 偏好设置。
+/**
+ * @file internal/repo/assistant_preferences.js
+ * 对应 Go 源文件：internal/repo/assistant_preferences.go
+ *
+ * 作用与职责边界：
+ * 负责读取和覆盖保存用户维度的 Main Bot 助手偏好设置（包括主动角色/SOP 开关、发送时引导、
+ * 工作区驱动、自定义指令及审批复核模式与自定义 API 配置）。
+ * 不负责默认偏好推导逻辑本身（由领域层 `AssistantPreferences` 负责）或权限校验。
+ *
+ * 语法差异说明：
+ * - Go `(domain.AssistantPreferences, error)` 译为成功返回偏好对象、失败 `throw err`。
+ * - Go 指针字段 `*string` / `*time.Time` 在 JS 中直接以 `null` 或对应值表示。
+ * - 同包方法通过 `AssistantRepo.prototype.<Method>` 挂载。
+ */
 
 "use strict";
 
@@ -7,8 +19,14 @@ const { AssistantPreferences, ApprovalReviewAPIConfig } = require("../domain/ass
 const { assistantPreferenceRow } = require("./models.js"); // 对应 Go 同包类型，models.js 待翻译
 const { AssistantRepo } = require("./repo.js"); // 对应 Go 同包类型，repo.js 待翻译
 
-// AssistantPreferences returns the user's Main Bot settings; the zero value
-// when they never saved any.
+/**
+ * 读取指定用户的 Main Bot 偏好设置。
+ * 当用户 ID 非法或从未保存过偏好时返回零值 `AssistantPreferences`；读取到记录时会清洗首尾空白、
+ * 解析审批复核 API 配置并计算生效的审批复核模式。
+ *
+ * @param {number} userID - 目标用户 ID。
+ * @returns {AssistantPreferences} 用户的助手偏好设置对象。
+ */
 AssistantRepo.prototype.AssistantPreferences = function (userID) {
   const out = new AssistantPreferences();
   if (userID <= 0) {
@@ -52,7 +70,15 @@ AssistantRepo.prototype.AssistantPreferences = function (userID) {
   return out;
 };
 
-// PutAssistantPreferences replaces the user's Main Bot settings.
+/**
+ * 覆盖保存指定用户的 Main Bot 偏好设置，并返回落库后规范化的最新偏好对象。
+ * 写入前会对文本字段及自定义审批复核 API 配置进行去空白整理。
+ *
+ * @param {number} userID - 目标用户 ID（必须大于 0）。
+ * @param {AssistantPreferences} p - 待保存的偏好设置对象。
+ * @returns {AssistantPreferences} 保存成功后重新读取的规范化偏好对象。
+ * @throws {Error} 当 `userID <= 0` 或数据库保存失败时抛出错误。
+ */
 AssistantRepo.prototype.PutAssistantPreferences = function (userID, p) {
   if (userID <= 0) {
     throw new Error("user id is required");

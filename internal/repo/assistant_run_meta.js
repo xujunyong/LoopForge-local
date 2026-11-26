@@ -1,5 +1,17 @@
-// assistant_run_meta.js —— 对应 Go 文件：internal/repo/assistant_run_meta.go
-// 作用：侧边栏用的运行头、需求标识与会话消息数批量读取。
+/**
+ * @file internal/repo/assistant_run_meta.js
+ * 对应 Go 源文件：internal/repo/assistant_run_meta.go
+ *
+ * 作用与职责边界：
+ * 为历史会话侧边栏提供轻量的批量只读投影查询，包括 SOP 运行头部元数据、关联需求编号与标题，
+ * 以及各会话的持久化消息计数，避免逐条加载完整运行图或对话正文导致列表接口慢查询。
+ * 不负责写操作或侧边栏最终展示文案拼装。
+ *
+ * 语法差异说明：
+ * - Go `map[string]V` 统一译为普通对象 `{}`；结构体零值按 Go 语义初始化（`time.Time` 译为 `null`）。
+ * - Go `log.Printf` 译为 `console.log`；`min(start+500, len(ids))` 译为 `Math.min(start + 500, ids.length)`。
+ * - 按 Go 原文件跨 `RunsRepo`、`IssuesRepo`、`AssistantRepo` 三个领域类型分别挂载原型方法。
+ */
 
 "use strict";
 
@@ -8,12 +20,17 @@ const { Buffer } = require("node:buffer");
 const { TelemetryContext } = require("../domain/observability.js"); // 对应 Go 同包类型，observability.js 已翻译
 const { RunsRepo, IssuesRepo, AssistantRepo } = require("./repo.js"); // 对应 Go 同包类型，repo.js 待翻译
 
-// SidebarRunMeta is the cheap run header the conversation history needs to
-// name and label a shared SOP run session. Decorating the whole list from
-// batched reads keeps the history endpoint's query count flat: per-session
-// RunState lookups once made long histories slow and transferred node graphs
-// the sidebar never shows.
+/**
+ * 侧边栏展示共享 SOP 运行会话所需的轻量运行头部信息。
+ * 通过批量查询替代逐条 `RunState` 读取，避免传输侧边栏不会展示的完整节点图。
+ */
 class SidebarRunMeta {
+  /**
+   * 构造并初始化侧边栏运行头部元数据对象。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.Status = init.Status ?? "";
     this.WorkflowID = init.WorkflowID ?? "";
@@ -22,17 +39,22 @@ class SidebarRunMeta {
     this.IssueID = init.IssueID ?? "";
     this.IssueNumber = init.IssueNumber ?? 0;
     this.ResponsibleUserID = init.ResponsibleUserID ?? 0;
-    // Input is the head of the task text the run was started with; it names a
-    // run that serves no requirement.
+    // Input 为启动运行时的任务文本开头截断，用于为未关联需求的运行命名。
     this.Input = init.Input ?? "";
     this.CreatedAt = init.CreatedAt ?? null;
   }
 }
 
-// sidebarRunInputChars bounds how much task text the list reads per run.
+// 侧边栏每条运行最多读取的任务输入文本字符数上限。
 const sidebarRunInputChars = 300;
 
-// SidebarRunMetas loads those headers for the listed runs.
+/**
+ * 按运行 ID 列表分批（每批 500 条）加载侧边栏所需的运行头部元数据。
+ * 查询出错时记录日志并返回已收集的部分结果，不中断整体列表渲染。
+ *
+ * @param {Array<string>} ids - 待查询的运行 ID 列表。
+ * @returns {Object<string, SidebarRunMeta>} 以运行 ID 为键、运行头部元数据为值的映射对象。
+ */
 RunsRepo.prototype.SidebarRunMetas = function (ids) {
   const out = {};
   if (ids.length === 0) {
@@ -86,16 +108,29 @@ RunsRepo.prototype.SidebarRunMetas = function (ids) {
   return out;
 };
 
-// SidebarIssue is the requirement identity shown next to a SOP run.
+/**
+ * 展示在 SOP 运行旁边的精简需求标识（仅含编号与标题）。
+ */
 class SidebarIssue {
+  /**
+   * 构造并初始化侧边栏需求标识对象。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射，缺省字段按 Go 零值填充。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.Number = init.Number ?? 0;
     this.Title = init.Title ?? "";
   }
 }
 
-// IssueSidebarIdentities loads only the requirement number and title, never
-// the description or the comments.
+/**
+ * 按需求 ID 列表分批（每批 500 条）仅加载需求编号与标题，不读取正文描述或评论。
+ * 查询出错时记录日志并返回已收集的部分结果。
+ *
+ * @param {Array<string>} ids - 待查询的需求 ID 列表。
+ * @returns {Object<string, SidebarIssue>} 以需求 ID 为键、精简需求标识为值的映射对象。
+ */
 IssuesRepo.prototype.IssueSidebarIdentities = function (ids) {
   const out = {};
   if (ids.length === 0) {
@@ -116,10 +151,13 @@ IssuesRepo.prototype.IssueSidebarIdentities = function (ids) {
   return out;
 };
 
-// AssistantSessionMessageCounts reports persisted message counts so the history
-// list can tell an unused SOP run conversation from one that already holds a
-// discussion, without transferring transcripts. The list projection strips
-// messages, so the count has to come from the stored payload.
+/**
+ * 在数据库侧直接统计指定会话列表的持久化消息条数，不传输对话全文。
+ * 供历史列表区分尚未讨论的空白 SOP 运行会话与已有讨论记录的会话。
+ *
+ * @param {Array<string>} ids - 待统计的会话 ID 列表。
+ * @returns {Object<string, number>} 以会话 ID 为键、消息数量为值的映射对象。
+ */
 AssistantRepo.prototype.AssistantSessionMessageCounts = function (ids) {
   const out = {};
   if (ids.length === 0) {
