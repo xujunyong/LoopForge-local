@@ -1,6 +1,20 @@
-// users.js —— 对应 Go 文件：internal/repo/users.go
-// 作用：用户与凭据：用户查询与保存、凭据更新、CLI 模型目录校验。
-// (值, error) 译为返回值、失败 throw，(值, bool) 译为 [值, bool]；errors.Is 译为 ===。
+/**
+ * @file internal/repo/users.js
+ * 对应 Go 源文件：internal/repo/users.go
+ *
+ * 作用与职责边界：
+ * 实现用户主记录（`users`）与个人配置/凭据（`user_configs`）的联合查询与写入、
+ * 事务行锁保护的个人执行器凭据及助手默认配置更新、工蜂 OAuth 令牌保存，
+ * 以及扩展 Agent CLI 凭据合并和 CLI 模型目录（含 Cursor 思考强度映射与通用推理强度）的规范化校验；
+ * 领域方法挂载于 `UsersRepo.prototype`（`UsersRepo` 定义于 `repo.js`），不负责登录鉴权会话或平台管理员名单管理（见 `platform_admin.js`）。
+ *
+ * 语法差异说明：
+ * - Go 的 `(值, error)`、`(值1, 值2, error)` 与仅 `error` 返回统一按成功返回值（或二元组、`undefined`）、失败 `throw err` 处理；
+ *   `db.Transaction(tx => ...)` 回调同样遵循失败抛错、成功正常返回。
+ * - Go 的 `(值, bool)` 译为二元组 `[值, boolean]`；`errors.Is(err, gorm.ErrRecordNotFound)` 译为 `===`。
+ * - Go 的 `map[string]V` 统一使用普通对象 `{}`；`struct` 字段严格按 Go 零值初始化（如 `UserCredentialUpdate.AgentCLICredentials` 为 `{}`）。
+ * - Go 中按值比较 `AssistantDefaults` 结构体在 JS 中展开为逐字段比较；按字符数计数（`utf8.RuneCountInString`）译为 `[...name].length`，按 UTF-8 字节长度校验（`len(id)`）译为 `Buffer.byteLength(id, "utf8")`。
+ */
 
 "use strict";
 
@@ -16,9 +30,20 @@ const { userRow, userConfigRow } = require("./models.js"); // 对应 Go 同包�
 const { upsert, insertIgnore, timePtr } = require("./payload.js"); // 对应 Go 同包函数，payload.js 已翻译
 const { IsAllowlistedPlatformAdmin } = require("./platform_admin.js"); // 对应 Go 同包函数，platform_admin.js 已翻译
 const { managedGitHTTPCredential } = require("./git_http_credentials.js"); // 对应 Go 同包函数，git_http_credentials.js 已翻译
-const { ErrAssistantDefaultExecutorUnavailable, firstAssistantExecutor } = require("./user_assistant_defaults.js"); // 对应 Go 同包函数，user_assistant_defaults.js 待翻译
+const { ErrAssistantDefaultExecutorUnavailable, firstAssistantExecutor } = require("./user_assistant_defaults.js"); // 对应 Go 同包函数，user_assistant_defaults.js 已翻译
 
+// ---------- Users ----------
+
+/**
+ * 承载 `users` 左连接 `user_configs` 联合查询结果的内部投影行模型，并附带 Git 凭据配置存在性子查询列。
+ */
 class userWithConfig {
+  /**
+   * 构造联合查询投影行实例，缺省字段严格按 Go 零值初始化（指针列为 `null`）。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.ID = init.ID ?? 0;
     this.StaffID = init.StaffID ?? 0;
@@ -49,6 +74,12 @@ class userWithConfig {
     this.Updated = init.Updated ?? null;
   }
 
+  /**
+   * 将联合查询投影行转换为 `User` 领域对象，解码各执行器模型目录、扩展 CLI 凭据与助手默认设置，
+   * 并根据是否存在平台托管工蜂 HTTPS 凭据补充 `GitHTTPCredentialsConfigured` 标记。
+   *
+   * @returns {User} 转换后的用户领域对象。
+   */
   toDomain() {
     const u = new User({
       ID: this.ID, StaffID: this.StaffID, LoginName: this.LoginName, ChineseName: this.ChineseName,
@@ -118,6 +149,7 @@ class userWithConfig {
   }
 }
 
+// 联合查询 `users` 与 `user_configs` 时复用的 SELECT 投影列清单。
 const userSelectColumns = `u.id, u.staff_id, u.login_name, u.chinese_name, u.dept_id, u.dept_name,
 	COALESCE(u.platform_role, '') AS platform_role,
 	c.git_token, EXISTS (SELECT 1 FROM user_git_ssh_keys k WHERE k.user_id = u.id) AS git_ssh_key_configured,
@@ -129,6 +161,14 @@ const userSelectColumns = `u.id, u.staff_id, u.login_name, u.chinese_name, u.dep
 	c.agent_cli_credentials, c.assistant_defaults,
 	u.created_at, u.updated_at`;
 
+/**
+ * 按给定 `WHERE` 条件查询单个用户及其配置记录，并映射为领域对象。
+ * 使用场景：供 `User`、`UserByLoginName`、`UserByStaffID` 共用。
+ *
+ * @param {string} where - SQL `WHERE` 子句条件表达式（不包含 `WHERE` 关键字）。
+ * @param {...*} args - 绑定到 `where` 占位符的参数列表。
+ * @returns {[User, boolean]} 查询命中有效用户时返回 `[user, true]`，否则返回 `[空 User, false]`。
+ */
 UsersRepo.prototype.userQuery = function (where, ...args) {
   const row = new userWithConfig();
   const q = this.DB.Raw(`SELECT ${userSelectColumns} FROM users u LEFT JOIN user_configs c ON c.user_id=u.id WHERE ${where}`, ...args);
@@ -138,6 +178,12 @@ UsersRepo.prototype.userQuery = function (where, ...args) {
   return [row.toDomain(), true];
 };
 
+/**
+ * 查询全部用户及其配置记录，并按 `LoginName` 字典序升序返回。
+ * 使用场景：成员选择器、权限配置页及平台管理员名单展示。
+ *
+ * @returns {User[]} 按登录名升序排列的用户领域对象数组；查询失败时返回空数组。
+ */
 UsersRepo.prototype.Users = function () {
   const rows = [];
   if (this.DB.Raw(`SELECT ${userSelectColumns} FROM users u LEFT JOIN user_configs c ON c.user_id=u.id ORDER BY u.login_name ASC`).Scan(rows).Error != null) {
@@ -151,6 +197,13 @@ UsersRepo.prototype.Users = function () {
   return out;
 };
 
+/**
+ * 按数字主键 ID 查询单个用户及其配置。
+ * 使用场景：鉴权上下文加载当前用户或按用户 ID 补全展示信息。
+ *
+ * @param {number} id - 用户数字主键 ID；小于等于 0 时直接返回未找到。
+ * @returns {[User, boolean]} 找到时返回 `[user, true]`，否则返回 `[空 User, false]`。
+ */
 UsersRepo.prototype.User = function (id) {
   if (id <= 0) {
     return [new User(), false];
@@ -158,21 +211,43 @@ UsersRepo.prototype.User = function (id) {
   return this.userQuery("u.id=?", id);
 };
 
+/**
+ * 按登录名不区分大小写查询单个用户及其配置；MySQL 下直接利用不区分大小写排序规则保持索引命中。
+ * 使用场景：登录回调或按账号查找用户记录。
+ *
+ * @param {string} loginName - 用户登录名。
+ * @returns {[User, boolean]} 找到时返回 `[user, true]`，否则返回 `[空 User, false]`。
+ */
 UsersRepo.prototype.UserByLoginName = function (loginName) {
   if (this.isMySQL()) {
-    // MySQL collation is already case-insensitive and keeps index usage.
+    // MySQL 排序规则本身不区分大小写，直接等值查询可保持索引命中。
     return this.userQuery("u.login_name=?", loginName);
   }
   return this.userQuery("LOWER(u.login_name) = LOWER(?)", loginName);
 };
 
+/**
+ * 按企业工号（`staff_id`）查询单个用户及其配置。
+ * 使用场景：单点登录或组织架构同步按工号匹配本地用户。
+ *
+ * @param {number} staffID - 用户数字工号。
+ * @returns {[User, boolean]} 找到时返回 `[user, true]`，否则返回 `[空 User, false]`。
+ */
 UsersRepo.prototype.UserByStaffID = function (staffID) {
   return this.userQuery("u.staff_id=?", staffID);
 };
 
+/**
+ * 创建或刷新用户身份主记录；登录刷新时仅更新身份信息并完整保留既有凭据与原角色，
+ * 命中管理员白名单时自动授予平台管理员角色；仅在首次建档且携带初始配置时一并写入 `user_configs`。
+ *
+ * @param {User} v - 待保存的用户领域对象（`LoginName`、`StaffID`、`ID` 至少提供其一）。
+ * @returns {void} 无返回值。
+ * @throws {Error} 缺少身份标识或数据库写入失败时抛出错误。
+ */
 UsersRepo.prototype.PutUser = function (v) {
   if (v.LoginName === "" && v.StaffID === 0 && v.ID === 0) {
-    return new Error("user loginName, staffId, or ID is required");
+    throw new Error("user loginName, staffId, or ID is required");
   }
   const now = new Date();
   let old = new User();
@@ -187,8 +262,7 @@ UsersRepo.prototype.PutUser = function (v) {
       v.ID = old.ID;
     }
     v.CreatedAt = old.CreatedAt;
-    // Authentication refreshes identity fields only. Credentials are managed
-    // through UpdateUserCredentials and must survive every login refresh.
+    // 登录认证仅刷新身份字段；个人凭据由 UpdateUserCredentials 独立维护，每次登录刷新都必须保留。
     v.GitToken = old.GitToken;
     v.GongfengRefreshToken = old.GongfengRefreshToken;
     v.GongfengTokenExpiresAt = old.GongfengTokenExpiresAt;
@@ -213,31 +287,27 @@ UsersRepo.prototype.PutUser = function (v) {
     v.PlatformRole = PlatformRoleAdmin;
   }
   v.UpdatedAt = now;
-  let saved;
-  try {
-    saved = this.writeUser(v);
-  } catch (err) {
-    return err;
-  }
+  const saved = this.writeUser(v);
   if (!ok && userHasConfig(saved)) {
-    const err = this.writeUserConfig(saved);
-    if (err != null) {
-      return err;
-    }
+    this.writeUserConfig(saved);
   }
-  return null;
 };
 
+/**
+ * 将用户主记录写入 `users` 表：已有主键 ID 时执行冲突覆盖，否则执行忽略冲突插入并在并发撞上唯一登录名时认领并刷新既有行。
+ * 使用场景：由 `PutUser` 内部调用以处理并发首次登录建档。
+ *
+ * @param {User} v - 待写入的用户领域对象。
+ * @returns {User} 已补全数据库主键 `ID` 的用户对象。
+ * @throws {Error} 数据库插入、查询或更新失败时抛出错误。
+ */
 UsersRepo.prototype.writeUser = function (v) {
   if (v.ID > 0) {
-    const err = upsert(this.DB, "users", {
+    upsert(this.DB, "users", {
       id: v.ID, staff_id: v.StaffID, login_name: v.LoginName, chinese_name: v.ChineseName,
       dept_id: v.DeptID, dept_name: v.DeptName, platform_role: v.PlatformRole,
       created_at: timePtr(v.CreatedAt), updated_at: timePtr(v.UpdatedAt),
     });
-    if (err != null) {
-      throw err;
-    }
     return v;
   }
   const inserted = insertIgnore(this.DB, "users", {
@@ -246,7 +316,7 @@ UsersRepo.prototype.writeUser = function (v) {
     created_at: timePtr(v.CreatedAt), updated_at: timePtr(v.UpdatedAt),
   });
   if (!inserted) {
-    // The unique login already exists: adopt that row and refresh it.
+    // 唯一登录名已存在：认领该行并刷新其最新身份信息。
     const existing = new userRow();
     const takeErr = this.DB.Where("login_name = ?", v.LoginName).Take(existing).Error;
     if (takeErr != null) {
@@ -271,6 +341,13 @@ UsersRepo.prototype.writeUser = function (v) {
   return v;
 };
 
+/**
+ * 判断用户对象是否包含任意非空的个人 Git 或执行器凭据/模型配置。
+ * 使用场景：`PutUser` 新建用户时决定是否需要同步写入一条 `user_configs` 记录。
+ *
+ * @param {User} user - 待检测的用户领域对象。
+ * @returns {boolean} 存在任一非空配置项时返回 `true`，否则返回 `false`。
+ */
 function userHasConfig(user) {
   return user.GitToken !== "" ||
     user.GongfengRefreshToken !== "" ||
@@ -287,7 +364,17 @@ function userHasConfig(user) {
     Object.keys(user.AgentCLICredentials ?? {}).length > 0;
 }
 
+/**
+ * 用户个人执行器凭据、模型目录与助手默认参数的增量更新请求结构。
+ * 指针类型字段传 `null` 表示保持原存储值不变，非空时覆盖更新。
+ */
 class UserCredentialUpdate {
+  /**
+   * 构造 `UserCredentialUpdate` 实例，缺省字段严格按 Go 零值初始化（映射字段初始化为 `{}`）。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.AssistantDefaults = init.AssistantDefaults ?? null;
     this.CodeBuddyAPIKey = init.CodeBuddyAPIKey ?? "";
@@ -303,52 +390,74 @@ class UserCredentialUpdate {
     this.ClaudeCodeAPIKeyClear = init.ClaudeCodeAPIKeyClear ?? false;
     this.ClaudeCodeBaseURL = init.ClaudeCodeBaseURL ?? null;
     this.ClaudeCodeModels = init.ClaudeCodeModels ?? null;
-    // AgentCLICredentials updates the agent CLIs by kind; absent fields keep
-    // the stored value. CodeBuddy, Codex and Claude Code stay on their own columns.
-    this.AgentCLICredentials = init.AgentCLICredentials ?? null;
+    // 按 CLI 种类更新扩展 Agent CLI 凭据，缺省字段保留原值；CodeBuddy、Codex、Claude Code 仍存在各自独立列。
+    this.AgentCLICredentials = init.AgentCLICredentials ?? {};
   }
 }
 
+/**
+ * 单个扩展 Agent CLI 的凭据增量更新结构。
+ */
 class AgentCLICredentialUpdate {
+  /**
+   * 构造 `AgentCLICredentialUpdate` 实例，缺省字段严格按 Go 零值初始化。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射。
+   * @param {string} [init.APIKey=""] - 新设置的 API Key（非空时覆盖）。
+   * @param {boolean} [init.APIKeyClear=false] - 为 `true` 时清空现有 API Key。
+   * @param {string | null} [init.BaseURL=null] - 可选更新的接口地址；`null` 表示保持不变。
+   * @param {string | null} [init.Protocol=null] - 可选更新的协议类型；`null` 表示保持不变。
+   * @param {CLIModel[] | null} [init.Models=null] - 可选更新的模型目录列表；`null` 表示保持不变。
+   * @param {string} [init.DiscoveredForKey=""] - 自动发现模型目录时所对应的旧密钥，防止延迟回写覆盖新密钥目录。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.APIKey = init.APIKey ?? "";
     this.APIKeyClear = init.APIKeyClear ?? false;
     this.BaseURL = init.BaseURL ?? null;
     this.Protocol = init.Protocol ?? null;
     this.Models = init.Models ?? null;
-    // DiscoveredForKey prevents a refresh for an old key from replacing the
-    // new key's models.
+    // 防止旧密钥触发的模型发现结果晚到并覆盖新密钥的模型目录。
     this.DiscoveredForKey = init.DiscoveredForKey ?? "";
   }
 }
 
+/**
+ * 在事务并对 `users` 主行加排他锁的保护下更新指定用户的执行器凭据、模型目录与助手默认设置，
+ * 即使请求跨多实例并发到达或尚未存在 `user_configs` 行也能严格串行化。
+ *
+ * @param {number} id - 目标用户数字主键 ID。
+ * @param {UserCredentialUpdate} update - 增量凭据与默认配置更新载荷。
+ * @returns {User} 更新并持久化后的完整用户领域对象。
+ * @throws {Error} 用户不存在、参数校验失败或数据库事务执行失败时抛出错误。
+ */
 UsersRepo.prototype.UpdateUserCredentials = function (id, update) {
   let user = new User();
-  const err = this.DB.Transaction((tx) => {
-    // Serialize edits and CLI discovery for this user even when they
-    // arrive at different server instances or before a config row exists.
+  this.DB.Transaction((tx) => {
+    // 通过锁定 users 行，串行化同一用户的手工编辑与 CLI 模型自动发现写入。
     const owner = new userRow();
     const lockErr = this.locking(tx.Select("id")).Where("id = ?", id).Take(owner).Error;
     if (lockErr != null) {
       if (lockErr === gorm.ErrRecordNotFound) {
-        return new Error("user not found");
+        throw new Error("user not found");
       }
-      return lockErr;
+      throw lockErr;
     }
     const credentials = new UsersRepo({ DB: tx });
-    try {
-      user = credentials.updateUserCredentials(id, update);
-    } catch (e) {
-      return e;
-    }
-    return null;
+    user = credentials.updateUserCredentials(id, update);
   });
-  if (err != null) {
-    throw err;
-  }
   return user;
 };
 
+/**
+ * 在事务内执行用户凭据、模型目录校验合并与助手默认执行器回退，并落库到 `user_configs`。
+ * 使用场景：仅由 `UpdateUserCredentials` 在持有用户行锁的事务中调用。
+ *
+ * @param {number} id - 目标用户数字主键 ID。
+ * @param {UserCredentialUpdate} update - 增量凭据更新载荷。
+ * @returns {User} 更新并持久化后的用户领域对象。
+ * @throws {Error} 用户不存在、模型目录/协议/默认执行器校验失败或写库失败时抛出错误。
+ */
 UsersRepo.prototype.updateUserCredentials = function (id, update) {
   const [user, ok] = this.User(id);
   if (!ok) {
@@ -396,33 +505,22 @@ UsersRepo.prototype.updateUserCredentials = function (id, update) {
   if (update.ClaudeCodeModels != null) {
     user.ClaudeCodeModels = normalizeCLIModels(update.ClaudeCodeModels);
   }
-  const agentErr = applyAgentCLICredentialUpdates(user, update.AgentCLICredentials);
-  if (agentErr != null) {
-    throw agentErr;
-  }
+  applyAgentCLICredentialUpdates(user, update.AgentCLICredentials);
   if (update.AssistantDefaults != null) {
     if (!user.HasExecutorCredential(update.AssistantDefaults.Executor)) {
       throw ErrAssistantDefaultExecutorUnavailable;
     }
-    user.AssistantDefaults = update.AssistantDefaults;
+    user.AssistantDefaults = new AssistantDefaults(update.AssistantDefaults);
   } else if (!user.HasExecutorCredential(user.AssistantDefaults.Executor)) {
     user.AssistantDefaults.Executor = firstAssistantExecutor(user);
     user.AssistantDefaults.Model = "";
     user.AssistantDefaults.Effort = "";
   }
   user.UpdatedAt = new Date();
-  const configErr = this.writeUserConfig(user);
-  if (configErr != null) {
-    throw configErr;
-  }
+  this.writeUserConfig(user);
   // Go 按值比较结构体，JS 里逐字段比较。
   if (user.AssistantDefaults.Executor !== previousDefaults.Executor || user.AssistantDefaults.Model !== previousDefaults.Model || user.AssistantDefaults.Effort !== previousDefaults.Effort || user.AssistantDefaults.Approval !== previousDefaults.Approval) {
-    let value;
-    try {
-      value = JSON.stringify(user.AssistantDefaults);
-    } catch (err) {
-      throw err;
-    }
+    const value = JSON.stringify(user.AssistantDefaults);
     const updateErr = this.DB.Model(new userConfigRow()).Where("user_id = ?", id).Update("assistant_defaults", value).Error;
     if (updateErr != null) {
       throw updateErr;
@@ -431,8 +529,17 @@ UsersRepo.prototype.updateUserCredentials = function (id, update) {
   return user;
 };
 
-// SaveGongfengOAuth stores an OAuth access token in the git credential slot
-// and keeps the refresh token so a later use can renew it.
+/**
+ * 保存用户的工蜂 OAuth 访问令牌（写入 `git_token` 槽位）、刷新令牌及过期时间，供后续 Git 操作自动续期。
+ * 使用场景：工蜂 OAuth 授权回调或令牌自动刷新完成后落库。
+ *
+ * @param {number} id - 目标用户数字主键 ID。
+ * @param {string} accessToken - 工蜂 OAuth 访问令牌。
+ * @param {string} refreshToken - 工蜂 OAuth 刷新令牌。
+ * @param {Date} expiresAt - 访问令牌过期时间（将转为 UTC 保存）。
+ * @returns {User} 更新后的用户领域对象。
+ * @throws {Error} 用户不存在或写库失败时抛出错误。
+ */
 UsersRepo.prototype.SaveGongfengOAuth = function (id, accessToken, refreshToken, expiresAt) {
   const [user, ok] = this.User(id);
   if (!ok) {
@@ -442,13 +549,18 @@ UsersRepo.prototype.SaveGongfengOAuth = function (id, accessToken, refreshToken,
   user.GongfengRefreshToken = refreshToken.trim();
   user.GongfengTokenExpiresAt = new Date(expiresAt.getTime());
   user.UpdatedAt = new Date();
-  const err = this.writeUserConfig(user);
-  if (err != null) {
-    throw err;
-  }
+  this.writeUserConfig(user);
   return user;
 };
 
+/**
+ * 将用户的全部凭据与模型配置列以冲突覆盖（upsert）方式写入 `user_configs` 表。
+ * 使用场景：由 `PutUser`、`updateUserCredentials`、`SaveGongfengOAuth` 内部调用。
+ *
+ * @param {User} v - 待持久化配置的用户领域对象。
+ * @returns {void} 无返回值。
+ * @throws {Error} 数据库写入失败时抛出错误。
+ */
 UsersRepo.prototype.writeUserConfig = function (v) {
   const values = {
     user_id: v.ID,
@@ -463,9 +575,16 @@ UsersRepo.prototype.writeUserConfig = function (v) {
     agent_cli_credentials: encodeAgentCLICredentials(v.AgentCLICredentials),
     created_at: timePtr(v.CreatedAt), updated_at: timePtr(v.UpdatedAt),
   };
-  return upsert(this.DB, "user_configs", values);
+  upsert(this.DB, "user_configs", values);
 };
 
+/**
+ * 将空字符串转换为数据库 `NULL`（`null`），非空字符串原样返回。
+ * 使用场景：写入 `user_configs` 的可空凭据列时避免存入空串。
+ *
+ * @param {string} v - 待转换的字符串值。
+ * @returns {string | null} 空字符串返回 `null`，非空字符串原样返回。
+ */
 function nullableString(v) {
   if (v === "") {
     return null;
@@ -473,9 +592,18 @@ function nullableString(v) {
   return v;
 }
 
+/**
+ * 将扩展 Agent CLI 凭据的增量变更合并到 `user.AgentCLICredentials` 中：
+ * 校验 CLI 类型与协议合法性、按需重置 Cursor 更换密钥后的旧模型目录、防止过期发现结果覆盖自定义目录，并剔除已清空的条目。
+ *
+ * @param {User} user - 待就地更新 `AgentCLICredentials` 的用户领域对象。
+ * @param {Object.<string, AgentCLICredentialUpdate> | null} updates - 按 CLI 类型索引的增量凭据更新映射。
+ * @returns {void} 无返回值。
+ * @throws {Error} 传入不支持的 CLI 类型、不支持的协议或模型目录校验失败时抛出错误。
+ */
 function applyAgentCLICredentialUpdates(user, updates) {
   if (updates == null || Object.keys(updates).length === 0) {
-    return null;
+    return;
   }
   let merged = {};
   for (const [kind, cred] of Object.entries(user.AgentCLICredentials ?? {})) {
@@ -484,7 +612,7 @@ function applyAgentCLICredentialUpdates(user, updates) {
   for (let [kind, update] of Object.entries(updates)) {
     kind = kind.trim();
     if (!IsAgentCLIKind(kind)) {
-      return new Error(`不支持的 CLI：${kind}`);
+      throw new Error(`不支持的 CLI：${kind}`);
     }
     // Go 读缺失的 map 键得零值，JS 取不到时按空凭据处理。
     const cred = merged[kind] ?? new AgentCLICredential();
@@ -494,9 +622,7 @@ function applyAgentCLICredentialUpdates(user, updates) {
     } else if (update.APIKey.trim() !== "") {
       cred.APIKey = update.APIKey.trim();
     }
-    // Cursor's catalog and effort variants belong to the key's plan.
-    // A replacement key starts with its own list unless the edit also
-    // supplies a catalog.
+    // Cursor 的模型目录与思考强度变体绑定于密钥所属套餐；更换密钥且未同时提交新目录时清空旧目录。
     if (kind === "cursor" && cred.APIKey !== previousKey && update.Models == null) {
       cred.Models = null;
       cred.ModelsCustomized = false;
@@ -507,18 +633,13 @@ function applyAgentCLICredentialUpdates(user, updates) {
     if (update.Protocol != null) {
       const protocol = update.Protocol.trim();
       if (protocol !== "" && NormalizeAgentCLIProtocol(kind, protocol) !== protocol) {
-        return new Error(`${kind} 不支持协议 ${protocol}`);
+        throw new Error(`${kind} 不支持协议 ${protocol}`);
       }
       cred.Protocol = protocol;
     }
     const discovered = (update.DiscoveredForKey ?? "") !== "";
     if (update.Models != null && (!discovered || (!cred.ModelsCustomized && cred.APIKey === update.DiscoveredForKey))) {
-      let models;
-      try {
-        models = normalizeCLIModels(update.Models);
-      } catch (err) {
-        return err;
-      }
+      const models = normalizeCLIModels(update.Models);
       cred.Models = models;
       if (kind === "cursor") {
         cred.ModelsCustomized = !discovered && models.length !== 0;
@@ -534,9 +655,14 @@ function applyAgentCLICredentialUpdates(user, updates) {
     merged = null;
   }
   user.AgentCLICredentials = merged;
-  return null;
 }
 
+/**
+ * 将扩展 Agent CLI 凭据映射编码为 JSON 字符串用于落库；为空映射或序列化异常时返回 `null`。
+ *
+ * @param {Object.<string, AgentCLICredential> | null} creds - 扩展 Agent CLI 凭据映射。
+ * @returns {string | null} JSON 字符串；无有效内容时返回 `null`。
+ */
 function encodeAgentCLICredentials(creds) {
   if (creds == null || Object.keys(creds).length === 0) {
     return null;
@@ -553,10 +679,17 @@ function encodeAgentCLICredentials(creds) {
   return raw;
 }
 
+// 单个执行器允许配置的模型数量上限、模型 ID 最大字节长度及显示名称最大字符数。
 const maxCLIModels = 100;
 const maxCLIModelIDLen = 128;
 const maxCLIModelNameRune = 64;
 
+/**
+ * 将数据库中存储的 CLI 模型目录 JSON 文本反序列化为 `CLIModel[]`；为空或解析失败时返回 `null`。
+ *
+ * @param {string | null} raw - 数据库列中保存的 JSON 字符串。
+ * @returns {CLIModel[] | null} 解析得到的模型列表；输入为空或非法时返回 `null`。
+ */
 function decodeCLIModels(raw) {
   if (raw == null || raw.trim() === "") {
     return null;
@@ -570,6 +703,12 @@ function decodeCLIModels(raw) {
   return Array.isArray(models) ? models : null;
 }
 
+/**
+ * 将 CLI 模型目录数组编码为 JSON 字符串用于落库；为空数组或序列化失败时返回 `null`。
+ *
+ * @param {CLIModel[] | null} models - CLI 模型定义数组。
+ * @returns {string | null} JSON 字符串；空列表或序列化出错时返回 `null`。
+ */
 function encodeCLIModels(models) {
   if (models == null || models.length === 0) {
     return null;
@@ -581,6 +720,14 @@ function encodeCLIModels(models) {
   }
 }
 
+/**
+ * 校验并规范化用户提交的 CLI 模型目录列表：检查总数上限、ID 合法性与去重、显示名称长度及控制字符，
+ * 并递归规范化 Cursor 思考强度映射与通用推理强度列表。
+ *
+ * @param {CLIModel[] | null} models - 待校验的原始模型目录数组。
+ * @returns {CLIModel[]} 规范化后的 `CLIModel` 实例数组。
+ * @throws {Error} 数量超限、模型 ID 非法或重复、名称非法或思考强度不受支持时抛出错误。
+ */
 function normalizeCLIModels(models) {
   if ((models ?? []).length > maxCLIModels) {
     throw new Error(`模型目录最多 ${maxCLIModels} 个`);
@@ -634,6 +781,13 @@ function normalizeCLIModels(models) {
   return out;
 }
 
+/**
+ * 校验并去重单模型的推理思考强度列表；每一项必须属于 `ExecutorEffortLevels` 中任意执行器允许的档位。
+ *
+ * @param {string[] | null} raw - 可选的原始思考强度列表；为 `null` 时表示未配置，直接返回 `null`。
+ * @returns {string[] | null} 规范化并去重后的思考强度数组；输入为 `null` 时返回 `null`。
+ * @throws {Error} 列表中存在不受支持的思考强度档位时抛出错误。
+ */
 function normalizeCLIReasoningEfforts(raw) {
   if (raw == null) {
     return null;
@@ -658,6 +812,14 @@ function normalizeCLIReasoningEfforts(raw) {
   return levels;
 }
 
+/**
+ * 校验单个 CLI 模型 ID 的合法性：非空、UTF-8 字节长度不超过 128、且不含空格、引号、反斜杠或控制字符。
+ * 使用场景：由 `normalizeCLIModels` 和 `normalizeCLIModelEfforts` 调用。
+ *
+ * @param {string} id - 已去除首尾空白的模型 ID 字符串。
+ * @returns {void} 无返回值。
+ * @throws {Error} 模型 ID 为空、超长或包含禁止字符时抛出错误。
+ */
 function validCLIModelID(id) {
   if (id === "") {
     throw new Error("模型 ID 不能为空");
@@ -671,12 +833,17 @@ function validCLIModelID(id) {
       throw new Error(`模型 ID ${JSON.stringify(id)} 不能包含空格、引号、反斜杠或控制字符`);
     }
   }
-  return null;
 }
 
-// normalizeCLIModelEfforts checks the effort→model ID mapping of a Cursor
-// model family: efforts are Cursor's levels and every target is a valid
-// model ID. A default outside the mapping is dropped.
+/**
+ * 校验并规范化 Cursor 模型家族的「思考强度 → 目标模型 ID」映射；
+ * 所有键必须属于 Cursor 支持的思考强度档位，所有目标值必须是合法模型 ID，不在映射内的默认值将被丢弃为空串。
+ *
+ * @param {Object.<string, string> | null} efforts - 思考强度到目标模型 ID 的映射对象。
+ * @param {string} defaultEffort - 期望的默认思考强度档位。
+ * @returns {[Object.<string, string> | null, string]} 二元组 `[规范化映射或 null, 有效的默认思考强度]`。
+ * @throws {Error} 包含不受支持的思考强度键或非法目标模型 ID 时抛出错误。
+ */
 function normalizeCLIModelEfforts(efforts, defaultEffort) {
   if (efforts == null || Object.keys(efforts).length === 0) {
     return [null, ""];
