@@ -1,14 +1,25 @@
-// generic_docker.js —— 对应 Go 文件：internal/repo/generic_docker.go
-// 作用：通用后端容器沙箱：平台默认 Dockerfile 与沙箱画像。
+/**
+ * @file internal/repo/generic_docker.js
+ * 对应 Go 源文件：internal/repo/generic_docker.go
+ *
+ * 作用与职责边界：
+ * 定义平台内置的通用后端 Docker 容器沙箱镜像配方（Dockerfile 正文）、基线时间戳以及默认 `SandboxProfile` 构造函数。
+ * 供通用交付 SOP、对话工作区默认回退以及沙箱目录缺失默认行时作为平台默认容器沙箱使用。
+ *
+ * 语法差异说明：
+ * - Go 的 `time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)` 译为 `new Date(Date.UTC(2026, 0, 1, 0, 0, 0, 0))`（JS 月份从 0 开始）。
+ * - Go 的反引号原生字符串译为模板字符串，其中的反斜杠 `\` 与 `${` 均已转义以保持内容逐字节一致。
+ */
 
 "use strict";
 
 const { SandboxProfile, SandboxDockerfile } = require("../domain/assets.js"); // 对应 Go 的 domain.SandboxProfile/SandboxDockerfile，domain 已翻译
-const { GenericDockerSandboxID } = require("./generic_workflows.js"); // 对应 Go 同包常量，generic_workflows.js 本次一同翻译
+const { GenericDockerSandboxID } = require("./generic_workflows.js"); // 对应 Go 同包常量，generic_workflows.js 已翻译
 
+// 通用 Docker 沙箱的固定纪元时间戳（2026-01-01T00:00:00Z）。
 const genericDockerEpoch = new Date(Date.UTC(2026, 0, 1, 0, 0, 0, 0));
 
-// Go 的反引号原生字符串译为模板字符串，其中的反斜杠与 ${ 已转义。
+// 平台默认的通用后端容器沙箱 Dockerfile 正文（内置 Node 22、主流 Agent CLI、gcc 与 Go 工具链）。
 const genericBackendDockerfileContent = `FROM node:22-bookworm-slim
 
 ARG CLAUDE_CODE_PACKAGE=@anthropic-ai/claude-code
@@ -73,6 +84,12 @@ WORKDIR /workspace
 CMD ["sh", "-lc", "trap : TERM INT; sleep infinity & wait"]
 `;
 
+/**
+ * 构造平台共享的通用后端 Docker 沙箱配置档案。
+ * 作为通用 SOP 的默认绑定沙箱，以及数据库中默认沙箱记录缺失时的内置回退配置。
+ *
+ * @returns {SandboxProfile} 内置通用后端 Docker 沙箱配置对象。
+ */
 function GenericDockerSandbox() {
   return new SandboxProfile({
     ID: GenericDockerSandboxID,

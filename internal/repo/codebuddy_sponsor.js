@@ -1,46 +1,64 @@
-// codebuddy_sponsor.js —— 对应 Go 文件：internal/repo/codebuddy_sponsor.go
-// 作用：平台共享 CodeBuddy Key 的存取：管理员配置的共享 Key，缺省时用赞助账号的 Key。
-// gorm 链式调用按原样保留；os.Getenv 译为 process.env。
+/**
+ * @file internal/repo/codebuddy_sponsor.js
+ * 对应 Go 源文件：internal/repo/codebuddy_sponsor.go
+ *
+ * 作用与职责边界：
+ * 实现平台共享 CodeBuddy API Key 的数据结构与持久化读写逻辑，挂载在 `UsersRepo` 原型上。
+ * 未配置个人 CodeBuddy Key 的用户在对话与 SOP 运行时可借用管理员在平台管理中配置的共享 Key，
+ * 若未配置共享 Key 则回退到环境变量 `AGENTFLOW_ASSISTANT_SPONSOR_LOGIN` 指定的历史赞助账号 Key。
+ * API Key 仅存储在数据库中供服务端内部使用，对外管理状态结构永不回传明文 Key。
+ *
+ * 语法差异说明：
+ * - `UsersRepo` 定义于 `repo.js`，本文件通过 `UsersRepo.prototype` 挂载共享 Key 相关方法。
+ * - Go 的 `error` 返回统一按成功无返回值（`undefined`）、失败 `throw err` 处理；`(值, bool)` 译为 `[值, boolean]` 元组。
+ * - Go 的 `os.Getenv` 译为 `process.env`；`gorm` 链式调用与 `clause.OnConflict` 按原样保留。
+ * - Go 结构体切片字段（如 `Models`）的零值统一初始化为空数组 `[]`。
+ */
 
 "use strict";
 
 const clause = require("gorm.io/gorm/clause"); // Go 第三方包 gorm.io/gorm/clause
 
 const { User } = require("../domain/user.js"); // 对应 Go 的 domain.User，user.js 已翻译
-const { UsersRepo } = require("./repo.js"); // 对应 Go 同包类型，repo.js 待翻译
+const { UsersRepo } = require("./repo.js"); // 对应 Go 同包类型，repo.js 已翻译
 
-// Users who have not configured their own CodeBuddy API Key use the shared
-// key a platform administrator configured under 平台管理, limited to the
-// models the administrator allowed. It covers chat conversations and SOP
-// runs, so a new user can start working before configuring anything;
-// scheduled prompts, reports, bots and run evaluation keep requiring the
-// user's own key.
-//
-// Older deployments lent the key of the account named by
-// AGENTFLOW_ASSISTANT_SPONSOR_LOGIN instead, limited to
-// SponsoredCodeBuddyModel. That still applies while no shared key is
-// configured.
+// 未配置个人 CodeBuddy API Key 的用户使用平台管理员在平台管理中配置的共享 Key（受允许模型白名单限制），
+// 覆盖聊天对话与 SOP 运行；定时任务、报告、Bot 与运行评测仍需用户个人 Key。
+// 旧版部署在未配置共享 Key 时借用环境变量 AGENTFLOW_ASSISTANT_SPONSOR_LOGIN 对应账号的 Key，并限定使用 SponsoredCodeBuddyModel。
 const CodeBuddySponsorLoginEnv = "AGENTFLOW_ASSISTANT_SPONSOR_LOGIN";
 const SponsoredCodeBuddyModel = "deepseek-v4.1-flash";
-// MaxSharedCodeBuddyModels bounds the allow list of the shared key.
+// 平台共享 Key 允许配置的模型白名单数量上限。
 const MaxSharedCodeBuddyModels = 32;
 
-// SharedCodeBuddyKey is the key users without their own borrow.
+/**
+ * 表示未配置个人 Key 的用户可借用的共享 CodeBuddy 凭据配置。
+ * 包含 API Key、网络环境、允许使用的模型列表（首项为默认模型）及历史赞助账号 ID。
+ */
 class SharedCodeBuddyKey {
+  /**
+   * 构造并初始化共享 CodeBuddy Key 实例，未提供的字段按 Go 零值填充。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.APIKey = init.APIKey ?? "";
     this.InternetEnvironment = init.InternetEnvironment ?? "";
-    // Models are the models it may run; the first is the default.
-    this.Models = init.Models ?? null;
-    // SponsorID is the lending account under AGENTFLOW_ASSISTANT_SPONSOR_LOGIN,
-    // 0 for the key configured under 平台管理.
+    // Models 为允许调用的模型列表，第一项为默认模型。
+    this.Models = init.Models ?? [];
+    // SponsorID 为历史赞助账号 ID；使用平台管理配置的共享 Key 时为 0。
     this.SponsorID = init.SponsorID ?? 0;
   }
 
-  // Model returns the model a shared-key turn runs: the requested model when it
-  // is allowed, the default when none is requested, and false otherwise.
+  /**
+   * 根据请求模型名解析本次共享 Key 回合应使用的模型。
+   * 未指定时返回默认模型（列表首项）；指定且在白名单内时原样返回；白名单为空或不在白名单内时返回未命中。
+   *
+   * @param {string} requested - 调用方请求的模型标识（可为空）。
+   * @returns {[string, boolean]} 返回 `[解析出的模型标识, 是否允许使用]`。
+   */
   Model(requested) {
-    if ((this.Models ?? []).length === 0) {
+    if (this.Models.length === 0) {
       return ["", false];
     }
     requested = requested.trim();
@@ -56,9 +74,17 @@ class SharedCodeBuddyKey {
   }
 }
 
-// The key is stored like personal CodeBuddy keys in user_configs: the
-// database is the trust boundary, and the key is never returned by the API.
+/**
+ * 对应数据库表 `platform_codebuddy_keys` 的单行持久化模型。
+ * 表中至多保存主键为 `platformCodeBuddyKeyID` 的一行记录，Key 明文不经 API 暴露。
+ */
 class platformCodeBuddyKeyRow {
+  /**
+   * 构造并初始化平台共享 Key 数据库行模型。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.ID = init.ID ?? 0;
     this.APIKey = init.APIKey ?? "";
@@ -68,42 +94,67 @@ class platformCodeBuddyKeyRow {
     this.Updated = init.Updated ?? null;
   }
 
+  /**
+   * 返回对应的数据库表名 `"platform_codebuddy_keys"`。
+   *
+   * @returns {string} 数据库表名。
+   */
   TableName() {
     return "platform_codebuddy_keys";
   }
 }
 
-// The table holds at most this one row.
+// `platform_codebuddy_keys` 表仅保存这一条固定主键记录。
 const platformCodeBuddyKeyID = 1;
 
-// PlatformCodeBuddyKeyStatus is what administrators see; it never carries the key.
+/**
+ * 面向平台管理员展示的共享 CodeBuddy Key 状态视图，永不包含明文 API Key。
+ */
 class PlatformCodeBuddyKeyStatus {
+  /**
+   * 构造并初始化共享 Key 状态视图对象，未提供的字段按 Go 零值填充。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.Configured = init.Configured ?? false;
     this.InternetEnvironment = init.InternetEnvironment ?? "";
-    this.Models = init.Models ?? null;
+    this.Models = init.Models ?? [];
     this.UpdatedAt = init.UpdatedAt ?? null;
     this.UpdatedBy = init.UpdatedBy ?? "";
-    // LegacySponsor is the account named by AGENTFLOW_ASSISTANT_SPONSOR_LOGIN
-    // whose key is lent while no shared key is configured here.
+    // 未配置共享 Key 时借用的历史赞助账号登录名与限定模型。
     this.LegacySponsor = init.LegacySponsor ?? "";
     this.LegacySponsorModel = init.LegacySponsorModel ?? "";
   }
 }
 
-// PlatformCodeBuddyKeyUpdate replaces the shared key settings. An empty
-// APIKey keeps the stored key. Models must already be validated.
+/**
+ * 管理员更新平台共享 CodeBuddy Key 配置的入参结构。
+ * `APIKey` 为空串时保留当前已存 Key；`Models` 应由调用方提前完成校验。
+ */
 class PlatformCodeBuddyKeyUpdate {
+  /**
+   * 构造并初始化共享 Key 更新入参对象，未提供的字段按 Go 零值填充。
+   *
+   * @param {Object} [init={}] - 可选初始字段映射。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.APIKey = init.APIKey ?? "";
     this.InternetEnvironment = init.InternetEnvironment ?? "";
-    this.Models = init.Models ?? null;
+    this.Models = init.Models ?? [];
   }
 }
 
 const ErrSharedCodeBuddyKeyRequired = new Error("shared CodeBuddy API Key is required");
 const ErrSharedCodeBuddyModelsRequired = new Error("at least one shared CodeBuddy model is required");
 
+/**
+ * 读取数据库中唯一一行平台共享 CodeBuddy Key 记录。
+ *
+ * @returns {[platformCodeBuddyKeyRow, boolean]} 返回 `[行记录, 是否成功读到记录]`。
+ */
 UsersRepo.prototype.platformCodeBuddyKey = function () {
   const row = new platformCodeBuddyKeyRow();
   if (this == null || this.deps == null || this.DB == null) {
@@ -113,6 +164,13 @@ UsersRepo.prototype.platformCodeBuddyKey = function () {
   return [row, result.Error == null && result.RowsAffected > 0];
 };
 
+/**
+ * 将数据库存储的模型白名单 JSON 字符串反序列化为字符串数组。
+ * 解析失败时返回 `null`。
+ *
+ * @param {string} raw - 模型列表 JSON 文本。
+ * @returns {string[]|null} 模型标识数组，解析异常时返回 `null`。
+ */
 function decodeSharedModels(raw) {
   let models;
   try {
@@ -123,8 +181,11 @@ function decodeSharedModels(raw) {
   return models;
 }
 
-// legacyCodeBuddySponsor returns the account named by
-// AGENTFLOW_ASSISTANT_SPONSOR_LOGIN, if it exists and has a key.
+/**
+ * 读取环境变量 `AGENTFLOW_ASSISTANT_SPONSOR_LOGIN` 指定的历史赞助账号（要求用户存在且配置了非空 CodeBuddy Key）。
+ *
+ * @returns {[User, boolean]} 返回 `[赞助账号用户对象, 是否可用]`。
+ */
 UsersRepo.prototype.legacyCodeBuddySponsor = function () {
   const login = (process.env[CodeBuddySponsorLoginEnv] ?? "").trim();
   if (login === "" || this == null) {
@@ -137,8 +198,11 @@ UsersRepo.prototype.legacyCodeBuddySponsor = function () {
   return [sponsor, true];
 };
 
-// SharedCodeBuddyKey returns the key users without their own borrow: the one
-// configured under 平台管理, else the legacy sponsor account's.
+/**
+ * 获取当前生效的平台共享 CodeBuddy Key：优先使用平台管理中配置的共享 Key，未配置时回退到历史赞助账号的 Key。
+ *
+ * @returns {[SharedCodeBuddyKey, boolean]} 返回 `[共享 Key 配置对象, 是否存在可用共享 Key]`。
+ */
 UsersRepo.prototype.SharedCodeBuddyKey = function () {
   const [row, ok] = this.platformCodeBuddyKey();
   if (ok) {
@@ -154,8 +218,11 @@ UsersRepo.prototype.SharedCodeBuddyKey = function () {
   return [new SharedCodeBuddyKey({ APIKey: sponsor.CodeBuddyAPIKey, InternetEnvironment: sponsor.CodeBuddyInternetEnvironment, Models: [SponsoredCodeBuddyModel], SponsorID: sponsor.ID }), true];
 };
 
-// SharedCodeBuddyModels returns the models users without their own key may
-// use, the default first, or nil when there is no shared key.
+/**
+ * 返回无个人 Key 用户允许使用的共享模型列表（首项为默认模型）；若无共享 Key 则返回 `null`。
+ *
+ * @returns {string[]|null} 允许使用的模型标识列表，无可用共享 Key 时返回 `null`。
+ */
 UsersRepo.prototype.SharedCodeBuddyModels = function () {
   const [key, ok] = this.SharedCodeBuddyKey();
   if (ok) {
@@ -164,7 +231,11 @@ UsersRepo.prototype.SharedCodeBuddyModels = function () {
   return null;
 };
 
-// PlatformCodeBuddyKeyStatus describes the shared key for administrators.
+/**
+ * 组装面向平台管理员的共享 CodeBuddy Key 当前状态（含历史赞助账号回退信息），不暴露明文 API Key。
+ *
+ * @returns {PlatformCodeBuddyKeyStatus} 平台共享 Key 状态视图对象。
+ */
 UsersRepo.prototype.PlatformCodeBuddyKeyStatus = function () {
   const status = new PlatformCodeBuddyKeyStatus({ Models: [] });
   const [row, ok] = this.platformCodeBuddyKey();
@@ -189,10 +260,18 @@ UsersRepo.prototype.PlatformCodeBuddyKeyStatus = function () {
   return status;
 };
 
-// SetPlatformCodeBuddyKey saves the shared key settings.
+/**
+ * 保存或更新平台共享 CodeBuddy Key 配置。
+ * 要求模型白名单非空且最终 Key 非空（传入空 Key 时沿用库中已有 Key），通过主键冲突更新原子落盘。
+ *
+ * @param {PlatformCodeBuddyKeyUpdate} update - 待写入的共享 Key 与模型白名单配置。
+ * @param {number} actorID - 执行修改的平台管理员用户 ID。
+ * @returns {void} 无返回值。
+ * @throws {Error} 模型白名单为空、缺少有效 API Key、序列化失败或数据库写入失败时抛出错误。
+ */
 UsersRepo.prototype.SetPlatformCodeBuddyKey = function (update, actorID) {
   if (update.Models.length === 0) {
-    return ErrSharedCodeBuddyModelsRequired;
+    throw ErrSharedCodeBuddyModelsRequired;
   }
   const [row] = this.platformCodeBuddyKey();
   const key = update.APIKey.trim();
@@ -200,30 +279,35 @@ UsersRepo.prototype.SetPlatformCodeBuddyKey = function (update, actorID) {
     row.APIKey = key;
   }
   if (row.APIKey.trim() === "") {
-    return ErrSharedCodeBuddyKeyRequired;
+    throw ErrSharedCodeBuddyKeyRequired;
   }
-  let models;
-  try {
-    models = JSON.stringify(update.Models);
-  } catch (e) {
-    return e;
-  }
+  const models = JSON.stringify(update.Models);
   const now = new Date();
   row.ID = platformCodeBuddyKeyID;
   row.InternetEnvironment = update.InternetEnvironment;
   row.Models = models;
   row.UpdatedBy = actorID;
   row.Updated = now;
-  return this.DB.Clauses(new clause.OnConflict({
+  const err = this.DB.Clauses(new clause.OnConflict({
     Columns: [new clause.Column({ Name: "id" })],
     DoUpdates: clause.AssignmentColumns(["api_key", "internet_environment", "models", "updated_by", "updated_at"]),
   })).Create(row).Error;
+  if (err != null) {
+    throw err;
+  }
 };
 
-// ClearPlatformCodeBuddyKey removes the shared key; users without their own
-// key need one again (or fall back to the legacy sponsor account).
+/**
+ * 清除平台管理中配置的共享 CodeBuddy Key；清除后未配个人 Key 的用户将无法借用（或回退到历史赞助账号）。
+ *
+ * @returns {void} 无返回值。
+ * @throws {Error} 数据库删除失败时抛出错误。
+ */
 UsersRepo.prototype.ClearPlatformCodeBuddyKey = function () {
-  return this.DB.Where("id = ?", platformCodeBuddyKeyID).Delete(new platformCodeBuddyKeyRow()).Error;
+  const err = this.DB.Where("id = ?", platformCodeBuddyKeyID).Delete(new platformCodeBuddyKeyRow()).Error;
+  if (err != null) {
+    throw err;
+  }
 };
 
 module.exports = { CodeBuddySponsorLoginEnv, SponsoredCodeBuddyModel, MaxSharedCodeBuddyModels, SharedCodeBuddyKey, platformCodeBuddyKeyRow, platformCodeBuddyKeyID, PlatformCodeBuddyKeyStatus, PlatformCodeBuddyKeyUpdate, ErrSharedCodeBuddyKeyRequired, ErrSharedCodeBuddyModelsRequired, decodeSharedModels };
