@@ -1,6 +1,19 @@
-// run_ops.js —— 对应 Go 文件：internal/engine/run_ops.go
-// 作用：运行人工操作：取消、暂停、批准、通过、打回、重试与继续。
-// Go 返回 error 的 Engine 方法译为 throw；repo 方法按既有约定返回 err 或 [值, err]；context.Background() 译为 null；time.Time 零值译为 null；Go 的 map[string]bool 译为普通对象。
+/**
+ * @file internal/engine/run_ops.js
+ * 对应 Go 源文件：internal/engine/run_ops.go
+ *
+ * 作用与职责边界：
+ * 实现运行生命周期的人工与控制面操作，包括取消（`Cancel`）、暂停（`Pause`）、
+ * 人工门禁批准（`Approve`）、失败/暂停脚本节点通过（`Pass`）、打回返工（`Reject`）、
+ * 从中断或指定节点重试（`Retry`/`RetryContext`）、恢复已暂停运行（`ResumePaused`/`ResumePausedContext`）、
+ * 刷新已停止运行的 SOP 定义（`RefreshRunSOP`）以及拒绝重试（`DeclineRetry`）。
+ *
+ * 语法差异说明：
+ * - Go 的 `sync.Mutex`（`e.stateMu`）在单线程 JS 中省略；`context.Background()` 译为 `null`；`time.Time` 零值译为 `null`。
+ * - Go 的 `(值, error)` 与仅 `error` 返回（含全部 `this.repo.*` 调用）均按统一约定译为成功返回值（或无返回值 `undefined`）、失败 `throw err`。
+ * - Go 的 `map[string]bool`（含 `descendants()` 返回值）译为普通对象 `{}`，统一通过属性访问与 `Object.keys()` 读写。
+ * - Go 中异步取消子运行的 `go func()` 译为 `queueMicrotask`。
+ */
 
 "use strict";
 
@@ -9,7 +22,26 @@ const { NodeRun } = require("../domain/run.js"); // 对应 Go 的 domain.NodeRun
 const { TerminalRunStatus } = require("../domain/run_eval.js"); // 对应 Go 的 domain.TerminalRunStatus，run_eval.js 已翻译
 const { RunnerTaskQueued, RunnerTaskLeased, RunnerTaskRunning } = require("../domain/runner.js"); // 对应 Go 的 domain.RunnerTaskQueued/RunnerTaskLeased/RunnerTaskRunning，runner.js 已翻译
 const { AttachPreviewBuild } = require("../domain/preview_build.js"); // 对应 Go 的 domain.AttachPreviewBuild，preview_build.js 已翻译
+const { descendants, workflowForRun, replayUpstreamSucceeded, latestWorkflowDefinition, hasWaiting, readyNodes, allSucceeded, hasFailed } = require("./workflow_graph.js"); // 对应 Go 同包图函数，workflow_graph.js 已翻译
+const { isLiveStatus } = require("./workspace_cleanup.js"); // 对应 Go 同包函数，workspace_cleanup.js 已翻译
+const { checkNodeExpectation } = require("./bot_control.js"); // 对应 Go 同包函数，bot_control.js 已翻译
+const { forbidClosedGongfengIssue } = require("./node_outcome.js"); // 对应 Go 同包函数，node_outcome.js 已翻译
+const { recordHumanContext } = require("./human_context.js"); // 对应 Go 同包函数，human_context.js 已翻译
+const { appendArtifact } = require("./artifacts.js"); // 对应 Go 同包函数，artifacts.js 已翻译
+const { appendControlTelemetry } = require("./run_events.js"); // 对应 Go 同包函数，run_events.js 已翻译
+const { safeRunnerPath } = require("./runner_dispatch.js"); // 对应 Go 同包函数，runner_dispatch.js 已翻译
+const { configureBaselineAlignCLI } = require("./align.js"); // 对应 Go 同包函数，align.js 已翻译
 
+/**
+ * 持久化人工控制决策后的运行状态、推送实时变更，并按当前进程角色恢复本地调度或释放租约。
+ * 使用场景：由 `Approve`、`pass`、`Reject`、`retryContext`、`resumePaused` 在修改运行状态后统一收尾调用。
+ *
+ * @param {string} runID - 目标运行主键 ID。
+ * @param {object} r - 修改后的运行对象（`domain.Run`）。
+ * @param {...object} expected - 可选节点期望断言列表（`NodeExpectation`），非空时走修订号乐观锁写入。
+ * @returns {void} 无返回值。
+ * @throws {Error} 清除控制标志或写入运行记录失败时抛出错误。
+ */
 Engine.prototype.persistControlDecision = function (runID, r, ...expected) {
   if (r.Status === "running") {
     r.CancelRequested = false;
@@ -17,36 +49,38 @@ Engine.prototype.persistControlDecision = function (runID, r, ...expected) {
   }
   // pause_requested 不参与运行快照写入。只要本次决策本身释放了暂停就清除它，包括群组因无在途任务而继续等待的情况。
   if (expected.length === 0 && !r.PauseRequested && !r.CancelRequested) {
-    const err = this.repo.ClearRunControl(runID);
-    if (err != null) {
-      throw err;
-    }
+    this.repo.ClearRunControl(runID);
   }
-  let err;
   if (expected.length > 0) {
-    err = this.repo.PutRunAtRevision(r, r.Revision);
+    this.repo.PutRunAtRevision(r, r.Revision);
   } else {
-    err = this.repo.PutRun(r);
-  }
-  if (err != null) {
-    throw err;
+    this.repo.PutRun(r);
   }
   this.publish(runID);
   if (this.executes()) {
     this.resume(runID);
-    return null;
+    return;
   }
   if (r.OwnerInstanceID !== "") {
-    this.repo.ReleaseRunLease(runID, r.OwnerInstanceID, r.Generation);
+    try {
+      this.repo.ReleaseRunLease(runID, r.OwnerInstanceID, r.Generation);
+    } catch {}
   }
-  return null;
 };
 
+/**
+ * 取消指定运行及其存活子 SOP 运行：排队中直接取消，等待态同步终结，运行态持久化取消标志并中断或结算孤儿运行。
+ * 使用场景：操作员或上游流程主动终止运行。
+ *
+ * @param {string} runID - 目标运行主键 ID。
+ * @returns {void} 无返回值。
+ * @throws {Error} 运行不存在、运行已非活跃、持久化取消请求失败或取消 Runner 任务失败时抛出错误。
+ */
 Engine.prototype.Cancel = function (runID) {
   const cancelled = this.repo.CancelQueuedRun(runID);
   if (cancelled) {
     this.publish(runID);
-    return null;
+    return;
   }
   let [r, ok] = this.repo.RunState(runID);
   if (!ok) {
@@ -55,15 +89,11 @@ Engine.prototype.Cancel = function (runID) {
   if (!isLiveStatus(r.Status)) {
     if (TerminalRunStatus(r.Status) && r.HasActiveNode()) {
       this.forceTerminate(runID, "cancelled", "流水线已取消");
-      return null;
+      return;
     }
     throw new Error("run is not active");
   }
-  const [reqRun, reqErr] = this.repo.RequestRunCancel(runID);
-  if (reqErr != null) {
-    throw reqErr;
-  }
-  r = reqRun;
+  r = this.repo.RequestRunCancel(runID);
   const [full] = this.repo.RunState(runID);
   for (const childID of childRunIDs(full)) {
     const [child, childOk] = this.repo.RunState(childID);
@@ -82,33 +112,37 @@ Engine.prototype.Cancel = function (runID) {
   // 等待中的 Run 没有活动进程来确认请求。同步终结它，让审批/暂停记录总能从纯控制面 API 进程取消。
   if (r.Status === "waiting") {
     this.forceTerminate(runID, "cancelled", "流水线已取消");
-    return null;
+    return;
   }
   if (this.Interrupt(runID)) {
-    return null;
+    return;
   }
   this.notifyRunControl(runID);
   // 本进程没有调度协程。存活的外来租约说明归属 worker 已收到通知（续租时也会看到该标志）。
   if (r.OwnerInstanceID !== "" && r.LeaseUntil != null && r.LeaseUntil.getTime() > Date.now() && !this.ownsRun(r)) {
-    return null;
+    return;
   }
   try {
     r = this.acquireLease(r);
   } catch {
-    return null;
+    return;
   }
   this.settleOrphan(runID, "运行已被手动终止（调度协程不存在，可能由服务重启导致）");
-  this.repo.ReleaseRunLease(runID, this.instanceID, r.Generation);
-  return null;
+  try {
+    this.repo.ReleaseRunLease(runID, this.instanceID, r.Generation);
+  } catch {}
 };
 
-// Pause 中断活动节点，但不终结 Run、不销毁工作区。Worker 在人工决策点停下，操作员可补充上下文并继续被中断的节点。
+/**
+ * 暂停指定运行及其运行中的子 SOP 运行：中断当前活动节点但不终结运行、不销毁工作区，停在人工决策点等待补充上下文并继续。
+ * 使用场景：操作员需要临时介入正在执行的运行。
+ *
+ * @param {string} runID - 目标运行主键 ID。
+ * @returns {void} 无返回值。
+ * @throws {Error} 持久化暂停请求失败或取消 Runner 任务失败时抛出错误。
+ */
 Engine.prototype.Pause = function (runID) {
-  const [r0, err] = this.repo.RequestRunPause(runID);
-  if (err != null) {
-    throw err;
-  }
-  let r = r0;
+  let r = this.repo.RequestRunPause(runID);
   const [full] = this.repo.RunState(runID);
   for (const childID of childRunIDs(full)) {
     const [child, ok] = this.repo.RunState(childID);
@@ -125,22 +159,34 @@ Engine.prototype.Pause = function (runID) {
   }
   this.publish(runID);
   if (this.Interrupt(runID)) {
-    return null;
+    return;
   }
   this.notifyRunControl(runID);
   if (r.OwnerInstanceID !== "" && r.LeaseUntil != null && r.LeaseUntil.getTime() > Date.now() && !this.ownsRun(r)) {
-    return null;
+    return;
   }
   try {
     r = this.acquireLease(r);
   } catch {
-    return null;
+    return;
   }
   this.pauseAt(runID, r.Generation, "运行已由用户暂停");
-  this.repo.ReleaseRunLease(runID, this.instanceID, r.Generation);
-  return null;
+  try {
+    this.repo.ReleaseRunLease(runID, this.instanceID, r.Generation);
+  } catch {}
 };
 
+/**
+ * 批准处于 `waiting_approval` 状态的人工门禁节点，记录决策产物与人工上下文，并将运行重新置为 `running`。
+ * 使用场景：操作员通过界面或企微卡片批准审批节点。
+ *
+ * @param {string} runID - 目标运行主键 ID。
+ * @param {string} nodeID - 待批准的节点 ID。
+ * @param {string} humanContext - 操作员附加的说明上下文。
+ * @param {...object} expected - 可选节点期望断言（`NodeExpectation`）。
+ * @returns {void} 无返回值。
+ * @throws {Error} 运行不存在、工作区绑定阻塞、租约获取失败、断言不匹配、关联需求已关闭、节点未等待审批或持久化失败时抛出错误。
+ */
 Engine.prototype.Approve = function (runID, nodeID, humanContext, ...expected) {
   let [r, ok] = this.repo.RunState(runID);
   if (!ok) {
@@ -169,16 +215,36 @@ Engine.prototype.Approve = function (runID, nodeID, humanContext, ...expected) {
   this.event(r, nodeID, "gate.approved", "人工门禁已通过");
   appendControlTelemetry(r, nodeID, "gate.approved", "人工门禁已通过");
   r.Status = "running";
-  return this.persistControlDecision(runID, r, ...expected);
+  this.persistControlDecision(runID, r, ...expected);
 };
 
-// Pass 把失败（或已暂停）的节点标记为成功，让下游无需重新执行即可继续。onFailure=fail 后、打回返工耗尽后，或硬脚本在执行中途被暂停、从头重试也无济于事时（例如环境问题），操作员会用它——硬脚本否则可能永远卡住运行。
+/**
+ * 手动将失败或中途暂停的脚本节点标记为成功以放行下游，并在该运行为子 SOP 时自动唤醒父流程重新接上。
+ * 使用场景：`onFailure=fail`、返工次数耗尽或硬脚本在执行中途暂停且重跑无解时由操作员人工放行。
+ *
+ * @param {string} runID - 目标运行主键 ID。
+ * @param {string} nodeID - 待通过的脚本节点 ID（传空串时自动推断续跑节点）。
+ * @param {string} humanContext - 操作员附加的说明上下文。
+ * @param {...object} expected - 可选节点期望断言（`NodeExpectation`）。
+ * @returns {Promise<void>} 无返回值。
+ * @throws {Error} 校验不通过或持久化失败时抛出错误。
+ */
 Engine.prototype.Pass = async function (runID, nodeID, humanContext, ...expected) {
   this.pass(runID, nodeID, humanContext, ...expected);
   await this.resumeParentAfterChildRecovery(runID);
-  return null;
 };
 
+/**
+ * 执行人工通过脚本节点的核心状态更新与持久化逻辑。
+ * 使用场景：由 `Pass` 在内部调用。
+ *
+ * @param {string} runID - 目标运行主键 ID。
+ * @param {string} nodeID - 待通过的脚本节点 ID。
+ * @param {string} humanContext - 操作员附加的说明上下文。
+ * @param {...object} expected - 可选节点期望断言（`NodeExpectation`）。
+ * @returns {void} 无返回值。
+ * @throws {Error} 运行不存在、节点非失败/暂停脚本节点、断言失败或持久化失败时抛出错误。
+ */
 Engine.prototype.pass = function (runID, nodeID, humanContext, ...expected) {
   let [r, ok] = this.repo.RunState(runID);
   if (!ok) {
@@ -241,9 +307,19 @@ Engine.prototype.pass = function (runID, nodeID, humanContext, ...expected) {
   r.PauseRequested = false;
   r.Status = "running";
   markRunRelationsRunning(this.repo, r);
-  return this.persistControlDecision(runID, r, ...expected);
+  this.persistControlDecision(runID, r, ...expected);
 };
 
+/**
+ * 将工作流打回到目标节点：重置目标节点及其全部下游节点状态、累加返工次数、取消孤立子运行与并行兄弟执行。
+ * 使用场景：操作员在门禁或审查阶段要求打回上游节点返工。
+ *
+ * @param {string} runID - 目标运行主键 ID。
+ * @param {object} req - 打回请求对象（`domain.RejectRequest`，含 `NodeID`、`TargetID`、`Reason`、`Context`）。
+ * @param {...object} expected - 可选节点期望断言（`NodeExpectation`）。
+ * @returns {void} 无返回值。
+ * @throws {Error} 运行不存在、打回目标缺失/不存在、超出最大返工次数或持久化失败时抛出错误。
+ */
 Engine.prototype.Reject = function (runID, req, ...expected) {
   let [r, ok] = this.repo.RunState(runID);
   if (!ok) {
@@ -310,22 +386,50 @@ Engine.prototype.Reject = function (runID, req, ...expected) {
   this.cancelLiveChildRuns(stale);
   this.persistControlDecision(runID, r, ...expected);
   this.cancelNodeExecutions(runID, interrupted);
-  return null;
 };
 
-// Retry 从选定节点重开已停止的工作流，同时保留原运行、已成功的上游节点及其冻结产物。已成功的运行可能已清理工作区；这类运行会被复活，让操作员调整上下文后从某个节点重放。手动重试在节点已耗尽配置的自动尝试时恰好多给一次尝试。nodeID 为空时从中断的节点继续。
+/**
+ * 从选定节点（或自动推断的中断节点）重新打开已停止的工作流，保留已成功上游节点及其冻结产物；
+ * 若节点已耗尽自动尝试次数，手动重试会额外授予一次尝试机会。
+ * 使用场景：操作员在运行失败、取消、等待或成功后发起重试或重放。
+ *
+ * @param {string} runID - 目标运行主键 ID。
+ * @param {string} nodeID - 目标重跑节点 ID（为空时自动选择中断节点）。
+ * @param {string} reason - 重试原因说明。
+ * @param {string} humanContext - 操作员补充的上下文。
+ * @param {...object} expected - 可选节点期望断言（`NodeExpectation`）。
+ * @returns {Promise<void>} 无返回值。
+ * @throws {Error} 校验不通过、恢复检查点失败或持久化失败时抛出错误。
+ */
 Engine.prototype.Retry = async function (runID, nodeID, reason, humanContext, ...expected) {
-  return this.RetryContext(null, runID, nodeID, reason, humanContext, ...expected);
+  await this.RetryContext(null, runID, nodeID, reason, humanContext, ...expected);
 };
 
-// RetryContext 在恢复被回收的运行时复用调用方的工作区租约。
+/**
+ * 带上下文的重试入口，在恢复被回收工作区的运行时复用调用方租约，并在完成后自动唤醒因该子 SOP 失败的父流程。
+ * 使用场景：HTTP 或上层编排需要透传取消信号/工作区租约时调用。
+ *
+ * @param {AbortSignal|null} ctx - 取消信号。
+ * @param {string} runID - 目标运行主键 ID。
+ * @param {string} nodeID - 目标重跑节点 ID。
+ * @param {string} reason - 重试原因说明。
+ * @param {string} humanContext - 操作员补充的上下文。
+ * @param {...object} expected - 可选节点期望断言（`NodeExpectation`）。
+ * @returns {Promise<void>} 无返回值。
+ * @throws {Error} 校验不通过、恢复检查点失败或持久化失败时抛出错误。
+ */
 Engine.prototype.RetryContext = async function (ctx, runID, nodeID, reason, humanContext, ...expected) {
   await this.retryContext(ctx, runID, nodeID, reason, humanContext, "", ...expected);
   await this.resumeParentAfterChildRecoveryContext(ctx, runID);
-  return null;
 };
 
-// cancelLiveChildRuns 停止父节点已被重置、不再引用它们的子 SOP 运行，让它们既不再继续工作，也不再占用工作区。调用方持有 stateMu，Cancel 经 updateRun 结算时也要拿它，因此取消在调用方释放锁后执行。
+/**
+ * 异步取消已被父节点重置且不再被引用的子 SOP 运行，避免其继续执行或占用工作区。
+ * 使用场景：由 `Reject` 或 `retryContext` 在重置节点并释放状态锁后执行。
+ *
+ * @param {string[]} ids - 待检查并取消的子运行 ID 列表（允许包含空字符串）。
+ * @returns {void} 无返回值。
+ */
 Engine.prototype.cancelLiveChildRuns = function (ids) {
   const live = [];
   for (const id of ids) {
@@ -348,11 +452,25 @@ Engine.prototype.cancelLiveChildRuns = function (ids) {
   });
 };
 
-// resumeParentAfterChildRecovery 让因该子 SOP 运行失败的父流程在子流程被重试或通过后继续：父流程重放它的 SOP 节点，跟随恢复后的子流程，而不是新起一个。
+/**
+ * 在子 SOP 运行被重试或人工通过后，尝试自动唤醒因该子运行失败的父流程。
+ * 使用场景：由 `Pass` 在内部调用。
+ *
+ * @param {string} childID - 已恢复的子 SOP 运行 ID。
+ * @returns {Promise<void>} 无返回值。
+ */
 Engine.prototype.resumeParentAfterChildRecovery = async function (childID) {
   await this.resumeParentAfterChildRecoveryContext(null, childID);
 };
 
+/**
+ * 带上下文地向上级联唤醒因指定子 SOP 运行失败的父流程，使父流程重放对应 SOP 节点并继续跟随恢复后的子运行。
+ * 使用场景：由 `RetryContext` 和 `resumeParentAfterChildRecovery` 调用，支持多层嵌套 SOP 递归恢复。
+ *
+ * @param {AbortSignal|null} ctx - 取消信号。
+ * @param {string} childID - 已恢复的子 SOP 运行 ID。
+ * @returns {Promise<void>} 无返回值。
+ */
 Engine.prototype.resumeParentAfterChildRecoveryContext = async function (ctx, childID) {
   const [child, ok] = this.repo.RunState(childID);
   if (!ok) {
@@ -389,6 +507,20 @@ Engine.prototype.resumeParentAfterChildRecoveryContext = async function (ctx, ch
   await this.resumeParentAfterChildRecoveryContext(ctx, parentID);
 };
 
+/**
+ * 执行重试/重放的核心流程：校验状态与上游、必要时恢复已清理的工作区检查点、重置目标及下游与被取消的并行分支并重新调度。
+ * 使用场景：由 `RetryContext` 与 `resumeParentAfterChildRecoveryContext` 调用。
+ *
+ * @param {AbortSignal|null} ctx - 取消信号。
+ * @param {string} runID - 目标运行主键 ID。
+ * @param {string} nodeID - 目标节点 ID（为空时自动推断）。
+ * @param {string} reason - 重试原因说明。
+ * @param {string} humanContext - 操作员补充上下文（脚本节点会清空）。
+ * @param {string} keepChildRunID - 需要保留不被取消的既有子运行 ID（父流程接回已恢复子 SOP 时使用）。
+ * @param {...object} expected - 可选节点期望断言（`NodeExpectation`）。
+ * @returns {Promise<void>} 无返回值。
+ * @throws {Error} 校验不通过、工作区恢复失败、清理任务仍在运行或持久化失败时抛出错误。
+ */
 Engine.prototype.retryContext = async function (ctx, runID, nodeID, reason, humanContext, keepChildRunID, ...expected) {
   let [r, ok] = this.repo.RunState(runID);
   if (!ok) {
@@ -450,10 +582,7 @@ Engine.prototype.retryContext = async function (ctx, runID, nodeID, reason, huma
       if (exists) {
         switch (task.Status) {
           case RunnerTaskQueued: {
-            const err = this.repo.CancelRunnerTask(cleanupID, new Date());
-            if (err != null) {
-              throw err;
-            }
+            this.repo.CancelRunnerTask(cleanupID, new Date());
             break;
           }
           case RunnerTaskLeased:
@@ -462,10 +591,7 @@ Engine.prototype.retryContext = async function (ctx, runID, nodeID, reason, huma
         }
       }
     }
-    const resetErr = this.repo.ResetRunWorkspaceCleanup(runID);
-    if (resetErr != null) {
-      throw resetErr;
-    }
+    this.repo.ResetRunWorkspaceCleanup(runID);
     r.WorkspaceCleanedAt = null;
     if (this.executes()) {
       try {
@@ -565,7 +691,9 @@ Engine.prototype.retryContext = async function (ctx, runID, nodeID, reason, huma
     if (found && issue.Status !== "done" && issue.Status !== "closed") {
       issue.Status = "in_progress";
       issue.UpdatedAt = new Date();
-      this.repo.PutIssue(issue);
+      try {
+        this.repo.PutIssue(issue);
+      } catch {}
     }
   }
   const taskID = r.ExecutionContext.TaskID;
@@ -574,19 +702,40 @@ Engine.prototype.retryContext = async function (ctx, runID, nodeID, reason, huma
     if (found) {
       task.Status = "running";
       task.UpdatedAt = new Date();
-      this.repo.PutTask(task);
+      try {
+        this.repo.PutTask(task);
+      } catch {}
     }
   }
   this.cancelLiveChildRuns(stale);
-  return this.persistControlDecision(runID, r, ...expected);
+  this.persistControlDecision(runID, r, ...expected);
 };
 
-// ResumePaused 继续所有被操作员暂停打断的节点。它与 Retry 是分开的操作，普通审批门禁不受影响。与父流程一起暂停的子 SOP 运行随父流程一起恢复。先恢复子流程，让恢复后的父流程不会等一个仍暂停的子流程。
+/**
+ * 恢复因操作员暂停而中断的全部节点（不影响普通人工审批门禁）；会先递归恢复一并暂停的子 SOP 运行。
+ * 使用场景：操作员在暂停状态下点击继续运行。
+ *
+ * @param {string} runID - 目标运行主键 ID。
+ * @param {string} humanContext - 操作员补充的上下文。
+ * @param {...object} expected - 可选节点期望断言（`NodeExpectation`）。
+ * @returns {Promise<void>} 无返回值。
+ * @throws {Error} 子 SOP 仍在停止中、工作区恢复失败、断言不匹配或持久化失败时抛出错误。
+ */
 Engine.prototype.ResumePaused = async function (runID, humanContext, ...expected) {
-  return this.ResumePausedContext(null, runID, humanContext, ...expected);
+  await this.ResumePausedContext(null, runID, humanContext, ...expected);
 };
 
-// ResumePausedContext 在恢复被暂停的 SOP 时保留工作区归属。
+/**
+ * 带上下文地恢复被暂停的运行，先恢复所有已暂停子 SOP 与会话工作区，再推进当前运行状态。
+ * 使用场景：需要透传取消信号或工作区归属上下文时调用。
+ *
+ * @param {AbortSignal|null} ctx - 取消信号。
+ * @param {string} runID - 目标运行主键 ID。
+ * @param {string} humanContext - 操作员补充的上下文。
+ * @param {...object} expected - 可选节点期望断言（`NodeExpectation`）。
+ * @returns {Promise<void>} 无返回值。
+ * @throws {Error} 校验不通过、子 SOP 恢复失败、工作区恢复失败或持久化失败时抛出错误。
+ */
 Engine.prototype.ResumePausedContext = async function (ctx, runID, humanContext, ...expected) {
   if (expected.length > 0) {
     const [r, ok] = this.repo.RunState(runID);
@@ -619,10 +768,16 @@ Engine.prototype.ResumePausedContext = async function (ctx, runID, humanContext,
     }
   }
   await this.RestoreConversationWorkspaceIfNeeded(ctx, runID);
-  return this.resumePaused(runID, humanContext, ...expected);
+  this.resumePaused(runID, humanContext, ...expected);
 };
 
-// childRunIDs 列出运行的 SOP 节点引用的子 SOP 运行。
+/**
+ * 列出运行内所有节点引用的非空子 SOP 运行 ID，并按字典序排序。
+ * 使用场景：`Cancel` / `Pause` 级联操作子 SOP 时枚举子运行。
+ *
+ * @param {object} r - 运行对象（`domain.Run`）。
+ * @returns {string[]} 排序后的子运行 ID 数组。
+ */
 function childRunIDs(r) {
   const ids = [];
   for (const nr of Object.values(r.Nodes)) {
@@ -634,6 +789,16 @@ function childRunIDs(r) {
   return ids;
 }
 
+/**
+ * 执行恢复暂停运行的核心状态更新：确认远端 Runner 任务已退出、收集暂停节点（含切回 SOP 检查点或无打断节点的图）、注入补充上下文并重新调度。
+ * 使用场景：由 `ResumePausedContext` 在内部调用。
+ *
+ * @param {string} runID - 目标运行主键 ID。
+ * @param {string} humanContext - 操作员补充的上下文。
+ * @param {...object} expected - 可选节点期望断言（`NodeExpectation`）。
+ * @returns {void} 无返回值。
+ * @throws {Error} 运行未处于暂停态、工作区被阻塞、远端任务仍在退出、无可恢复节点或持久化失败时抛出错误。
+ */
 Engine.prototype.resumePaused = function (runID, humanContext, ...expected) {
   let [r, ok] = this.repo.RunState(runID);
   if (!ok) {
@@ -646,8 +811,10 @@ Engine.prototype.resumePaused = function (runID, humanContext, ...expected) {
   if (this.executes() && this.workspaceBlocked(r)) {
     throw new Error(`run ${runID} 的工作区绑定在 ${r.WorkspaceHost}:${r.WorkspaceRoot}，请在绑定实例上继续`);
   }
-  const [activeRunnerTasks, err] = this.repo.ActiveRunnerTasksForRun(runID);
-  if (err != null) {
+  let activeRunnerTasks;
+  try {
+    activeRunnerTasks = this.repo.ActiveRunnerTasksForRun(runID);
+  } catch (err) {
     throw new Error(`check runner tasks: ${err.message}`);
   }
   if (activeRunnerTasks.length > 0) {
@@ -690,7 +857,8 @@ Engine.prototype.resumePaused = function (runID, humanContext, ...expected) {
     if (r.Status === "running") {
       markRunRelationsRunning(this.repo, r);
     }
-    return this.persistControlDecision(runID, r, ...expected);
+    this.persistControlDecision(runID, r, ...expected);
+    return;
   }
   if (this.executes()) {
     r = this.acquireLease(r);
@@ -738,10 +906,17 @@ Engine.prototype.resumePaused = function (runID, humanContext, ...expected) {
   this.event(r, paused[0], "run.resumed", message);
   appendControlTelemetry(r, paused[0], "run.resumed", message);
   markRunRelationsRunning(this.repo, r);
-  return this.persistControlDecision(runID, r, ...expected);
+  this.persistControlDecision(runID, r, ...expected);
 };
 
-// RefreshRunSOP 把已停止运行的冻结图换成最新发布的 SOP。同 ID 已完成的节点保留结果，新节点从 pending 开始，已落地的沙箱保持冻结。
+/**
+ * 将已停止运行中冻结的工作流快照更新为最新发布的 SOP 定义：同 ID 已完成节点保留结果、新节点初始化为 `pending`，原有沙箱配置保持冻结。
+ * 使用场景：SOP 修复后操作员在不新建运行的前提下刷新已停止运行的流程定义。
+ *
+ * @param {string} runID - 目标运行主键 ID。
+ * @returns {void} 无返回值。
+ * @throws {Error} 运行不存在、运行仍在活动中、工作流不存在、预览构建装配失败或持久化失败时抛出错误。
+ */
 Engine.prototype.RefreshRunSOP = function (runID) {
   let [r, ok] = this.repo.RunState(runID);
   if (!ok) {
@@ -761,7 +936,7 @@ Engine.prototype.RefreshRunSOP = function (runID) {
   const previousVersion = r.WorkflowSnapshot.Version;
   const previousRevision = r.WorkflowSnapshot.Revision;
   if (previousVersion === latest.Version && previousRevision === latest.Revision) {
-    return null;
+    return;
   }
   // 图/角色更新不得悄悄替换已有工作区之下的环境。新运行会取最新的沙箱资产。
   latest.SandboxProfileID = r.WorkflowSnapshot.SandboxProfileID;
@@ -777,19 +952,29 @@ Engine.prototype.RefreshRunSOP = function (runID) {
   const message = `已更新为最新 SOP：v${previousVersion} #${previousRevision} → v${latest.Version} #${latest.Revision}（保留当前运行环境）`;
   this.event(r, "", "run.workflow_refreshed", message);
   appendControlTelemetry(r, "", "run.workflow_refreshed", message);
-  const err = this.repo.PutRun(r);
-  if (err != null) {
-    throw err;
-  }
+  this.repo.PutRun(r);
   this.publish(runID);
-  return null;
 };
 
+/**
+ * 判断节点是否因操作员主动暂停而停在 `waiting_approval` 状态。
+ * 使用场景：区分用户暂停节点与普通人工审批门禁节点。
+ *
+ * @param {object|null} nr - 节点运行状态对象（`domain.NodeRun`）。
+ * @returns {boolean} 处于等待审批且活动文案包含“用户暂停”时返回 `true`，否则返回 `false`。
+ */
 function isUserPausedNode(nr) {
   return nr != null && nr.Status === "waiting_approval" && nr.Activity.includes("用户暂停");
 }
 
-// resumeUnpausedGraph 清除没有打断节点的暂停。人工门禁仍会挡住：恢复不得批准它。否则已完成的 SOP 回到调度器等它终结，待办工作继续，空闲群组回到等待下一个任务。
+/**
+ * 清除未实际打断任何节点的暂停状态：若存在普通人工审批门禁则拒绝恢复；否则将运行恢复为 `running`（或空闲自由协作保持 `waiting`）。
+ * 使用场景：暂停落在步骤刚完成或群组空闲时由 `resumePaused` 调用。
+ *
+ * @param {object|null} r - 待恢复的运行对象（`domain.Run`，会被就地修改）。
+ * @returns {boolean} 成功恢复返回 `true`，存在阻塞门禁或无法推进返回 `false`。
+ * @throws {Error} 传入运行对象为空时抛出错误。
+ */
 function resumeUnpausedGraph(r) {
   if (r == null) {
     throw new Error("run not found");
@@ -817,6 +1002,13 @@ function resumeUnpausedGraph(r) {
   return false;
 }
 
+/**
+ * 判断工作流节点定义是否为脚本或命令节点。
+ * 使用场景：`pass`、`retryContext`、`resumePaused` 区分脚本节点与 Agent 节点。
+ *
+ * @param {object|null} node - 工作流节点定义对象（`domain.WorkflowNode`）。
+ * @returns {boolean} 节点类型为 `"script"` 或 `"command"` 时返回 `true`，否则返回 `false`。
+ */
 function isScriptNode(node) {
   if (node == null) {
     return false;
@@ -824,6 +1016,14 @@ function isScriptNode(node) {
   return node.Type === "script" || node.Type === "command";
 }
 
+/**
+ * 将运行关联的需求（若未完成/未关闭）和任务状态同步更新回进行中/运行中。
+ * 使用场景：人工通过或恢复暂停使运行重新进入 `running` 状态时同步外部关联状态。
+ *
+ * @param {object} st - 仓储 Store 实例。
+ * @param {object} r - 运行对象（`domain.Run`）。
+ * @returns {void} 无返回值。
+ */
 function markRunRelationsRunning(st, r) {
   const issueID = r.ExecutionContext.IssueID;
   if (issueID !== "") {
@@ -831,7 +1031,9 @@ function markRunRelationsRunning(st, r) {
     if (found && issue.Status !== "done" && issue.Status !== "closed") {
       issue.Status = "in_progress";
       issue.UpdatedAt = new Date();
-      st.PutIssue(issue);
+      try {
+        st.PutIssue(issue);
+      } catch {}
     }
   }
   const taskID = r.ExecutionContext.TaskID;
@@ -840,13 +1042,25 @@ function markRunRelationsRunning(st, r) {
     if (found) {
       task.Status = "running";
       task.UpdatedAt = new Date();
-      st.PutTask(task);
+      try {
+        st.PutTask(task);
+      } catch {}
     }
   }
 }
 
+/**
+ * 在对话轮次耗尽等待确认时由人工选择不重试：将对应节点及整个运行标记为 `failed` 并持久化。
+ * 使用场景：操作员在交互确认卡片上点击“不重试”按钮。
+ *
+ * @param {string} runID - 目标运行主键 ID。
+ * @param {string} nodeID - 处于 `waiting_approval` 的节点 ID。
+ * @param {...object} expected - 可选节点期望断言（`NodeExpectation`）。
+ * @returns {void} 无返回值。
+ * @throws {Error} 运行不存在、断言不匹配、节点未等待确认或持久化失败时抛出错误。
+ */
 Engine.prototype.DeclineRetry = function (runID, nodeID, ...expected) {
-  let [r, ok] = this.repo.RunState(runID);
+  const [r, ok] = this.repo.RunState(runID);
   if (!ok) {
     throw new Error("run not found");
   }
@@ -864,19 +1078,23 @@ Engine.prototype.DeclineRetry = function (runID, nodeID, ...expected) {
   this.event(r, nodeID, "agent.turns.declined", "人工选择不重试本节点");
   appendControlTelemetry(r, nodeID, "agent.turns.declined", "人工选择不重试本节点");
   r.Status = "failed";
-  let err;
   if (expected.length > 0) {
-    err = this.repo.PutRunAtRevision(r, r.Revision);
+    this.repo.PutRunAtRevision(r, r.Revision);
   } else {
-    err = this.repo.PutRun(r);
-  }
-  if (err != null) {
-    throw err;
+    this.repo.PutRun(r);
   }
   this.publish(runID);
-  return null;
 };
 
+/**
+ * 在打回或重试重置节点集合时，用当前最新工作流定义覆盖这些待重跑节点的 Agent/执行器/产物/重试配置，同时同步提升快照版本号。
+ * 使用场景：由 `Reject` 与 `retryContext` 调用，使重跑节点生效最新绑定配置而不影响已完成节点。
+ *
+ * @param {object|null} st - 仓储 Store 实例。
+ * @param {object|null} r - 运行对象（`domain.Run`，其 `WorkflowSnapshot` 会被就地更新）。
+ * @param {Object<string, boolean>} nodeIDs - 待覆盖的节点 ID 集合（普通对象）。
+ * @returns {void} 无返回值。
+ */
 function overlayLatestNodeBindings(st, r, nodeIDs) {
   if (st == null || r == null || Object.keys(nodeIDs).length === 0) {
     return;
@@ -922,6 +1140,13 @@ function overlayLatestNodeBindings(st, r, nodeIDs) {
   }
 }
 
+/**
+ * 自动推断未指定节点时的续跑目标节点 ID：优先选首个已取消或失败的节点，其次选首个就绪节点，最后兜底选首个未成功节点。
+ * 使用场景：`pass` 与 `retryContext` 在调用方传入空 `nodeID` 时定位续跑起点。
+ *
+ * @param {object} r - 运行对象（`domain.Run`）。
+ * @returns {string} 推断出的节点 ID；所有节点均已成功或无节点时返回 `""`。
+ */
 function resumeNodeID(r) {
   const wf = r.WorkflowSnapshot;
   const order = [];

@@ -1,6 +1,7 @@
 // prompt.js —— 对应 Go 文件：internal/engine/prompt.go
-// 作用：节点提示词渲染：角色任务书、占位符替换与上游输出、产物约定拼接。
-// strings.Builder 译为字符串数组拼接；(值, bool) 译为 [值, bool]。
+// 作用：节点提示词渲染，负责编译角色任务书、替换运行期占位符、拼接上游输出/人工上下文/需求身份/自由协作交接说明及产物契约。
+// 职责边界：仅负责提示词文本的纯拼装与占位符替换；不负责提示词落盘、执行器调用或门禁指令追加。
+// 语法差异说明：strings.Builder 译为字符串数组拼接；(值, bool) 译为 [值, boolean]；Go 的字符串字节截取译为 UTF-16 码元 slice。
 
 "use strict";
 
@@ -9,13 +10,33 @@ const { Artifact } = require("../domain/run.js"); // 对应 Go 的 domain.Artifa
 const { RepositoryProviderSSH, RepositoryProviderHTTPS, GitOnlyRepositoryProvider } = require("../domain/project.js"); // 对应 Go 的 domain.RepositoryProviderSSH/RepositoryProviderHTTPS/GitOnlyRepositoryProvider，project.js 已翻译
 const { workflowAgent } = require("./assets.js"); // 对应 Go 同包函数，assets.js 已翻译
 const { artifactPromptBody } = require("./artifacts.js"); // 对应 Go 同包函数，artifacts.js 已翻译
-const { repositoryBaseBranch } = require("./repository_workspace.js"); // 对应 Go 同包函数，repository_workspace.js 本批翻译
-const { sopHandoffInputPath } = require("./legacy_handoff.js"); // 对应 Go 同包函数，legacy_handoff.js 待翻译
+const { repositoryBaseBranch } = require("./repository_workspace.js"); // 对应 Go 同包函数，repository_workspace.js 已翻译
+const { sopHandoffInputPath } = require("./legacy_handoff.js"); // 对应 Go 同包函数，legacy_handoff.js 已翻译
 
+/**
+ * 不依赖持久化仓库，使用给定角色提示词直接渲染节点提示词。
+ * 在预览渲染或测试场景下调用。
+ *
+ * @param {Object} wf - 工作流定义对象（domain.WorkflowDefinition）。
+ * @param {Object} node - 工作流节点定义（domain.WorkflowNode）。
+ * @param {string} rolePrompt - 角色原始提示词文本。
+ * @param {Object} run - 运行对象（domain.Run）。
+ * @returns {string} 替换全部占位符后的完整提示词。
+ */
 function renderPromptSpec(wf, node, rolePrompt, run) {
   return applyPromptPlaceholders(null, wf, node, new AgentDefinition({ Prompt: rolePrompt }), run);
 }
 
+/**
+ * 从数据仓库解析节点对应的角色定义并渲染完整节点提示词。
+ * 在 Agent 节点执行前（node_execute.js）调用。
+ *
+ * @param {Object|null} st - 数据仓库实例（repo.Store）。
+ * @param {Object} wf - 工作流定义对象（domain.WorkflowDefinition）。
+ * @param {Object} node - 工作流节点定义（domain.WorkflowNode）。
+ * @param {Object} run - 运行对象（domain.Run）。
+ * @returns {string} 渲染完成的节点提示词文本。
+ */
 function renderPromptWithStore(st, wf, node, run) {
   let role = null;
   if (st != null) {
@@ -27,12 +48,23 @@ function renderPromptWithStore(st, wf, node, run) {
   return applyPromptPlaceholders(st, wf, node, role, run);
 }
 
+/**
+ * 将角色任务书模板与运行期上下文（输入、仓库、MR 说明、上游输出、产物、人工补充、需求身份、协作交接等）合并渲染。
+ * 作为 renderPromptSpec 与 renderPromptWithStore 的核心实现。
+ *
+ * @param {Object|null} st - 数据仓库实例（repo.Store，可为 null）。
+ * @param {Object} wf - 工作流定义对象（domain.WorkflowDefinition）。
+ * @param {Object} node - 工作流节点定义（domain.WorkflowNode）。
+ * @param {AgentDefinition|null} role - 解析到的角色定义对象（可为 null）。
+ * @param {Object} run - 运行对象（domain.Run）。
+ * @returns {string} 替换全部占位符并追加必要上下文段落后的提示词。
+ */
 function applyPromptPlaceholders(st, wf, node, role, run) {
   let prompt = "";
   if (role != null && role.Prompt.trim() !== "") {
     prompt = compileTaskPrompt(node, role.Name, role.Prompt, role.Verification);
   }
-  // 角色提示词可能没引用 {{input}}，不能悄悄丢掉本次运行输入。
+  // 角色提示词可能未显式引用 {{input}}，不能静默丢弃本次运行输入。
   if (run.Input.trim() !== "" && !prompt.includes("{{input}}")) {
     prompt += "\n\n## 本次运行输入\n\n{{input}}";
   }
@@ -105,7 +137,13 @@ function applyPromptPlaceholders(st, wf, node, role, run) {
   return prompt;
 }
 
-// promptRepositoryLine：渲染本次运行主仓库的 {{repository}} 占位符值。
+/**
+ * 渲染本次运行主仓库的 `{{repository}}` 占位符文本。
+ * 未绑定代码仓库时返回提示文案，否则返回仓库名、托管标识、远端基线与工作分支摘要。
+ *
+ * @param {Object} run - 运行对象（domain.Run）。
+ * @returns {string} 仓库摘要单行文本。
+ */
 function promptRepositoryLine(run) {
   if (run.Repository.RepositoryID === "") {
     return "未绑定代码仓库";
@@ -120,7 +158,15 @@ function promptRepositoryLine(run) {
   return `${run.Repository.Name} (${identity}), 最新远端基线 ${run.Repository.BaseBranch}, 本次工作分支 ${run.Repository.WorkBranch}`;
 }
 
-// upstreamNodeOutputs：按边顺序收集流入本节点的非空上游输出，并标注来源节点 ID。
+/**
+ * 按工作流边定义顺序收集流入当前节点的全部非空上游节点输出，并附带来源节点 ID 标签。
+ * 在 applyPromptPlaceholders 替换 `{{upstream}}` 占位符时调用。
+ *
+ * @param {Object} wf - 工作流定义对象（domain.WorkflowDefinition）。
+ * @param {Object} node - 当前工作流节点定义（domain.WorkflowNode）。
+ * @param {Object} run - 运行对象（domain.Run）。
+ * @returns {string[]} 格式化后的上游输出片段数组。
+ */
 function upstreamNodeOutputs(wf, node, run) {
   const upstream = [];
   for (const edge of wf.Edges) {
@@ -135,6 +181,13 @@ function upstreamNodeOutputs(wf, node, run) {
   return upstream;
 }
 
+/**
+ * 为纯 Git（SSH / HTTPS）代码仓库生成推送与 PR/MR 交付提示文本。
+ * 当运行包含纯 Git 仓库时在提示词中告知 Agent 凭据与推送约束。
+ *
+ * @param {Object} run - 运行对象（domain.Run）。
+ * @returns {string} 无纯 Git 仓库时返回空字符串，否则返回交付说明文本。
+ */
 function sshDeliveryHint(run) {
   const sshRepos = [];
   for (const repository of run.RepositoryContexts()) {
@@ -148,6 +201,14 @@ function sshDeliveryHint(run) {
   return "Git 仓库（" + sshRepos.join("、") + "）：只推本轮工作分支，并报告分支名和提交 SHA。SSH 密钥用于 Git 传输，HTTPS 凭据通过标准 credential helper 获取。需要 PR/MR 时，由负责交付的 Agent 自行查询托管平台官方 API，使用该主机访问令牌在内存中调用，不打印或保存令牌；也可使用已配置的托管平台 MCP。";
 }
 
+/**
+ * 生成 `{{existingMR}}` 占位符内容，兼顾纯 Git 仓库交付提示与托管平台已有 MR 提示。
+ * 在 applyPromptPlaceholders 中调用。
+ *
+ * @param {Object|null} st - 数据仓库实例（repo.Store）。
+ * @param {Object} run - 运行对象（domain.Run）。
+ * @returns {string} 合并后的 MR 交付说明文本。
+ */
 function existingMRBlurb(st, run) {
   const hint = sshDeliveryHint(run);
   if (hint === "") {
@@ -161,6 +222,14 @@ function existingMRBlurb(st, run) {
   return hint;
 }
 
+/**
+ * 为托管平台代码仓库生成已有 MR / 继续已有分支的操作指引文本。
+ * 区分“继续指定已有分支”与“独立工作分支”两种模式，并按需附带本轮已有的 mr-body 产物摘要。
+ *
+ * @param {Object|null} st - 数据仓库实例（保留参数以与 Go 签名一致）。
+ * @param {Object} run - 运行对象（domain.Run）。
+ * @returns {string} 托管仓库的 MR 操作指引文本。
+ */
 function hostedMRBlurb(st, run) {
   const continued = [];
   for (const repository of run.RepositoryContexts()) {
@@ -192,6 +261,15 @@ function hostedMRBlurb(st, run) {
   return "本轮还没有 MR。对当前工作分支 git push 后创建新 MR。";
 }
 
+/**
+ * 从运行的产物列表中查找指定节点与名称的最新一条产物（优先尝试次数更大，其次创建时间更晚）。
+ * 在 hostedMRBlurb 中查找最新 mr-body 产物时调用。
+ *
+ * @param {Object} run - 运行对象（domain.Run）。
+ * @param {string} nodeID - 产物来源节点 ID。
+ * @param {string} name - 产物名称。
+ * @returns {[Artifact, boolean]} 找到时返回 [最新产物对象, true]，否则返回 [空 Artifact, false]。
+ */
 function latestNamedArtifact(run, nodeID, name) {
   let best = new Artifact();
   let found = false;
@@ -207,6 +285,16 @@ function latestNamedArtifact(run, nodeID, name) {
   return [best, found];
 }
 
+/**
+ * 将角色名称、角色提示词、节点交付物清单、门禁要求与重试策略编译为结构化的“节点任务书”Markdown。
+ * 在 applyPromptPlaceholders 中作为提示词主干调用。
+ *
+ * @param {Object} node - 工作流节点定义（domain.WorkflowNode）。
+ * @param {string} roleName - 执行角色名称。
+ * @param {string} rolePrompt - 角色提示词正文。
+ * @param {Object[]} gates - 角色配置的验证门禁列表（domain.VerificationGate[]）。
+ * @returns {string} 编译后的节点任务书 Markdown 文本。
+ */
 function compileTaskPrompt(node, roleName, rolePrompt, gates) {
   const b = [];
   b.push("# 节点任务书\n\n");
@@ -235,6 +323,15 @@ function compileTaskPrompt(node, roleName, rolePrompt, gates) {
   return b.join("");
 }
 
+/**
+ * 向提示词缓冲区写入一个带二级标题的正文段落；内容为空白时跳过。
+ * 在 compileTaskPrompt 拼装任务书各小节时调用。
+ *
+ * @param {string[]} b - 字符串片段数组缓冲区。
+ * @param {string} title - 段落二级标题。
+ * @param {string} value - 段落正文内容。
+ * @returns {void} 无返回值。
+ */
 function writePromptSection(b, title, value) {
   if (value.trim() === "") {
     return;
@@ -242,6 +339,15 @@ function writePromptSection(b, title, value) {
   b.push(`## ${title}\n\n${value}\n\n`);
 }
 
+/**
+ * 向提示词缓冲区写入一个带二级标题的无序列表；列表为空时跳过，自动过滤空白条目。
+ * 在 compileTaskPrompt 拼装交付物与门禁列表时调用。
+ *
+ * @param {string[]} b - 字符串片段数组缓冲区。
+ * @param {string} title - 列表二级标题。
+ * @param {string[]} values - 列表条目文本数组。
+ * @returns {void} 无返回值。
+ */
 function writePromptList(b, title, values) {
   if (values.length === 0) {
     return;
@@ -255,6 +361,15 @@ function writePromptList(b, title, values) {
   b.push("\n");
 }
 
+/**
+ * 在节点提示词末尾追加多仓库工作区目录布局说明与必填/可选产物契约清单。
+ * 在 Agent 节点执行前（node_execute.js）渲染完占位符后调用。
+ *
+ * @param {string} prompt - 已渲染的节点提示词正文。
+ * @param {Object} node - 工作流节点定义（domain.WorkflowNode）。
+ * @param {Object[]} repositories - 本次运行的代码仓库上下文列表（domain.RepositoryContext[]）。
+ * @returns {string} 追加工作区布局与产物契约后的完整提示词。
+ */
 function appendArtifactContract(prompt, node, repositories) {
   const b = [];
   b.push(prompt);
