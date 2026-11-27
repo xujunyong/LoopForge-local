@@ -1,6 +1,17 @@
-// command_binding.js —— 对应 Go 文件：internal/runtime/command_binding.go
-// 作用：给子命令绑定凭据与环境：清空宿主凭据、按绑定写入密钥、配置私有 HOME 与遥测。
-// Go 的 (值, error) 译为成功返回值、失败 throw；结构体按值复制译为对象浅复制。
+/**
+ * @file internal/runtime/command_binding.js
+ * @description 对应 Go 源文件：internal/runtime/command_binding.go
+ *
+ * 职责与边界：
+ * 负责子命令执行前的凭据与运行环境绑定：清空宿主敏感凭据、按声明的绑定类型注入目标凭据、
+ * 准备并校验工作区私有 HOME/TMP 目录、配置 Git 实时凭据中继与身份信息、设置 OpenTelemetry 遥测变量。
+ * 不负责底层沙箱进程拉起或具体 CLI 配置渲染（Agent CLI 凭据渲染见 `agent_cli.js`）。
+ *
+ * 语法差异说明：
+ * - Go 的 `(值, error)` 译为成功返回值、失败抛出 `Error`；仅 `error` 译为成功返回 `undefined`、失败抛出 `Error`。
+ * - Go 的 `(值1, 值2, error)` 译为成功返回 `[值1, 值2]`、失败抛出 `Error`。
+ * - Go 结构体按值复制译为对象浅拷贝 `{ ...command }`；`context.Context` 对应 `AbortSignal`。
+ */
 
 "use strict";
 
@@ -24,6 +35,14 @@ const { unwrapSandbox } = require("./browser.js"); // 对应 Go 同包函数，b
 const { processSandbox } = require("./sandbox_process.js"); // 对应 Go 同包类型，sandbox_process.js 待翻译
 const { localSandbox } = require("./sandbox_local.js"); // 对应 Go 同包类型，sandbox_local.js 待翻译
 
+/**
+ * 在 `KEY=VALUE` 形式的环境变量数组中更新或追加指定键（重复键仅保留首次替换项）。
+ *
+ * @param {string[]} env - 原始环境变量条目数组。
+ * @param {string} key - 环境变量名。
+ * @param {string} value - 新的环境变量值。
+ * @returns {string[]} 更新后的环境变量数组。
+ */
 function upsertEnv(env, key, value) {
   const prefix = key + "=";
   const out = [];
@@ -44,6 +63,17 @@ function upsertEnv(env, key, value) {
   return out;
 }
 
+/**
+ * 为待执行命令绑定运行环境与凭据：清空宿主敏感变量、创建并校验私有 HOME、
+ * 按 `CredentialBindings` 注入对应凭据与参数，最后注入钩子输出路径和遥测变量。
+ *
+ * @param {AbortSignal} ctx - 取消信号（对应 Go `context.Context`）。
+ * @param {Object} sandbox - 目标沙箱实例。
+ * @param {string} workspace - 宿主工作区目录路径。
+ * @param {Object} command - 待绑定的 `CommandSpec` 对象。
+ * @param {Object} credentials - 本次运行的 `RunCredentials` 凭据集合。
+ * @returns {Object} 绑定完成后的新 `CommandSpec` 对象；目录校验、凭据缺失或未知绑定类型时抛出 `Error`。
+ */
 function bindCommand(ctx, sandbox, workspace, command, credentials) {
   if (command.bindingsPrepared) {
     return command;
@@ -115,11 +145,7 @@ function bindCommand(ctx, sandbox, workspace, command, credentials) {
         dir = ".claude";
         key = "CLAUDE_CONFIG_DIR";
       }
-      try {
-        EnsureControlDirectory(workspace, "private-home", provider, dir);
-      } catch (err) {
-        throw err;
-      }
+      EnsureControlDirectory(workspace, "private-home", provider, dir);
       bound.environment[key] = path.join(bound.environment["HOME"], dir).split(path.sep).join("/");
     }
   }
@@ -144,7 +170,7 @@ function bindCommand(ctx, sandbox, workspace, command, credentials) {
         // 缺失的凭据特意导出为空字符串：子进程不得继承 AgentFlow 宿主进程自己的值，
         // 部署通过 Extra 凭据路由的变量尤其如此。
         for (const [envName, credName] of Object.entries(command.ExtraCredentialEnv ?? {})) {
-          bound.environment[envName] = credentials.Extra[credName];
+          bound.environment[envName] = (credentials.Extra ?? {})[credName] ?? "";
           bound.credentialEnvKeys = [...(bound.credentialEnvKeys ?? []), envName];
         }
         break;
@@ -182,7 +208,8 @@ function bindCommand(ctx, sandbox, workspace, command, credentials) {
           }
           home = HostAgentCLIHome(homeEnv);
         }
-        const [argv, env] = ApplyAgentCLICredential(command.Provider, credentials.AgentCLI[command.Provider], command.AgentCLI, home, homeEnv, bound.Argv);
+        const cred = (credentials.AgentCLI ?? {})[command.Provider] ?? { APIKey: "", BaseURL: "", Protocol: "", Models: [] };
+        const [argv, env] = ApplyAgentCLICredential(command.Provider, cred, command.AgentCLI, home, homeEnv, bound.Argv);
         bound.Argv = argv;
         for (const key of agentCLIHostEnv) {
           bound.environment[key] = "";
@@ -203,8 +230,15 @@ function bindCommand(ctx, sandbox, workspace, command, credentials) {
   return bound;
 }
 
-// bindTelemetryEnvironment：把子 CLI 的 OpenTelemetry 导出器指向 AgentFlow 采集器，
-// 并用 run 与节点给 span 打标签。telemetry 为空时环境保持不动。
+/**
+ * 为子 CLI 配置 OpenTelemetry 导出环境变量，并按 RunID、NodeID 与供应商名称打资源标签。
+ * `telemetry` 为空时不对 `env` 做任何改动。
+ *
+ * @param {Object<string, string>} env - 目标环境变量字典（就地修改）。
+ * @param {Object | null | undefined} telemetry - 调用遥测选项（含 `RunID`、`NodeID`）。
+ * @param {string} provider - 执行器供应商名称。
+ * @returns {void} 无返回值。
+ */
 function bindTelemetryEnvironment(env, telemetry, provider) {
   if (telemetry == null) {
     return;
@@ -236,9 +270,14 @@ function bindTelemetryEnvironment(env, telemetry, provider) {
   env["OTEL_RESOURCE_ATTRIBUTES"] = attributes;
 }
 
-// CodexUserProviderArgv：在最后的 argv 元素（提示词）之前插入专用的 "agentflow_user"
-// 模型供应商。baseURL 为空时回退到 OpenAI API。密钥留在进程环境里作 CODEX_API_KEY；
-// argv 里只写变量名，专用供应商可防止回退到宿主登录。输入切片不修改。
+/**
+ * 在 Codex 命令最后一个参数（提示词）之前插入专用 `"agentflow_user"` 模型供应商配置参数。
+ * `baseURL` 为空时默认回落到 OpenAI 官方 API；输入数组不修改。
+ *
+ * @param {string[]} argv - 原始 Codex 命令行参数数组（长度至少为 2）。
+ * @param {string} baseURL - 自定义端点地址。
+ * @returns {string[]} 插入供应商配置后的新参数数组；`argv` 长度不足时抛出 `Error`。
+ */
 function CodexUserProviderArgv(argv, baseURL) {
   if (argv.length < 2) {
     throw new Error("invalid Codex invocation");
@@ -259,7 +298,13 @@ function CodexUserProviderArgv(argv, baseURL) {
   return out;
 }
 
-// PrivateHomeName：PrivateHome 命令以 HOME 运行的 .agentflow/private-home 下的目录。
+/**
+ * 计算启用了 `PrivateHome` 的命令在 `.agentflow/private-home` 下的子目录名。
+ * 依次回落：`PrivateHomeKey` → `Provider` → `"process"`。
+ *
+ * @param {Object} command - `CommandSpec` 对象。
+ * @returns {string} 消毒后的安全目录名。
+ */
 function PrivateHomeName(command) {
   let name = safeID(command.PrivateHomeKey);
   if (name === "") {
@@ -271,15 +316,28 @@ function PrivateHomeName(command) {
   return name;
 }
 
-// AgentCLIPrivateHomeKey：Agent CLI 调用的 PrivateHomeKey：每个 CLI 与 Agent 一个 HOME，
-// 这样并发的 Agent 各自保有 MCP 配置与会话。
+/**
+ * 生成 Agent CLI 调用专用的 `PrivateHomeKey`（每个 CLI 与 Agent 组合独立一份 HOME）。
+ *
+ * @param {string} kind - Agent CLI 种类标识。
+ * @param {string} agentID - Agent 角色标识。
+ * @returns {string} 消毒后的私有 HOME 键名。
+ */
 function AgentCLIPrivateHomeKey(kind, agentID) {
   return safeID(kind + "-" + agentID);
 }
 
-// BindAgentCLICommand：Runner 侧的 BindAgentCLI：把 Agent CLI 的配置渲染进命令的私有 HOME，
-// 返回运行它用的 argv 与环境（包含 HOME 与 TMPDIR）。Agent CLI 始终在该 HOME 里运行，
-// 无论是否沙箱化，因为 MCP 配置就在那里。
+/**
+ * Runner 侧 Agent CLI 凭据绑定入口：确保私有 HOME 与 TMP 目录安全存在，
+ * 渲染模型配置并返回运行所需的命令行参数与环境变量（含 `HOME` 与 `TMPDIR`）。
+ *
+ * @param {Object} sandbox - 目标沙箱实例。
+ * @param {string} workspace - 宿主工作区目录路径。
+ * @param {Object} command - `CommandSpec` 对象。
+ * @param {Object} cred - 目标供应商凭据对象。
+ * @param {string[]} argv - 原始命令行参数数组。
+ * @returns {[string[], Object<string, string>]} 二元组 `[更新后的 argv, 环境变量映射]`；目录或凭据绑定失败时抛出 `Error`。
+ */
 function BindAgentCLICommand(sandbox, workspace, command, cred, argv) {
   const name = PrivateHomeName(command);
   const [, homeEnv] = privateHomePaths(sandbox, workspace, command);
@@ -313,7 +371,14 @@ function BindAgentCLICommand(sandbox, workspace, command, cred, argv) {
   return [argv, env];
 }
 
-// privateHomePaths：返回 PrivateHome 命令在宿主上的 HOME 与进程看到的 HOME。
+/**
+ * 返回 `PrivateHome` 命令在宿主上的 HOME 路径以及子进程视角看到的 HOME 路径。
+ *
+ * @param {Object} sandbox - 目标沙箱实例。
+ * @param {string} workspace - 宿主工作区目录路径。
+ * @param {Object} command - `CommandSpec` 对象。
+ * @returns {[string, string]} 二元组 `[宿主 HOME 路径, 进程视角 HOME 路径]`。
+ */
 function privateHomePaths(sandbox, workspace, command) {
   const name = PrivateHomeName(command);
   const host = path.join(workspace, ".agentflow", "private-home", name);
@@ -323,8 +388,16 @@ function privateHomePaths(sandbox, workspace, command) {
   return [host, host];
 }
 
-// bindWorkspaceGitEnvironment：安装标准宿主级 helper。
-// 它通过实时中继请求凭据，而不是写 token。
+/**
+ * 为工作区命令配置 Git 身份、清空 `gh`/`glab` 历史登录态，并安装基于会话网关的实时凭据中继 helper 与 CLI shim。
+ *
+ * @param {AbortSignal} ctx - 取消信号（对应 Go `context.Context`）。
+ * @param {Object} sandbox - 目标沙箱实例。
+ * @param {string} workspace - 宿主工作区目录路径。
+ * @param {Object<string, string>} environment - 待写入的环境变量映射（就地修改）。
+ * @param {Object} credentials - 本次运行的 `RunCredentials` 凭据集合。
+ * @returns {void} 成功无返回值；目录创建、写配置或安装 helper 失败时抛出 `Error`。
+ */
 function bindWorkspaceGitEnvironment(ctx, sandbox, workspace, environment, credentials) {
   environment["GIT_TERMINAL_PROMPT"] = "0";
   try {
@@ -406,8 +479,13 @@ function bindWorkspaceGitEnvironment(ctx, sandbox, workspace, environment, crede
   }
 }
 
-// workspaceGitHosts：把 host→platform 渲染为 GitHostsEnv 的有序 "host=platform" 列表，
-// 跳过任何不是纯 HTTPS host 的项。
+/**
+ * 将 `host -> platform` 映射格式化为 `GitHostsEnv` 所需的有序 `"host=platform"` 逗号列表，
+ * 自动跳过非纯 HTTPS 主机项。
+ *
+ * @param {Object<string, string> | null | undefined} hosts - 主机到 Git 平台类型的映射。
+ * @returns {string} 排序并逗号拼接后的 `"host=platform"` 字符串。
+ */
 function workspaceGitHosts(hosts) {
   const pairs = [];
   for (const [host, platformRaw] of Object.entries(hosts ?? {})) {
@@ -433,7 +511,12 @@ function workspaceGitHosts(hosts) {
   return pairs.join(",");
 }
 
-// sandboxBasePath：沙箱内进程启动时的 PATH：配置里的（带有已激活环境的工具）或宿主的。
+/**
+ * 获取沙箱进程启动时的基础 `PATH`：优先取沙箱配置中的 `PATH`，否则回落到宿主进程 `PATH`。
+ *
+ * @param {Object} sandbox - 目标沙箱实例。
+ * @returns {string} 基础 `PATH` 字符串。
+ */
 function sandboxBasePath(sandbox) {
   const sb = unwrapSandbox(sandbox);
   if (sb instanceof processSandbox) {
@@ -448,6 +531,13 @@ function sandboxBasePath(sandbox) {
   return process.env.PATH ?? "";
 }
 
+/**
+ * 将用户姓名与邮箱清洗并渲染为 `[user]` 段的 Git 系统级配置文件内容。
+ *
+ * @param {string} name - Git 用户名。
+ * @param {string} email - Git 邮箱地址。
+ * @returns {string} Git config 文本；姓名和邮箱均为空时返回 `""`。
+ */
 function workspaceGitIdentity(name, email) {
   const clean = (value) => value.replaceAll("\n", " ").replaceAll("\r", " ").replaceAll('"', "").replaceAll("\\", "");
   name = clean(name ?? "").trim();
@@ -472,6 +562,13 @@ case "$1" in
 esac
 `;
 
+/**
+ * 在工作区 `runtime` 目录下写出可执行的 `GIT_ASKPASS` 辅助脚本（权限 0o700）。
+ *
+ * @param {string} workspace - 宿主工作区目录路径。
+ * @param {string} filePath - 目标脚本文件绝对路径。
+ * @returns {void} 成功无返回值；目录创建或写文件失败时抛出 `Error`。
+ */
 function writeGitAskPass(workspace, filePath) {
   try {
     EnsureControlDirectory(workspace, "runtime");

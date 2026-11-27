@@ -1,20 +1,28 @@
-// browser_agent.js —— 对应 Go 文件：internal/runtime/browser_agent.go
-// 作用：Agent 操作浏览器：快照、点击、输入、按键与截图。
-// context.Context 译为 AbortSignal；(值, error) 译为成功返回值、失败 throw；
-// Go 的 *string/*bool 等标量 out 译为单元素数组（out[0]）；select + time.After 译为 sleepOrAbort；
-// context.WithTimeout 译为 withTimeout。
+/**
+ * @file internal/runtime/browser_agent.js
+ * @description 对应 Go 文件：internal/runtime/browser_agent.go。
+ * 负责在 `browserView` 上提供面向语言模型的浏览器操作能力，包括页面脚本求值、
+ * 可交互元素快照（打 ref 标记）、导航等待、按 ref 点击与输入、按键分发以及 CSS 像素截图。
+ *
+ * Go → JS 语法差异说明：
+ * - `context.Context` 译为 `AbortSignal`；
+ * - `(值, error)` 译为成功返回值、失败 `throw err`；`(值1, 值2, error)` 译为成功返回 `[值1, 值2]`、失败 `throw err`；
+ * - Go 的 `*string` / `*bool` 等标量出参指针译为单元素数组（`out[0]`）；
+ * - `sync.Mutex` 在单线程 JS 中省略；`select` + `time.After` 译为 `sleepOrAbort`；`context.WithTimeout` 译为 `withTimeout`；
+ * - 同包跨文件方法挂载到 `browserView.prototype`。
+ */
 
 "use strict";
 
-const { BrowserSnapshot } = require("../domain/runner_workspace.js"); // 对应 Go 的 domain.BrowserSnapshot，runner_workspace.js 已翻译
-const { browserView } = require("./browser_view.js"); // 对应 Go 同包的 browserView，browser_view.js 待翻译
-const { assignWireJSON } = require("./browser_cdp.js"); // 对应 Go 同包的 json.Unmarshal，browser_cdp.js 已翻译
+const { BrowserSnapshot } = require("../domain/runner_workspace.js");
+const { browserView } = require("./browser_view.js");
+const { assignWireJSON } = require("./browser_cdp.js");
 
 const browserSnapshotElements = 150;
 const browserSnapshotText = 12000;
 const browserRefAttr = "data-agentflow-ref";
 
-// browserSnapshotScript：给可见可交互元素打 ref，供语言模型按 ref 操作；String.raw 保留脚本里的 \s、\n。
+// 给可见可交互元素打 ref 属性，供语言模型无需坐标直接操作；使用 String.raw 保留脚本内反斜杠。
 const browserSnapshotScript = String.raw`(() => {
   const attr = "${browserRefAttr}", max = ${browserSnapshotElements}, limit = ${browserSnapshotText};
   document.querySelectorAll("[" + attr + "]").forEach(e => e.removeAttribute(attr));
@@ -41,15 +49,31 @@ const browserSnapshotScript = String.raw`(() => {
   return { text: text.slice(0, limit), truncated: text.length > limit, elements };
 })()`;
 
-// cdpEvaluateResult：Runtime.evaluate 的返回体；Result.Value 是原始 JSON（Go 的 json.RawMessage），保持解析后的值。
+/**
+ * 表示 CDP `Runtime.evaluate` 的响应结构体，对应 Go 的 `cdpEvaluateResult`。
+ */
 class cdpEvaluateResult {
+  /**
+   * 构造 `Runtime.evaluate` 响应对象，字段按 Go 零值初始化。
+   *
+   * @param {object} [init={}] 初始字段对象。
+   * @param {{ Value: any }} [init.Result] 表达式求值结果包装对象。
+   * @param {{ Text: string, Exception: { Description: string } } | null} [init.ExceptionDetails=null] 脚本异常详情。
+   */
   constructor(init = {}) {
     this.Result = init.Result ?? { Value: null };
     this.ExceptionDetails = init.ExceptionDetails ?? null;
   }
 }
 
-// sleepOrAbort：等满毫秒或等到 ctx 取消，对应 Go 的 time.NewTimer + select。
+/**
+ * 等待指定毫秒数，若期间 `ctx` 取消则提前拒绝，对应 Go 的 `time.NewTimer` + `select`。
+ * 用于 `settle` 开始前的短暂停顿。
+ *
+ * @param {AbortSignal | null | undefined} ctx 取消信号。
+ * @param {number} ms 等待毫秒数。
+ * @returns {Promise<void>} 无返回值；取消时拒绝并抛出取消原因。
+ */
 function sleepOrAbort(ctx, ms) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -76,12 +100,24 @@ function sleepOrAbort(ctx, ms) {
   });
 }
 
-// sleep：只等满毫秒，对应 Go 的 time.Sleep。
+/**
+ * 固定等待指定毫秒数，对应 Go 的 `time.Sleep`。
+ *
+ * @param {number} ms 等待毫秒数。
+ * @returns {Promise<void>} 无返回值。
+ */
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// withTimeout：给 ctx 加一个超时，返回 [信号, 取消函数]，对应 Go 的 context.WithTimeout。
+/**
+ * 基于父信号创建带超时的子取消信号，对应 Go 的 `context.WithTimeout`。
+ * 用于 `settle` 每次探测 `document.readyState` 的 1 秒超时。
+ *
+ * @param {AbortSignal | null | undefined} ctx 父级取消信号。
+ * @param {number} ms 超时毫秒数。
+ * @returns {[AbortSignal, () => void]} 返回 `[子信号, 清理定时器函数]` 元组。
+ */
 function withTimeout(ctx, ms) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new Error("context deadline exceeded")), ms);
@@ -95,6 +131,15 @@ function withTimeout(ctx, ms) {
   return [controller.signal, () => clearTimeout(timer)];
 }
 
+/**
+ * 在当前活动标签页内执行 JS 表达式，并将返回值解码写入 `out`。
+ * 若页面脚本抛出异常则提取异常描述并抛出错误。
+ *
+ * @param {AbortSignal | null | undefined} ctx 取消信号。
+ * @param {string} expression 要在页面上下文执行的 JS 表达式。
+ * @param {object | any[] | null | undefined} out 接收解码结果的目标对象或单元素数组（可为 `null`）。
+ * @returns {Promise<void>} 无返回值；无活动标签页或脚本异常时抛出错误。
+ */
 browserView.prototype.evaluate = async function (ctx, expression, out) {
   // Go 的 v.mu 锁省略，JS 单线程无需加锁。
   const session = this.session;
@@ -104,9 +149,9 @@ browserView.prototype.evaluate = async function (ctx, expression, out) {
   const result = new cdpEvaluateResult();
   await this.client.call(ctx, session, "Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true }, result);
   if (result.ExceptionDetails != null) {
-    let msg = result.ExceptionDetails.Exception.Description;
+    let msg = result.ExceptionDetails.Exception?.Description ?? "";
     if (msg === "") {
-      msg = result.ExceptionDetails.Text;
+      msg = result.ExceptionDetails.Text ?? "";
     }
     throw new Error(`页面脚本执行失败：${msg}`);
   }
@@ -116,13 +161,24 @@ browserView.prototype.evaluate = async function (ctx, expression, out) {
   assignWireJSON(out, result.Result.Value);
 };
 
+/**
+ * 获取当前页面的文本内容与可见可交互元素快照，并为元素打上 ref 属性。
+ *
+ * @param {AbortSignal | null | undefined} ctx 取消信号。
+ * @returns {Promise<BrowserSnapshot>} 页面快照对象。
+ */
 browserView.prototype.snapshot = async function (ctx) {
   const snap = new BrowserSnapshot();
   await this.evaluate(ctx, browserSnapshotScript, snap);
   return snap;
 };
 
-// settle：等导航完成，对应 Go 的 settle。
+/**
+ * 在页面变更类操作后短暂等待导航稳定（先等待 400ms，再最多轮询 5 秒直到 `document.readyState === "complete"`）。
+ *
+ * @param {AbortSignal | null | undefined} ctx 取消信号。
+ * @returns {Promise<void>} 无返回值。
+ */
 browserView.prototype.settle = async function (ctx) {
   try {
     await sleepOrAbort(ctx, 400);
@@ -149,6 +205,12 @@ browserView.prototype.settle = async function (ctx) {
   }
 };
 
+/**
+ * 校验元素 ref 格式（如 `"e12"`）并构造对应的 DOM 查询表达式。
+ *
+ * @param {string} ref 页面快照中返回的元素引用标识。
+ * @returns {string} 可直接在页面求值的 `document.querySelector(...)` 表达式字符串。
+ */
 function browserRefSelector(ref) {
   ref = ref.trim();
   if (ref.length < 2 || ref[0] !== "e") {
@@ -160,7 +222,14 @@ function browserRefSelector(ref) {
   return `document.querySelector('[${browserRefAttr}="${ref}"]')`;
 }
 
-// clickRef：用真实鼠标事件点元素中心，与任务面板的用户点击走同一条路。
+/**
+ * 将指定 ref 对应的元素滚动到视口中央，并通过真实 CDP 鼠标事件点击其中心坐标。
+ * 与任务面板的用户点击走同一条输入事件链路。
+ *
+ * @param {AbortSignal | null | undefined} ctx 取消信号。
+ * @param {string} ref 元素引用标识（如 `"e1"`）。
+ * @returns {Promise<void>} 无返回值；元素不存在或事件分发失败时抛出错误。
+ */
 browserView.prototype.clickRef = async function (ctx, ref) {
   const selector = browserRefSelector(ref);
   const pointBox = [null];
@@ -179,6 +248,15 @@ browserView.prototype.clickRef = async function (ctx, ref) {
   }
 };
 
+/**
+ * 点击并全选指定 ref 元素的现有内容，随后输入指定文本（空串时按 Backspace 清空），可选按下回车提交。
+ *
+ * @param {AbortSignal | null | undefined} ctx 取消信号。
+ * @param {string} ref 元素引用标识。
+ * @param {string} text 要输入的文本内容；为空字符串时清空原内容。
+ * @param {boolean} submit 输入完成后是否按下 Enter 键提交。
+ * @returns {Promise<void>} 无返回值；元素消失或 CDP 调用失败时抛出错误。
+ */
 browserView.prototype.typeRef = async function (ctx, ref, text, submit) {
   await this.clickRef(ctx, ref);
   const selector = browserRefSelector(ref);
@@ -195,10 +273,11 @@ browserView.prototype.typeRef = async function (ctx, ref, text, submit) {
     await this.pageCall(ctx, "Input.insertText", { text });
   }
   if (submit) {
-    return this.press(ctx, "Enter");
+    await this.press(ctx, "Enter");
   }
 };
 
+// 支持的常用控制键与 CDP 虚拟键码映射表，对应 Go 的 map[string]struct{...}。
 const browserKeys = {
   Enter: { code: "Enter", keyCode: 13, text: "\r" },
   Tab: { code: "Tab", keyCode: 9, text: "" },
@@ -216,6 +295,13 @@ const browserKeys = {
   " ": { code: "Space", keyCode: 32, text: " " },
 };
 
+/**
+ * 向当前活动页面发送一次完整的键盘按下与抬起事件。
+ *
+ * @param {AbortSignal | null | undefined} ctx 取消信号。
+ * @param {string} key 按键名称（如 `"Enter"`、`"Escape"`、`"space"`）。
+ * @returns {Promise<void>} 无返回值；不支持的按键或分发失败时抛出错误。
+ */
 browserView.prototype.press = async function (ctx, key) {
   if (key.toLowerCase() === "space") {
     key = " ";
@@ -234,6 +320,13 @@ browserView.prototype.press = async function (ctx, key) {
   await this.pageCall(ctx, "Input.dispatchKeyEvent", { type: "keyUp", key, code: spec.code, windowsVirtualKeyCode: spec.keyCode, nativeVirtualKeyCode: spec.keyCode });
 };
 
+/**
+ * 截取当前活动标签页的 JPEG 画面并返回 Base64 字符串。
+ * 当浏览器处于高设备像素比（`devicePixelRatio > 1`）时按 CSS 像素裁剪缩放，以减小传给模型的图片体积。
+ *
+ * @param {AbortSignal | null | undefined} ctx 取消信号。
+ * @returns {Promise<string>} Base64 编码的 JPEG 截图数据。
+ */
 browserView.prototype.screenshot = async function (ctx) {
   // Go 的 v.mu 锁省略，JS 单线程无需加锁。
   const session = this.session;
@@ -263,7 +356,14 @@ browserView.prototype.screenshot = async function (ctx) {
   return shot.Data;
 };
 
-// agentOperation：跑一次语言模型操作，改页的操作返回事后快照，让 ref 保持最新。
+/**
+ * 执行一次语言模型发起的浏览器操作（快照、截图、点击、输入、按键）。
+ * 对会改变页面状态的操作先等待页面稳定，再返回最新快照以保持 ref 有效。
+ *
+ * @param {AbortSignal | null | undefined} ctx 取消信号。
+ * @param {object} req 浏览器操作请求（`domain.BrowserRequest`，含 `Operation`/`Ref`/`Text`/`Submit`/`Key`）。
+ * @returns {Promise<[BrowserSnapshot | null, string]>} 返回 `[页面快照或 null, 截图 Base64 或空串]` 元组。
+ */
 browserView.prototype.agentOperation = async function (ctx, req) {
   switch (req.Operation) {
     case "snapshot":

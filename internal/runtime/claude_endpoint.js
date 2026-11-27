@@ -1,11 +1,25 @@
 // claude_endpoint.js —— 对应 Go 文件：internal/runtime/claude_endpoint.go
-// 作用：给 Claude Code 调用配置 Anthropic 端点及 DeepSeek 专用的协议选项。
+//
+// 文件作用与职责边界：
+// 为本地执行与 Runner 执行共用，配置 Claude Code 所使用的 Anthropic Messages 端点环境变量，
+// 并在目标主机为 DeepSeek 兼容端点时写入对应的协议兼容开关。
+//
+// Go 与 JS 语法差异说明：
+// - Go 的 `net/url.Parse` 译为 Node.js `new URL(...)`，解析失败时按 Go 语义跳过特殊分支；
+// - Go 的 `map[string]string` 译为普通对象 `{}`。
 
 "use strict";
 
-const { URL } = require("node:url"); // Go net/url
+const { URL } = require("node:url"); // 对应 Go 标准库 net/url
 
-// BindClaudeCodeEndpoint：配置 Anthropic Messages 端点及供应商专用的协议选项，供本地与 Runner 调用共用。
+/**
+ * 配置 Anthropic Messages 端点地址及供应商专用协议环境变量。
+ * 在本地和 Runner 启动 Claude Code 进程前调用；当 baseURL 为空时回退到官方端点，
+ * 当主机名为 `api.deepseek.com` 时禁用延迟工具搜索与实验性 beta 字段以兼容其协议。
+ * @param {Object<string, string>} env - 待写入的环境变量映射对象（原地修改）。
+ * @param {string} baseURL - 用户或配置指定的 Anthropic API 基础地址。
+ * @returns {void} 无返回值。
+ */
 function BindClaudeCodeEndpoint(env, baseURL) {
   baseURL = baseURL.trim();
   if (baseURL === "") {
@@ -18,7 +32,7 @@ function BindClaudeCodeEndpoint(env, baseURL) {
   try {
     endpoint = new URL(baseURL);
   } catch {
-    // Go：url.Parse 失败时跳过。
+    // 对应 Go：url.Parse 失败时跳过。
   }
   if (endpoint !== null && endpoint.hostname.toLowerCase() === "api.deepseek.com") {
     env["ENABLE_TOOL_SEARCH"] = "false";

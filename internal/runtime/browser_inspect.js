@@ -1,18 +1,23 @@
-// browser_inspect.js —— 对应 Go 文件：internal/runtime/browser_inspect.go
-// 作用：任务面板拾取模式的元素检查：取 Agent 浏览器画面上一点处的元素信息。
-// Go 的原始字符串译为 String.raw 模板字面量（反斜杠原样保留）；
-// (值, error) 译为返回值、失败 throw。
+/**
+ * @file internal/runtime/browser_inspect.js
+ * @description 对应 Go 文件：internal/runtime/browser_inspect.go。
+ * 负责任务面板拾取模式（pick mode）下的元素检查：在 Agent 浏览器画面上按归一化视口坐标
+ * 命中目标 DOM 元素（穿透 Shadow DOM 与同源 iframe），返回高亮框信息以及选中时发送给 Agent 的详细上下文。
+ *
+ * Go → JS 语法差异说明：
+ * - Go 原始字符串反引号译为 `String.raw` 模板字面量，原样保留脚本中的反斜杠；
+ * - `context.Context` 译为 `AbortSignal`；
+ * - `(值, error)` 译为成功返回值、失败 `throw err`；
+ * - Go 的 `*domain.BrowserInspection` 指针出参译为单元素数组 `outBox` 接收，页面返回 `null` 时同步返回 `null`；
+ * - 同包跨文件方法挂载到 `browserView.prototype`。
+ */
 
 "use strict";
 
-const { BrowserInspection } = require("../domain/runner_workspace.js"); // 对应 Go 的 domain.BrowserInspection，domain 已翻译
-const { browserView, clampUnit } = require("./browser_view.js"); // 对应 Go 同包的 browserView/clampUnit
+const { BrowserInspection } = require("../domain/runner_workspace.js");
+const { browserView, clampUnit } = require("./browser_view.js");
 
-// Element inspection for the panel's pick mode on the Agent browser
-// screencast: the page reports the element under a point, its box for the
-// outline and, on a pick, the description the composer sends to the Agent.
-// The description follows chatbot/src/element-context.js, which does the same
-// for native previews in the user's own browser; keep the two in step.
+// 注入页面执行的元素检查脚本，返回结构与 chatbot/src/element-context.js 保持同步。
 const inspectScript = String.raw`(function (fx, fy, detail) {
   var doc = document, x = fx * innerWidth, y = fy * innerHeight, ox = 0, oy = 0, el = null;
   for (var depth = 0; depth < 8; depth++) {
@@ -146,15 +151,23 @@ const inspectScript = String.raw`(function (fx, fy, detail) {
   return out;
 })`;
 
-// inspect reports the element at point (a fraction of the viewport).
+/**
+ * 检查归一化视口坐标 `point` 下的页面元素，返回用于高亮框或上下文提取的检查结果。
+ * 当 `detail` 为 `false` 时仅返回标签与位置框（悬停预览）；为 `true` 时附带完整选择器、样式、HTML 与前端框架组件信息。
+ *
+ * @param {AbortSignal | null | undefined} ctx 取消信号。
+ * @param {{ X: number, Y: number } | null | undefined} point 归一化视口坐标（`domain.BrowserPoint`，分量范围 0~1）。
+ * @param {boolean} detail 是否采集完整元素上下文详情。
+ * @returns {Promise<BrowserInspection | null>} 命中元素时返回检查结果对象，未命中或命中根元素时返回 `null`；缺少坐标时抛出错误。
+ */
 browserView.prototype.inspect = async function (ctx, point, detail) {
   if (point == null) {
     throw new Error("缺少检查位置");
   }
-  const out = new BrowserInspection({});
+  const outBox = [null];
   const expression = `${inspectScript}(${clampUnit(point.X)}, ${clampUnit(point.Y)}, ${detail})`;
-  await this.evaluate(ctx, expression, out);
-  return out;
+  await this.evaluate(ctx, expression, outBox);
+  return outBox[0] != null ? new BrowserInspection(outBox[0]) : null;
 };
 
 module.exports = { inspectScript };

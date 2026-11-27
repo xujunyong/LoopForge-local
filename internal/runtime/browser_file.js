@@ -1,7 +1,14 @@
-// browser_file.js —— 对应 Go 文件：internal/runtime/browser_file.go
-// 作用：工作区文件预览：把 Agent 以 file:// 打开的页面文件送到用户浏览器渲染。
-// Go 的 mime.TypeByExtension 在 Node 里没有内置对应，这里用常见扩展名表；
-// http.DetectContentType 译为精简版内容嗅探；(值, error) 译为返回值、失败 throw。
+/**
+ * @file internal/runtime/browser_file.js
+ * @description 对应 Go 文件：internal/runtime/browser_file.go。
+ * 负责工作区本地文件的预览服务：将 Agent 以 `file://` 打开的工作区静态文件（Docker 边车内通过
+ * `docker exec` 脚本读取，宿主浏览器直接读盘）安全校验后封装为 HTTP 响应返回给用户浏览器渲染。
+ *
+ * Go → JS 语法差异说明：
+ * - `context.Context` 译为 `AbortSignal`；
+ * - `(值, error)` 译为成功返回值、失败 `throw err`；`(值1, 值2, error)` 译为成功返回 `[值1, 值2]`、失败 `throw err`；
+ * - Node 无内置 `mime.TypeByExtension` 与 `http.DetectContentType`，在文件底部以常见扩展名表与精简内容嗅探实现对应行为。
+ */
 
 "use strict";
 
@@ -9,28 +16,22 @@ const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 
-const { BrowserState, BrowserHTTPResponse } = require("../domain/runner_workspace.js"); // 对应 Go 的 domain.BrowserState/BrowserHTTPResponse，domain 已翻译
-const { DevServerBodyLimit, devServerLookup } = require("./browser_devserver.js"); // 对应 Go 同包的 DevServerBodyLimit/devServerLookup
+const { BrowserState, BrowserHTTPResponse } = require("../domain/runner_workspace.js");
+const { DevServerBodyLimit, devServerLookup } = require("./browser_devserver.js");
 
-// Workspace file access: pages the Agent opens as file:// are served to the
-// user's own browser so they render natively, like dev servers. Paths are
-// the ones the run browser sees (/workspace/... in a docker sidecar, the host
-// workspace for a host browser) and must resolve inside that workspace.
-
-// dockerWorkspaceRoot is where the browser sidecar mounts the workspace.
+// 浏览器边车容器中工作区的挂载根目录。
 const dockerWorkspaceRoot = "/workspace";
 
-// Outcomes shared by the sidecar script (exit codes) and the host reader.
+// 边车脚本退出码与宿主读取函数共用的结果状态码。
 const workspaceFileOK = 0;
 const workspaceFileMissing = 44;
 const workspaceFileOutside = 45;
-const workspaceFileDirectory = 46; // a directory asked for without a trailing slash
+const workspaceFileDirectory = 46; // 请求目录路径时缺少末尾斜杠
 const workspaceFileTooLarge = 47;
 const workspaceFileNoIndexHTML = 48;
 
-// workspaceFileScript prints a workspace file inside the sidecar:
-// node -e script ROOT PATH LIMIT. Symlinks are resolved before the
-// containment check, and a directory serves its index.html.
+// 在 Docker 边车容器内读取工作区文件的 Node 脚本：node -e script ROOT PATH LIMIT。
+// 解析软链接后再校验路径是否落在工作区内，目录路径自动尝试提供 index.html。
 const workspaceFileScript = String.raw`const fs=require("fs"),path=require("path");const[root0,p,limit]=process.argv.slice(1);` +
   String.raw`const real=f=>{try{return fs.realpathSync(f)}catch(e){process.exit(44)}};const root=real(root0);` +
   String.raw`const inside=r=>r===root||r.startsWith(root.endsWith("/")?root:root+"/");` +
@@ -39,7 +40,15 @@ const workspaceFileScript = String.raw`const fs=require("fs"),path=require("path
   String.raw`r=real(i);if(!inside(r))process.exit(45);st=fs.statSync(r);}` +
   String.raw`if(!st.isFile())process.exit(44);if(st.size>+limit)process.exit(47);process.stdout.write(fs.readFileSync(r),()=>process.exit(0));`;
 
-// workspaceFileExec runs the script in a sidecar; swapped in tests.
+/**
+ * 在 Docker 边车容器内执行 `workspaceFileScript` 读取工作区文件，可在测试中替换。
+ * 退出码落在 `44..48` 区间时表示已知业务状态（不存在、越界、目录重定向、过大、缺 index.html），正常返回 `[null, code]`。
+ *
+ * @param {AbortSignal | null | undefined} ctx 取消信号。
+ * @param {string} container 浏览器边车容器名称。
+ * @param {string} file 容器内文件绝对路径（如 `"/workspace/index.html"`）。
+ * @returns {Promise<[Buffer | null, number]>} 成功时返回 `[文件字节或 null, 状态码]`；进程启动失败、取消或非预期退出时抛出错误。
+ */
 let workspaceFileExec = (ctx, container, file) => {
   return new Promise((resolve, reject) => {
     const child = spawn("docker", ["exec", container, "node", "-e", workspaceFileScript,
@@ -59,11 +68,11 @@ let workspaceFileExec = (ctx, container, file) => {
       }
       const out = Buffer.concat(chunks);
       if (code != null && code >= workspaceFileMissing && code <= workspaceFileNoIndexHTML) {
-        resolve([null, code, null]);
+        resolve([null, code]);
         return;
       }
       if (code === 0) {
-        resolve([out, workspaceFileOK, null]);
+        resolve([out, workspaceFileOK]);
         return;
       }
       if (ctx instanceof AbortSignal && ctx.aborted) {
@@ -82,11 +91,19 @@ let workspaceFileExec = (ctx, container, file) => {
   });
 };
 
+/**
+ * 处理一次工作区文件预览请求，根据运行浏览器端点类型从容器或宿主机读取文件并推导 `Content-Type`。
+ *
+ * @param {AbortSignal | null | undefined} ctx 取消信号。
+ * @param {string} runID 运行实例 ID。
+ * @param {string} file 请求预览的文件绝对路径（必须以 `"/"` 开头且不含空字符）。
+ * @returns {Promise<BrowserState>} 包含 HTTP 响应或失败提示的浏览器状态对象；路径非法时抛出错误。
+ */
 async function handleWorkspaceFile(ctx, runID, file) {
   if (!file.startsWith("/") || file.includes("\0")) {
     throw new Error("无效的工作区文件路径");
   }
-  const [endpoint, ok] = devServerLookup(ctx, runID);
+  const [endpoint, ok] = await devServerLookup(ctx, runID);
   if (!ok) {
     return new BrowserState({ Available: false, Reason: "Agent 浏览器尚未启动：工作区文件预览需要它所在的执行环境" });
   }
@@ -120,7 +137,7 @@ async function handleWorkspaceFile(ctx, runID, file) {
     case workspaceFileOutside:
       return text(403, "只能预览工作区内的文件");
     case workspaceFileDirectory:
-      // The gateway adds the slash, so relative links resolve in the directory.
+      // 网关收到 301 后会补全末尾斜杠，确保页面内相对链接以该目录为基准解析。
       return new BrowserState({ Available: true, Kind: endpoint.Kind, HTTP: new BrowserHTTPResponse({ Status: 301 }) });
     case workspaceFileNoIndexHTML:
       return text(404, "目录下没有 index.html：" + file);
@@ -142,7 +159,15 @@ async function handleWorkspaceFile(ctx, runID, file) {
   }) });
 }
 
-// serveWorkspaceFile is the host browser's counterpart of workspaceFileScript.
+/**
+ * 宿主浏览器侧的工作区文件读取实现，与容器内 `workspaceFileScript` 逻辑等价。
+ * 解析软链接并校验路径不越出 `root`，目录路径自动尝试读取 `index.html`，同时校验文件大小上限。
+ *
+ * @param {string} root 工作区根目录路径。
+ * @param {string} file 待读取文件的路径。
+ * @param {number} limit 允许读取的最大字节数。
+ * @returns {[Buffer | null, number]} 返回 `[文件内容或 null, 结果状态码]` 元组。
+ */
 function serveWorkspaceFile(root, file, limit) {
   let realRoot;
   try {
@@ -204,7 +229,7 @@ function serveWorkspaceFile(root, file, limit) {
   return [body, workspaceFileOK];
 }
 
-// mime.TypeByExtension 的常见扩展名表，查不到时返回 ""。
+// 常见静态资源扩展名到 MIME 类型的映射表，对应 Go 的 mime.TypeByExtension。
 const mimeTypesByExtension = {
   ".html": "text/html; charset=utf-8",
   ".htm": "text/html; charset=utf-8",
@@ -231,12 +256,23 @@ const mimeTypesByExtension = {
   ".otf": "font/otf",
 };
 
+/**
+ * 根据文件扩展名查询对应的 MIME 类型，对应 Go 的 `mime.TypeByExtension`。
+ *
+ * @param {string} ext 带前导点的文件扩展名（如 `".html"`）。
+ * @returns {string} 匹配到的 MIME 类型字符串；未命中返回空字符串 `""`。
+ */
 function mimeTypeByExtension(ext) {
   return mimeTypesByExtension[ext.toLowerCase()] ?? "";
 }
 
-// http.DetectContentType 的精简版，只覆盖预览常见类型；
-// 其余按 Go 的默认规则返回 text/plain 或 application/octet-stream。
+/**
+ * 基于文件头部字节嗅探 MIME 类型，对应 Go 的 `http.DetectContentType` 精简实现。
+ * 覆盖常见预览格式，其余内容按是否全为可打印文本回退为 `text/plain` 或 `application/octet-stream`。
+ *
+ * @param {Buffer} body 文件原始字节内容。
+ * @returns {string} 推断出的 `Content-Type` 字符串。
+ */
 function detectContentType(body) {
   const text = body.subarray(0, 512).toString("latin1");
   if (/^\s*<!doctype html/i.test(text) || /^\s*<(html|head|script|style|title|body)/i.test(text)) {

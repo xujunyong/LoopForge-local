@@ -1,11 +1,25 @@
-// agent_cli.js —— 对应 Go 文件：internal/runtime/agent_cli.go
-// 作用：Agent CLI 的凭据绑定、MCP 配置渲染与私有 HOME 管理。
+/**
+ * @file internal/runtime/agent_cli.js
+ * @description 对应 Go 源文件：internal/runtime/agent_cli.go
+ *
+ * 职责与边界：
+ * 负责 CodeBuddy / Codex / Claude Code 之外的扩展 Agent CLI（OpenCode、Cursor CLI、Antigravity、
+ * Kimi Code、Pi、DeepSeek Harness、ZCode）的常量定义、协议规范化、MCP 配置渲染、
+ * 私有 HOME 路径安全打开与凭据/模型配置绑定。
+ * 不负责进程启动与流式输出解析（流式解析见 `agent_cli_stream.js`）。
+ *
+ * 语法差异说明：
+ * - Go 的 `(值, error)` 译为成功返回值、失败抛出 `Error`；仅 `error` 译为成功返回 `undefined`、失败抛出 `Error`。
+ * - Go 的 `(值1, 值2, error)` 译为成功返回二元组 `[值1, 值2]`、失败抛出 `Error`。
+ * - Go `struct` 译为带 `constructor(init = {})` 的类，字段严格按 Go 零值初始化。
+ * - Go 标准库 `os.Root` 在 JS 中无内置对应物，以 `Root` 类配合基路径边界校验进行对照实现。
+ */
 
 "use strict";
 
 const fs = require("node:fs");
 const path = require("node:path");
-const { AgentCLIExecutorKinds, IsAgentCLIKind, NormalizeAgentCLIProtocol, ValidateAgentEffort } = require("../domain/agent.js"); // 对应 Go 的 domain，domain 已翻译
+const { AgentCLIExecutorKinds, IsAgentCLIKind, ValidateAgentEffort } = require("../domain/agent.js"); // 对应 Go 的 domain，domain 已翻译
 const domainUser = require("../domain/user.js"); // 对应 Go 的 domain，domain 已翻译
 const { AutoUpdateEnvironment } = require("../managedcli/providers.js"); // 对应 Go 的 managedcli.AutoUpdateEnvironment，managedcli 已翻译
 const { ensureRootDirectory } = require("./materialize.js"); // 对应 Go 同包函数，materialize.js 待翻译
@@ -13,7 +27,7 @@ const { runnerLoginSpec, prepareRunnerLogin } = require("./conversation_runner_l
 const { CursorModelID } = require("./cursor_models.js"); // 对应 Go 同包函数，cursor_models.js 待翻译
 const zcode = require("./agent_cli_zcode.js"); // 对应 Go 同包常量，agent_cli_zcode.js 待翻译；本文件加载时读取其常量，zcode 文件顶层不引用本文件，故无循环加载问题
 
-// CodeBuddy / Codex / Claude Code 之外的 Agent CLI。
+// CodeBuddy / Codex / Claude Code 之外的 Agent CLI 标识常量。
 const AgentCLIOpenCode = "opencode";
 const AgentCLICursor = "cursor";
 const AgentCLIAntigravity = "agy";
@@ -25,6 +39,13 @@ const AgentCLIZCode = "zcode";
 // AgentCLIKinds：Agent CLI 的展示顺序。
 const AgentCLIKinds = AgentCLIExecutorKinds;
 
+/**
+ * 判断执行器种类是否属于扩展 Agent CLI。
+ * 在凭据绑定、命令构造与配置渲染分支判定时调用。
+ *
+ * @param {string} kind - 执行器种类标识。
+ * @returns {boolean} 属于扩展 Agent CLI 返回 `true`，否则返回 `false`。
+ */
 function IsAgentCLI(kind) { return IsAgentCLIKind(kind); }
 
 const AgentCLIProtocolChat = domainUser.AgentCLIProtocolChat;
@@ -33,14 +54,35 @@ const AgentCLIProtocolMessages = domainUser.AgentCLIProtocolMessages;
 const AgentCLIProtocolGemini = domainUser.AgentCLIProtocolGemini;
 const AgentCLIProtocolOptions = domainUser.AgentCLIProtocolOptions;
 
+/**
+ * 获取指定 Agent CLI 支持的协议列表。
+ * 在表单展示或协议校验场景下调用。
+ *
+ * @param {string} kind - Agent CLI 种类标识。
+ * @returns {string[] | undefined} 支持的协议数组；未知种类返回 `undefined`。
+ */
 function AgentCLIProtocols(kind) { return AgentCLIProtocolOptions[kind]; }
 
-// AgentCLIProtocol：规范化存储的协议选择，未知值回落到该 CLI 的默认值。
+/**
+ * 规范化已保存的协议选择；未知取值回落到该 CLI 的默认协议。
+ * 在绑定凭据或判断是否需要 Base URL 前调用。
+ *
+ * @param {string} kind - Agent CLI 种类标识。
+ * @param {string} protocol - 待规范化的协议字符串。
+ * @returns {string} 规范化后的协议标识或空字符串 `""`。
+ */
 function AgentCLIProtocol(kind, protocol) {
-  return NormalizeAgentCLIProtocol(kind, protocol);
+  return domainUser.NormalizeAgentCLIProtocol(kind, protocol);
 }
 
-// AgentCLINeedsBaseURL：凭据缺 Base URL 是否不可用。
+/**
+ * 判断指定 Agent CLI 在给定协议下是否必须填写 Base URL 才能使用。
+ * OpenCode 与 Pi 无官方端点，Antigravity 仅在 OpenAI Chat 兼容协议下需要网关地址。
+ *
+ * @param {string} kind - Agent CLI 种类标识。
+ * @param {string} protocol - 协议字符串。
+ * @returns {boolean} 必须提供 Base URL 返回 `true`，否则返回 `false`。
+ */
 function AgentCLINeedsBaseURL(kind, protocol) {
   switch (kind) {
     case AgentCLIOpenCode:
@@ -52,7 +94,14 @@ function AgentCLINeedsBaseURL(kind, protocol) {
   return false;
 }
 
-// agentCLIModelOptional：执行器与对话均未指定模型时 CLI 是否自选模型。
+/**
+ * 判断执行器与对话均未指定模型时，CLI 是否允许自行选择默认模型。
+ * Cursor 与 ZCode 始终允许；Antigravity 与 DeepSeek 仅在使用官方默认端点时允许。
+ *
+ * @param {string} kind - Agent CLI 种类标识。
+ * @param {string} baseURL - 去除首尾空白和末尾斜杠后的 Base URL。
+ * @returns {boolean} 允许省略模型名返回 `true`，否则返回 `false`。
+ */
 function agentCLIModelOptional(kind, baseURL) {
   switch (kind) {
     case AgentCLICursor:
@@ -66,8 +115,22 @@ function agentCLIModelOptional(kind, baseURL) {
   return false;
 }
 
-// AgentCLIOptions：凭据绑定渲染 CLI 模型配置所需的单次调用事实。
+/**
+ * 单次 Agent CLI 调用的凭据绑定选项，用于渲染模型、推理强度、系统提示与只读权限配置。
+ */
 class AgentCLIOptions {
+  /**
+   * 构造 AgentCLIOptions 实例，未传入字段按 Go 零值初始化。
+   *
+   * @param {Object} [init={}] - 可选初始字段对象。
+   * @param {string} [init.ApprovalCommand=""] - 工具审批钩子命令。
+   * @param {string} [init.Model=""] - 指定模型标识。
+   * @param {string} [init.Effort=""] - 推理强度等级。
+   * @param {string} [init.SystemPromptFile=""] - 进程视角的系统提示词文件路径。
+   * @param {boolean} [init.ReadOnly=false] - 是否处于只读对话模式。
+   * @param {boolean} [init.ImageInput=false] - 是否启用多模态图片输入。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     this.ApprovalCommand = init.ApprovalCommand ?? "";
     this.Model = init.Model ?? "";
@@ -82,11 +145,11 @@ class AgentCLIOptions {
   }
 }
 
-// agentCLIKeyEnv：以变量名而非密钥本身配置的 CLI 所用的用户密钥变量。
+// agentCLIKeyEnv：以变量名而非密钥本身配置的 CLI 所用的用户密钥环境变量名。
 const agentCLIKeyEnv = "AGENTFLOW_CLI_API_KEY";
 const kimiThinkingEffortEnv = "KIMI_MODEL_THINKING_EFFORT";
 
-// agentCLIHostEnv：每个子进程都要清除的宿主环境变量。
+// agentCLIHostEnv：每个子进程都要清除的宿主环境变量列表，避免继承宿主登录态、密钥或配置目录。
 const agentCLIHostEnv = [
   agentCLIKeyEnv, "CURSOR_API_KEY", "CURSOR_AUTH_TOKEN", "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GEMINI_BASE_URL", "GEMINI_BASE_URL",
   "AGY_ADC_AUTH", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_GENAI_USE_VERTEXAI", "GEMINI_HOME", "AGY_ACP_FORCE_FILE_STORAGE",
@@ -98,7 +161,7 @@ const agentCLIHostEnv = [
   ...zcode.zcodeHostEnv,
 ];
 
-// agentCLIMCPPaths：Agent CLI 读取 MCP 服务器的 HOME 相对文件。
+// agentCLIMCPPaths：各 Agent CLI 读取 MCP 服务器配置的 HOME 相对文件路径映射。
 const agentCLIMCPPaths = {
   [AgentCLIOpenCode]: ".config/opencode/opencode.json",
   [AgentCLICursor]: ".cursor/mcp.json",
@@ -109,8 +172,17 @@ const agentCLIMCPPaths = {
   [AgentCLIZCode]: zcode.zcodeConfigPath,
 };
 
-// AgentCLIMCPOptions：一次调用的 MCP 配置形态。
+/**
+ * 一次调用的 MCP 配置渲染选项。
+ */
 class AgentCLIMCPOptions {
+  /**
+   * 构造 AgentCLIMCPOptions 实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段对象。
+   * @param {boolean} [init.ReadOnly=false] - 是否禁用 CLI 自身的 shell、编辑与 web 工具（仅保留 MCP 工具）。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     // ReadOnly：禁用 CLI 自身的 shell、编辑与 web 工具。
     this.ReadOnly = init.ReadOnly ?? false;
@@ -119,13 +191,22 @@ class AgentCLIMCPOptions {
 
 const dshServerNameRe = /[^A-Za-z0-9_-]/g;
 
-// WriteAgentCLIMCPConfig：按 CLI 自身格式把 MCP 条目渲染到 home 下，替换上次调用的残留。
+/**
+ * 按目标 Agent CLI 的原生格式把 MCP 条目渲染并写入指定 HOME 目录，覆盖上次调用的残留配置。
+ * 在启动 Agent CLI 之前装配 MCP 服务器列表时调用。
+ *
+ * @param {string} kind - Agent CLI 种类标识。
+ * @param {AgentCLIHome} home - 目标私有 HOME 描述对象。
+ * @param {Object<string, Object>} entries - MCP 条目映射（键为服务 ID，值为含 `url`/`headers` 或 `command`/`args`/`cwd`/`env` 的对象）。
+ * @param {AgentCLIMCPOptions} options - MCP 配置选项（如是否只读）。
+ * @returns {void} 成功无返回值；未知 CLI 类型或写文件失败时抛出 `Error`。
+ */
 function WriteAgentCLIMCPConfig(kind, home, entries, options) {
   const rel = agentCLIMCPPaths[kind];
   if (rel === undefined) {
     throw new Error(`unknown agent CLI ${JSON.stringify(kind)}`);
   }
-  const ids = Object.keys(entries);
+  const ids = Object.keys(entries ?? {});
   ids.sort();
   const servers = {};
   let dshInserts = [];
@@ -208,7 +289,13 @@ function WriteAgentCLIMCPConfig(kind, home, entries, options) {
   writeAgentCLIFile(home, rel, data);
 }
 
-// openCodeMCPServer：为 OpenCode 渲染一条 MCP 条目。
+/**
+ * 为 OpenCode 渲染单条 MCP 服务器配置（远程 URL 模式或本地命令行 argv 模式）。
+ * 由 `WriteAgentCLIMCPConfig` 在处理 OpenCode 时调用。
+ *
+ * @param {Object} entry - 通用 MCP 条目对象。
+ * @returns {Object} 符合 OpenCode 配置格式的 MCP 服务器对象。
+ */
 function openCodeMCPServer(entry) {
   const url = typeof entry["url"] === "string" ? entry["url"] : "";
   if (url !== "") {
@@ -235,7 +322,15 @@ function openCodeMCPServer(entry) {
   return server;
 }
 
-// deepSeekMCPInsert：把一条 MCP 条目渲染为 dsh-mcp-client 插件 insert；服务器名是消毒后截断到 32 字符的 id。
+/**
+ * 将单条 MCP 条目渲染为 DeepSeek Harness 的 `dsh-mcp-client` 插件 insert 配置，
+ * 服务器名由消毒并截断到 32 字符的 `id` 构成。
+ * 由 `WriteAgentCLIMCPConfig` 在处理 DeepSeek Harness 时调用。
+ *
+ * @param {string} id - MCP 服务标识。
+ * @param {Object} entry - 通用 MCP 条目对象。
+ * @returns {Object} `dsh-mcp-client` 插件插入对象。
+ */
 function deepSeekMCPInsert(id, entry) {
   let name = id.replace(dshServerNameRe, "_");
   if (name.length > 32) {
@@ -263,9 +358,18 @@ function deepSeekMCPInsert(id, entry) {
   return { id: "agentflow-mcp-" + name, name: "@deepseek-ai/dsh-mcp-client", config };
 }
 
-// agyChatPermissions：AI 对话的 Antigravity 拒绝规则。
+// agyChatPermissions：AI 对话模式下 Antigravity 的工具拒绝规则。
 const agyChatPermissions = { allow: ["mcp(*)"], deny: ["command(*)", "write_file(*)", "read_url(*)"] };
 
+/**
+ * 将数据安全写入指定 Agent CLI HOME 下的相对路径文件（权限 0o600，自动创建父目录）。
+ * 在写入 MCP 配置或模型/凭据配置文件时调用。
+ *
+ * @param {AgentCLIHome} home - 目标私有 HOME 描述对象。
+ * @param {string} rel - 相对于 HOME 的文件路径。
+ * @param {string | Buffer} data - 待写入的文件内容。
+ * @returns {void} 成功无返回值；路径非法或文件操作失败时抛出 `Error`。
+ */
 function writeAgentCLIFile(home, rel, data) {
   rel = path.normalize(rel);
   if (!isLocalPath(rel) || path.isAbsolute(rel) || rel.startsWith("..")) {
@@ -283,37 +387,82 @@ function writeAgentCLIFile(home, rel, data) {
   }
 }
 
-// AgentCLIHome：受信基目录下的 Agent CLI HOME 位置。
+/**
+ * 描述位于受信基目录下的 Agent CLI HOME 位置。
+ * 用于在工作区可能被沙箱篡改为符号链接的场景下安全定位并校验 HOME 目录。
+ */
 class AgentCLIHome {
+  /**
+   * 构造 AgentCLIHome 实例。
+   *
+   * @param {Object} [init={}] - 可选初始字段对象。
+   * @param {string} [init.Base=""] - 控制面拥有的受信基目录路径。
+   * @param {string} [init.Rel=""] - 基目录下的本地相对路径，每一级都必须是真实目录。
+   * @returns {void} 无返回值。
+   */
   constructor(init = {}) {
     // Base 受信，可按原样打开；Rel 是 Base 下的本地路径。
     this.Base = init.Base ?? "";
     this.Rel = init.Rel ?? "";
   }
 
-  // Path：HOME 的宿主路径。
+  /**
+   * 返回该 HOME 在宿主文件系统上的完整路径。
+   *
+   * @returns {string} 拼接后的宿主路径。
+   */
   Path() { return path.join(this.Base, this.Rel); }
 }
 
-// HostAgentCLIHome：控制面自己选定的 HOME。
+/**
+ * 构造控制面自身选定的宿主 HOME 描述对象（其父目录受信，HOME 本身仍须为真实目录）。
+ *
+ * @param {string} home - 宿主 HOME 绝对或相对路径。
+ * @returns {AgentCLIHome} 对应的 `AgentCLIHome` 实例。
+ */
 function HostAgentCLIHome(home) {
   home = path.normalize(home);
   return new AgentCLIHome({ Base: path.dirname(home), Rel: path.basename(home) });
 }
 
-// WorkspaceAgentCLIHome：<workspace>/.agentflow/private-home 下的私有 HOME 名。
+/**
+ * 构造位于 `<workspace>/.agentflow/private-home/<name>` 下的工作区私有 HOME 描述对象。
+ *
+ * @param {string} workspace - 工作区根目录路径。
+ * @param {string} name - 私有 HOME 名称。
+ * @returns {AgentCLIHome} 对应的 `AgentCLIHome` 实例。
+ */
 function WorkspaceAgentCLIHome(workspace, name) {
   return new AgentCLIHome({ Base: workspace, Rel: path.join(".agentflow", "private-home", name) });
 }
 
-// Go os.Root 无 JS 对应物：以基路径加边界校验模拟，操作限定在基路径内。
+/**
+ * 对照 Go `os.Root` 的基路径边界封装类，确保所有文件与目录操作限定在 `base` 目录内。
+ */
 class Root {
+  /**
+   * 构造 Root 实例。
+   *
+   * @param {string} base - 根目录绝对路径。
+   * @returns {void} 无返回值。
+   */
   constructor(base) {
     this.base = base;
   }
 
+  /**
+   * 关闭根目录句柄（JS 对照实现为空操作）。
+   *
+   * @returns {void} 无返回值。
+   */
   Close() {}
 
+  /**
+   * 将相对路径解析为绝对路径并校验其未越出 `this.base` 边界。
+   *
+   * @param {string} rel - 相对于根目录的路径。
+   * @returns {string} 校验通过的绝对路径；越界时抛出 `Error`。
+   */
   resolve(rel) {
     const full = path.resolve(this.base, rel);
     if (full !== this.base && !full.startsWith(this.base + path.sep)) {
@@ -322,43 +471,99 @@ class Root {
     return full;
   }
 
+  /**
+   * 在根目录下递归创建目录。
+   *
+   * @param {string} rel - 相对目录路径。
+   * @param {number} mode - 目录权限位。
+   * @returns {void} 无返回值。
+   */
   MkdirAll(rel, mode) {
     fs.mkdirSync(this.resolve(rel), { recursive: true, mode });
   }
 
+  /**
+   * 向根目录下的相对路径写入文件。
+   *
+   * @param {string} rel - 相对文件路径。
+   * @param {string | Buffer} data - 文件内容。
+   * @param {number} mode - 文件权限位。
+   * @returns {void} 无返回值。
+   */
   WriteFile(rel, data, mode) {
     fs.writeFileSync(this.resolve(rel), data, { mode });
   }
 
+  /**
+   * 读取根目录下的相对路径文件内容。
+   *
+   * @param {string} rel - 相对文件路径。
+   * @returns {Buffer} 文件字节内容。
+   */
   ReadFile(rel) {
     return fs.readFileSync(this.resolve(rel));
   }
 
+  /**
+   * 获取根目录下相对路径的 `fs.Stats`（跟随符号链接）。
+   *
+   * @param {string} rel - 相对路径。
+   * @returns {fs.Stats} 文件状态对象。
+   */
   Stat(rel) {
     return fs.statSync(this.resolve(rel));
   }
 
+  /**
+   * 获取根目录下相对路径的 `fs.Stats`（不跟随符号链接）。
+   *
+   * @param {string} rel - 相对路径。
+   * @returns {fs.Stats} 文件状态对象。
+   */
   Lstat(rel) {
     return fs.lstatSync(this.resolve(rel));
   }
 
+  /**
+   * 以根目录下某个子目录作为新的 `Root` 打开。
+   *
+   * @param {string} rel - 子目录相对路径。
+   * @returns {Root} 新的子目录 `Root` 实例。
+   */
   OpenRoot(rel) {
     return new Root(this.resolve(rel));
   }
 }
 
-// isLocalPath：Go filepath.IsLocal 的对照实现。
+/**
+ * 判断路径是否为本地相对路径（对应 Go `filepath.IsLocal`）。
+ *
+ * @param {string} p - 待检查路径。
+ * @returns {boolean} 非绝对路径且不指向父目录时返回 `true`，否则返回 `false`。
+ */
 function isLocalPath(p) {
   const clean = path.normalize(p);
   return !path.isAbsolute(p) && clean !== ".." && !clean.startsWith(".." + path.sep);
 }
 
-// sameFile：Go os.SameFile 的对照实现。
+/**
+ * 判断两个 `fs.Stats` 是否指向同一底层文件（对应 Go `os.SameFile`）。
+ *
+ * @param {fs.Stats} a - 第一个文件状态对象。
+ * @param {fs.Stats} b - 第二个文件状态对象。
+ * @returns {boolean} 设备号与 inode 均一致返回 `true`，否则返回 `false`。
+ */
 function sameFile(a, b) {
   return a.dev === b.dev && a.ino === b.ino;
 }
 
-// openAgentCLIHome：把 home 作为 os.Root 打开，缺失目录逐级创建并校验为真实目录。
+/**
+ * 将 `AgentCLIHome` 作为安全 `Root` 打开：逐级创建缺失目录并校验每级均为真实目录，
+ * 打开后再次核对 `SameFile` 防止并发符号链接替换。
+ *
+ * @param {AgentCLIHome} home - 目标私有 HOME 描述对象。
+ * @returns {Root} 打开后的 HOME 根目录句柄；路径非法或目录校验失败时抛出 `Error`。
+ */
 function openAgentCLIHome(home) {
   const rel = path.normalize(home.Rel);
   if (home.Base.trim() === "" || rel === "." || !isLocalPath(rel)) {
@@ -366,18 +571,23 @@ function openAgentCLIHome(home) {
   }
   fs.mkdirSync(home.Base, { recursive: true, mode: 0o700 });
   const base = new Root(home.Base);
-  let current = "";
-  for (const element of rel.split(path.sep)) {
-    current = path.join(current, element);
-    try {
-      ensureRootDirectory(base, current);
-    } catch (err) {
-      throw new Error(`agent CLI home is not a real directory: ${home.Path()}: ${err.message}`);
+  let info;
+  let root;
+  try {
+    let current = "";
+    for (const element of rel.split(path.sep)) {
+      current = path.join(current, element);
+      try {
+        ensureRootDirectory(base, current);
+      } catch (err) {
+        throw new Error(`agent CLI home is not a real directory: ${home.Path()}: ${err.message}`);
+      }
     }
+    info = base.Lstat(rel);
+    root = base.OpenRoot(rel);
+  } finally {
+    base.Close();
   }
-  const info = base.Lstat(rel);
-  const root = base.OpenRoot(rel);
-  base.Close();
   // 打开后组件可能已被换成符号链接，再核对一次。
   let opened = null;
   let statErr = null;
@@ -393,7 +603,18 @@ function openAgentCLIHome(home) {
   return root;
 }
 
-// ApplyAgentCLICredential：把 Agent CLI 凭据相关的模型配置写入 home，返回运行用的 argv 与环境变量。密钥本身只进环境变量。
+/**
+ * 将 Agent CLI 凭据相关的模型配置写入 `home`，并返回运行所需的命令参数与环境变量映射。
+ * API Key 本身只写入环境变量，配置文件仅引用环境变量名（ZCode 除外，由专用清理钩子保障）。
+ *
+ * @param {string} kind - Agent CLI 种类标识。
+ * @param {Object} cred - 供应商凭据对象（含 `APIKey`、`BaseURL`、`Protocol`、`Models`）。
+ * @param {AgentCLIOptions} options - 单次调用选项（模型、推理强度、系统提示、只读、图片输入等）。
+ * @param {AgentCLIHome} home - 宿主侧私有 HOME 描述对象。
+ * @param {string} homeEnv - 子进程视角看到的 HOME 路径。
+ * @param {string[]} argv - 原始命令行参数数组。
+ * @returns {[string[], Object<string, string>]} 二元组 `[更新后的 argv, 环境变量映射]`；配置校验或写文件失败时抛出 `Error`。
+ */
 function ApplyAgentCLICredential(kind, cred, options, home, homeEnv, argv) {
   const key = cred.APIKey.trim();
   if (key === "") {
@@ -551,12 +772,31 @@ function ApplyAgentCLICredential(kind, cred, options, home, homeEnv, argv) {
   return [argv, env];
 }
 
-// agentCLIPiAPI：把线路协议映射为 Pi 与 DeepSeek Harness provider 配置共用的 pi-ai api 名。
+/**
+ * 将线路协议映射为 Pi 与 DeepSeek Harness 共用的 `pi-ai` API 类型名称。
+ *
+ * @param {string} protocol - 规范化后的协议常量。
+ * @returns {string | undefined} 对应的 `pi-ai` API 名称。
+ */
 function agentCLIPiAPI(protocol) {
   return { [AgentCLIProtocolChat]: "openai-completions", [AgentCLIProtocolResponses]: "openai-responses", [AgentCLIProtocolMessages]: "anthropic-messages" }[protocol];
 }
 
-// applyDeepSeekCredential：写 DeepSeek Harness 模型补丁，并把启动器 --patch 标志放到 profile 自身参数之前。
+/**
+ * 写入 DeepSeek Harness 模型补丁文件，并将启动器 `--patch` 参数插入到 profile 参数之前。
+ * 由 `ApplyAgentCLICredential` 在处理 DeepSeek Harness 时调用。
+ *
+ * @param {AgentCLIHome} home - 宿主侧私有 HOME 描述对象。
+ * @param {string} homeEnv - 进程视角 HOME 路径。
+ * @param {string} key - API 密钥。
+ * @param {string} baseURL - 自定义网关地址（为空表示官方端点）。
+ * @param {string} protocol - 规范化后的协议标识。
+ * @param {string} model - 目标模型名称。
+ * @param {string} effort - 推理强度等级。
+ * @param {boolean} imageInput - 是否启用多模态图片输入。
+ * @param {string[]} argv - 原始命令行参数数组。
+ * @returns {[string[], Object<string, string>]} 二元组 `[带 --patch 的 argv, 环境变量映射]`；校验或写入失败时抛出 `Error`。
+ */
 function applyDeepSeekCredential(home, homeEnv, key, baseURL, protocol, model, effort, imageInput, argv) {
   const env = {};
   let patch = [];
@@ -644,7 +884,14 @@ function applyDeepSeekCredential(home, homeEnv, key, baseURL, protocol, model, e
   return [argv, env];
 }
 
-// insertBeforeFlag：在 flag 最后一次出现之前插入值，flag 不存在时追加。
+/**
+ * 在参数数组中最后一次出现 `flag` 的位置之前插入若干参数；若 `flag` 不存在则追加到末尾。
+ *
+ * @param {string[]} argv - 原始参数数组（不就地修改）。
+ * @param {string} flag - 目标标志参数名。
+ * @param {...string} values - 待插入的参数列表。
+ * @returns {string[]} 插入后的新参数数组。
+ */
 function insertBeforeFlag(argv, flag, ...values) {
   for (let i = argv.length - 1; i > 0; i--) {
     if (argv[i] === flag) {
@@ -655,7 +902,12 @@ function insertBeforeFlag(argv, flag, ...values) {
   return [...argv, ...values];
 }
 
-// AgentCLIUserCredentials：把用户保存的 Agent CLI 凭据映射为命令绑定用的表单。
+/**
+ * 将用户保存的扩展 Agent CLI 凭据映射为命令绑定阶段使用的供应商凭据字典。
+ *
+ * @param {Object} user - 领域用户对象（含 `AgentCLICredentials`）。
+ * @returns {Object<string, Object> | null} 按 CLI 种类索引的凭据对象；用户未配置任何凭据时返回 `null`。
+ */
 function AgentCLIUserCredentials(user) {
   if (user.AgentCLICredentials === null || user.AgentCLICredentials === undefined || Object.keys(user.AgentCLICredentials).length === 0) {
     return null;
@@ -667,7 +919,12 @@ function AgentCLIUserCredentials(user) {
   return out;
 }
 
-// AgentCLILabel：错误与设置中展示的产品名。
+/**
+ * 返回用于错误提示与设置界面展示的 Agent CLI 产品名称。
+ *
+ * @param {string} kind - Agent CLI 种类标识。
+ * @returns {string} 展示名称；未知种类原样返回 `kind`。
+ */
 function AgentCLILabel(kind) {
   switch (kind) {
     case AgentCLIOpenCode:
@@ -688,7 +945,12 @@ function AgentCLILabel(kind) {
   return kind;
 }
 
-// AgentCLIBinary：各 Agent CLI 安装的可执行文件。
+/**
+ * 返回各 Agent CLI 安装的可执行文件名。
+ *
+ * @param {string} kind - Agent CLI 种类标识。
+ * @returns {string} 可执行文件名（如 Cursor 对应 `"cursor-agent"`，其余同 `kind`）。
+ */
 function AgentCLIBinary(kind) {
   switch (kind) {
     case AgentCLICursor:
@@ -697,7 +959,13 @@ function AgentCLIBinary(kind) {
   return kind;
 }
 
-// withCursorModelArg：替换首个 --model 选项的值。
+/**
+ * 替换命令行参数中首个 `--model` 选项对应的模型值，返回新数组（不就地修改输入）。
+ *
+ * @param {string[]} argv - 原始参数数组。
+ * @param {string} id - 新的模型标识。
+ * @returns {string[]} 替换后的参数数组；若未找到 `--model` 或值相同则直接返回原数组。
+ */
 function withCursorModelArg(argv, id) {
   for (let i = 0; i + 1 < argv.length; i++) {
     if (argv[i] === "--model") {
