@@ -1,6 +1,17 @@
-// conversation_zcode.js —— 对应 Go 文件：internal/runtime/conversation_zcode.go
-// 作用：恢复 ZCode 会话前先用官方协议把选中模型写回该会话，再交回原生命令。
-// Go 的 encoding/json 译为 JSON；path/filepath 译为 path。
+/**
+ * @file internal/runtime/conversation_zcode.js
+ * @description 对应 Go 源文件：internal/runtime/conversation_zcode.go
+ *
+ * 职责与边界：
+ * 负责在恢复 ZCode 原生会话前包装命令行参数并生成前置 Python 脚本，
+ * 通过 ZCode 官方 `app-server --stdio` 协议将所选模型应用到目标会话，再 `exec` 交回原始命令继续执行。
+ * 不负责 ZCode 凭据配置渲染或会话日志解析。
+ *
+ * 语法差异说明：
+ * - Go 的 `encoding/json` 译为 `JSON`；`path/filepath` 译为 `path`。
+ * - Go 的 `var denied []string` 未赋值时为 `nil`，JSON 序列化后为 `"null"`，JS 中以 `null` 初值严格保持一致。
+ * - Go 的反引号原生字符串译为模板字符串，其中的 `\n` 转义为 `\\n` 以保持 Python 脚本原文不变。
+ */
 
 "use strict";
 
@@ -8,6 +19,15 @@ const path = require("node:path"); // Go path/filepath
 
 const { zcodeHostEnv } = require("./agent_cli_zcode.js"); // 对应 Go 同包变量，agent_cli_zcode.js 已翻译
 
+/**
+ * 当 ZCode 命令包含 `--resume <session>` 时，在已绑定命令前包装前置模型设置脚本调用。
+ * 在对话进程启动准备阶段（`conversation_process.js`）完成凭据绑定后调用。
+ *
+ * @param {string} root 会话根目录的绝对路径。
+ * @param {string[]} native 绑定前的原始命令行参数数组（用于提取 CLI 路径、会话 ID 与禁用工具列表）。
+ * @param {string[]} bound 经凭据与沙箱绑定后的命令行参数数组。
+ * @returns {string[]} 最终要执行的命令行参数数组；非恢复会话时原样返回 `bound`。
+ */
 function conversationZCodeResumeArgv(root, native, bound) {
   let session = "";
   let denied = null; // Go：var denied []string，未赋值时是 nil，Marshal 后为 null
@@ -30,6 +50,12 @@ function conversationZCodeResumeArgv(root, native, bound) {
   return ["python3", path.join(root, "zcode-resume-model.py"), native[0], session, denyJSON, ...bound];
 }
 
+/**
+ * 渲染写入会话根目录的 `zcode-resume-model.py` 脚本字节内容，注入需剔除的宿主机环境变量清单。
+ * 在安装会话审批与辅助脚本（`conversation_approval.js`）时调用。
+ *
+ * @returns {Buffer} 渲染完成的 Python 脚本 UTF-8 字节内容。
+ */
 function conversationZCodeResumeScript() {
   const hostEnv = JSON.stringify(zcodeHostEnv);
   return Buffer.from(conversationZCodeResumePython.replaceAll("__HOST_ENV__", hostEnv), "utf8");

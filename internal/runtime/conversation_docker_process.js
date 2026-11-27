@@ -1,15 +1,33 @@
-// conversation_docker_process.js —— 对应 Go 文件：internal/runtime/conversation_docker_process.go
-// 作用：容器内原生 CLI 的进程包装：Linux 子收割者监管脚本与停止脚本。
-// Go 原始字符串译为模板字面量。
+/**
+ * @file 对应 Go 源文件：internal/runtime/conversation_docker_process.go
+ * 职责边界：构造容器内运行与停止原生 CLI 所需的进程包装命令参数，内嵌基于 Linux 子收割者
+ * （PR_SET_CHILD_SUBREAPER）的 Python 监管脚本与停止脚本，确保孤儿及派生子进程能被彻底清理。
+ * 语法差异说明：
+ * - Go 原始字符串（反引号）译为 JS 模板字面量；
+ * - Go 切片拼接（append）译为数组展开语法。
+ */
 
 "use strict";
 
 const { withToolchainPath } = require("./toolchain.js"); // 对应 Go 同包函数，toolchain.js 待翻译
 
+/**
+ * 构造容器内通过子收割者监管脚本启动原生 CLI 的命令行参数。
+ * 使用场景：在 Docker 容器中启动原生 CLI 进程时包装原始命令，用于跟踪并清理其全部后代进程。
+ * @param {string} file 进程状态控制文件路径（同时会派生同前缀的 .tmp 与 .stop 文件）。
+ * @param {string[]} argv 实际要执行的原生 CLI 命令及其参数列表。
+ * @returns {string[]} 附加工具链路径包装后的完整命令参数数组。
+ */
 function dockerConversationProcessArgv(file, argv) {
   return withToolchainPath(["python3", "-c", dockerConversationProcessSupervisor, file, ...argv]);
 }
 
+/**
+ * 构造容器内停止受监管原生 CLI 进程的命令行参数。
+ * 使用场景：需要取消或终止容器内正在运行的原生 CLI 会话时，通过停止脚本写入标记并向监管进程发送 SIGTERM。
+ * @param {string} file 进程状态控制文件路径，与启动时传入的 file 一致。
+ * @returns {string[]} 附加工具链路径包装后的停止命令参数数组。
+ */
 function dockerConversationStopArgv(file) {
   return withToolchainPath(["python3", "-c", dockerConversationProcessStop, file]);
 }

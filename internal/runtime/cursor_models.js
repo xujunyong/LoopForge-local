@@ -1,7 +1,8 @@
 // cursor_models.js —— 对应 Go 文件：internal/runtime/cursor_models.go
-// 作用：cursor-agent 的模型族表：按思考强度把族 ID 解析成具体模型 ID，或把 CLI 列出的强度 ID 折叠回族。
-// (值, bool) 译为 [值, bool]；slices.Clone 译为数组展开复制，slices.Index 译为 indexOf；
-// Go 的 map[string]string 译为普通对象，nil 切片译为 null。
+// 作用与职责边界：维护 cursor-agent 内置模型族表，支持按思考强度解析具体模型 ID、查询可用强度列表，以及将 CLI 返回的按强度拆分的模型列表折叠为模型族。
+// 语法差异说明：
+// - Go 的 (值, bool) 译为 [值, bool]；slices.Clone 译为数组浅拷贝，slices.Index 译为 indexOf；
+// - Go 的 map[string]string 译为普通对象 {}，nil 切片译为 null。
 
 "use strict";
 
@@ -9,7 +10,19 @@ const { ExecutorEffortLevels } = require("../domain/agent.js"); // 对应 Go 的
 const domain = require("../domain/user.js"); // 对应 Go 的 domain，user.js 已翻译
 const { AgentCLICursor } = require("./agent_cli.js"); // 对应 Go 同包常量，agent_cli.js 已翻译
 
+/**
+ * 表示 cursor-agent 的一个模型族，包含展示名称、默认思考强度及各强度对应的实际模型 ID 映射。
+ */
 class CursorModel {
+  /**
+   * 构造一个 CursorModel 实例，未传入字段按 Go 零值初始化。
+   *
+   * @param {Object} [init={}] 初始化字段对象。
+   * @param {string} [init.ID=""] 模型族 ID。
+   * @param {string} [init.Name=""] 模型族展示名称。
+   * @param {string} [init.Default=""] 默认思考强度；无强度变体时为空字符串。
+   * @param {Object<string, string>} [init.Variants={}] 思考强度到 cursor-agent 实际模型 ID 的映射。
+   */
   constructor(init = {}) {
     this.ID = init.ID ?? "";
     this.Name = init.Name ?? "";
@@ -109,13 +122,31 @@ const [cursorModelByID, cursorModelByVariant] = (() => {
   return [byID, byVariant];
 })();
 
+/**
+ * 返回内置 cursor-agent 模型族表的浅拷贝（按展示顺序排列）。
+ *
+ * @returns {CursorModel[]} 内置模型族数组副本。
+ */
 function CursorModels() { return [...cursorModels]; }
 
+/**
+ * 根据具体的 cursor-agent 模型变体 ID 反查所属的模型族。
+ *
+ * @param {string} id cursor-agent 模型变体 ID。
+ * @returns {[CursorModel, boolean]} 命中时返回 `[模型族, true]`；未命中时返回 `[空 CursorModel, false]`。
+ */
 function CursorModelFamily(id) {
-  const model = cursorModelByVariant[id];
+  const model = Object.prototype.hasOwnProperty.call(cursorModelByVariant, id) ? cursorModelByVariant[id] : undefined;
   return [model ?? new CursorModel(), model !== undefined];
 }
 
+/**
+ * 按思考强度从弱到强返回指定模型族支持的全部强度列表；未知模型族或无强度变体时返回 null。
+ *
+ * @param {string} id 模型族 ID。
+ * @param {Array<Object>|null} catalog 账号保存的 Cursor 模型目录（用于解析动态折叠的模型族）。
+ * @returns {string[]|null} 支持的思考强度列表；无可用强度时返回 null。
+ */
 function CursorModelEfforts(id, catalog) {
   const [model, ok] = lookupCursorFamily(id, catalog);
   if (!ok) {
@@ -130,6 +161,14 @@ function CursorModelEfforts(id, catalog) {
   return out.length === 0 ? null : out;
 }
 
+/**
+ * 将模型族 ID 与期望思考强度解析为 cursor-agent 实际接受的模型 ID；未知族 ID 原样透传。
+ *
+ * @param {string} id 模型族 ID 或原始模型 ID。
+ * @param {string} effort 期望思考强度（空串取族默认值，不支持时取最接近且偏强的强度）。
+ * @param {Array<Object>|null} catalog 账号保存的 Cursor 模型目录。
+ * @returns {string} 解析后的 cursor-agent 模型 ID。
+ */
 function CursorModelID(id, effort, catalog) {
   const [model, ok] = lookupCursorFamily(id, catalog);
   if (ok) {
@@ -138,6 +177,13 @@ function CursorModelID(id, effort, catalog) {
   return id;
 }
 
+/**
+ * 在已知模型族的 Variants 中按期望强度挑选实际模型 ID，缺失时选取距离最近（等距取更强）的强度变体。
+ *
+ * @param {CursorModel} model 目标模型族对象。
+ * @param {string} effort 期望思考强度。
+ * @returns {string} 匹配到的实际模型 ID。
+ */
 function cursorVariantID(model, effort) {
   if (model.Variants[""] !== undefined) {
     return model.Variants[""];
@@ -162,6 +208,12 @@ function cursorVariantID(model, effort) {
   return model.Variants[best];
 }
 
+/**
+ * 计算整数的绝对值，用于比较两个思考强度档位之间的索引距离。
+ *
+ * @param {number} n 整数值。
+ * @returns {number} n 的绝对值。
+ */
 function abs(n) {
   if (n < 0) {
     return -n;
@@ -183,11 +235,18 @@ const cursorEffortSuffixes = [
 
 const cursorEffortNameSuffixes = ["Extra High", "Minimal", "Medium", "Xhigh", "Ultra", "High", "None", "Max", "Low"];
 
+/**
+ * 先查内置模型族表，再查用户保存的模型目录，查找指定族 ID 对应的 CursorModel 定义。
+ *
+ * @param {string} id 模型族 ID。
+ * @param {Array<Object>|null} catalog 账号保存的 Cursor CLIModel 列表。
+ * @returns {[CursorModel, boolean]} 命中时返回 `[模型族, true]`；未命中时返回 `[空 CursorModel, false]`。
+ */
 function lookupCursorFamily(id, catalog) {
-  if (cursorModelByID[id] !== undefined) {
+  if (Object.prototype.hasOwnProperty.call(cursorModelByID, id)) {
     return [cursorModelByID[id], true];
   }
-  for (const entry of catalog) {
+  for (const entry of catalog ?? []) {
     if (entry.ID !== id || entry.Efforts === null || entry.Efforts === undefined || Object.keys(entry.Efforts).length === 0) {
       continue;
     }
@@ -209,6 +268,12 @@ function lookupCursorFamily(id, catalog) {
   return [new CursorModel(), false];
 }
 
+/**
+ * 校验字符串是否为受支持的思考强度标识。
+ *
+ * @param {string} effort 待校验的强度字符串。
+ * @returns {string} 合法时返回原字符串；非法时返回空字符串。
+ */
 function cursorEffortToken(effort) {
   switch (effort.trim()) {
     case "none":
@@ -225,6 +290,12 @@ function cursorEffortToken(effort) {
   }
 }
 
+/**
+ * 将带思考强度后缀的 cursor-agent 模型 ID 拆分为“族 ID + 思考强度”；末尾 `-fast` 保留在族 ID 中。
+ *
+ * @param {string} id 原始 cursor-agent 模型 ID。
+ * @returns {[string, string, boolean]} 拆分成功返回 `[family, effort, true]`；不含可识别强度后缀返回 `["", "", false]`。
+ */
 function splitCursorEffortID(id) {
   let fast = false;
   if (id.endsWith("-fast") && id.slice(0, -"-fast".length) !== "") {
@@ -247,6 +318,12 @@ function splitCursorEffortID(id) {
   return ["", "", false];
 }
 
+/**
+ * 去掉 cursor-agent 模型展示名中的强度词，同时保留末尾的 `Fast` 及括号补充说明（如 `(NO ZDR)`）。
+ *
+ * @param {string} name 原始模型展示名称。
+ * @returns {string} 去除强度词后的模型族展示名称。
+ */
 function stripCursorEffortName(name) {
   name = name.trim();
   let notes = "";
@@ -278,6 +355,12 @@ function stripCursorEffortName(name) {
   return name + notes;
 }
 
+/**
+ * 为动态折叠出的模型族推断默认思考强度：优先选 `"medium"`，否则取距离 `"medium"` 最近（等距取更强）的可用强度。
+ *
+ * @param {Object<string, string>} variants 该族已收集到的强度到模型 ID 映射。
+ * @returns {string} 推断出的默认思考强度；无有效强度时返回空字符串。
+ */
 function inferredCursorDefault(variants) {
   if (variants["medium"] !== undefined) {
     return "medium";
@@ -302,8 +385,14 @@ function inferredCursorDefault(variants) {
   return best;
 }
 
+/**
+ * 将 `cursor-agent models` 返回的按强度拆分的平铺模型列表折叠为“每族一行”的 CLIModel 列表；内置族按内置表顺序输出，未知族保留 CLI 顺序并附带 Efforts/DefaultEffort。
+ *
+ * @param {Array<Object>|null} models CLI 返回的原始 CLIModel 列表。
+ * @returns {Array<Object>} 折叠去重后的 CLIModel 数组。
+ */
 function FoldCursorCLIModels(models) {
-  const [present, groups, tail] = scanCursorCLIModels(models);
+  const [present, groups, tail] = scanCursorCLIModels(models ?? []);
   const dynamic = mergePlainCursorFamilies(tail, groups);
   const out = [];
   for (const family of cursorModels) {
@@ -321,21 +410,48 @@ function FoldCursorCLIModels(models) {
   return out;
 }
 
+/**
+ * 收集不在内置表中的单个动态模型族的展示名与各强度变体映射。
+ */
 class cursorFamilyGroup {
+  /**
+   * 构造一个 cursorFamilyGroup 实例。
+   *
+   * @param {Object} [init={}] 初始化字段对象。
+   * @param {string} [init.name=""] 模型族展示名称。
+   * @param {Object<string, string>} [init.variants={}] 强度到模型 ID 的映射。
+   */
   constructor(init = {}) {
     this.name = init.name ?? "";
     this.variants = init.variants ?? {};
   }
 }
 
+/**
+ * 记录动态模型族或普通独立模型 ID 在 CLI 原始列表中的出现顺序槽位。
+ */
 class cursorModelSlot {
+  /**
+   * 构造一个 cursorModelSlot 实例。
+   *
+   * @param {Object} [init={}] 初始化字段对象。
+   * @param {boolean} [init.family=false] 是否为动态折叠的模型族槽位。
+   * @param {string} [init.id=""] 族 ID 或普通模型 ID。
+   * @param {Object} [init.plain] 普通独立模型对应的 CLIModel 实例。
+   */
   constructor(init = {}) {
     this.family = init.family ?? false;
     this.id = init.id ?? "";
-    this.plain = init.plain ?? null;
+    this.plain = init.plain ?? new domain.CLIModel();
   }
 }
 
+/**
+ * 扫描 CLI 列出的全部模型，将其分类为内置族出现标记（present）、动态折叠族分组（groups）以及动态族与普通模型的顺序槽位（tail）。
+ *
+ * @param {Array<Object>} models 原始 CLIModel 列表。
+ * @returns {[Object<string, boolean>, Object<string, cursorFamilyGroup>, cursorModelSlot[]]} 返回 `[present, groups, tail]` 三元组。
+ */
 function scanCursorCLIModels(models) {
   const present = {};
   const groups = {};
@@ -353,7 +469,7 @@ function scanCursorCLIModels(models) {
     }
     const [familyID, effort, splitOk] = splitCursorEffortID(id);
     if (splitOk) {
-      if (cursorModelByID[familyID] !== undefined) {
+      if (Object.prototype.hasOwnProperty.call(cursorModelByID, familyID)) {
         present[familyID] = true;
         continue;
       }
@@ -384,6 +500,13 @@ function scanCursorCLIModels(models) {
   return [present, groups, tail];
 }
 
+/**
+ * 若某个普通模型 ID 与已折叠的动态族 ID 同名，则将其并入该族作为 `medium` 变体（若尚未存在）并更新族展示名，同时从尾列表中移除重复项。
+ *
+ * @param {cursorModelSlot[]} tail 扫描得到的顺序槽位列表。
+ * @param {Object<string, cursorFamilyGroup>} groups 动态模型族分组映射。
+ * @returns {cursorModelSlot[]} 合并去重后的动态槽位列表。
+ */
 function mergePlainCursorFamilies(tail, groups) {
   const dynamic = [];
   for (const item of tail) {
@@ -406,6 +529,13 @@ function mergePlainCursorFamilies(tail, groups) {
   return dynamic;
 }
 
+/**
+ * 将单个动态模型族分组组装为可持久化的 CLIModel 行，无展示名时回退为族 ID。
+ *
+ * @param {string} id 动态模型族 ID。
+ * @param {cursorFamilyGroup} g 动态模型族分组对象。
+ * @returns {Object} 包含 ID、Name、Efforts 与 DefaultEffort 的 CLIModel 实例。
+ */
 function cursorFamilyRow(id, g) {
   const name = g.name === "" ? id : g.name;
   const variants = {};

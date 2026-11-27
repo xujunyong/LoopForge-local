@@ -1,6 +1,12 @@
-// conversation_approval.js —— 对应 Go 文件：internal/runtime/conversation_approval.go
-// 作用：为各 Agent CLI 安装原生工具审批钩子，拦截工具调用并向网关请求批准。
-// (值, error) 译为返回值、失败 throw；Go 原始字符串译为模板字面量。
+/**
+ * @file 对应 Go 源文件：internal/runtime/conversation_approval.go
+ * 职责边界：为各类原生 Agent CLI 安装工具调用审批钩子（Python/JS/TS 钩子脚本与配置），
+ * 在工具执行前拦截请求并通过网关向平台申请批准；仅安装供应商自有钩子，不写入凭据。
+ * 语法差异说明：
+ * - Go 的 (值, error) 返回值译为成功直接返回、失败 throw Error；
+ * - Go 原始字符串（反引号）译为 JS 模板字面量；
+ * - Go 的 strconv.Quote 对普通字符串使用 JSON.stringify 等价表达。
+ */
 
 "use strict";
 
@@ -21,8 +27,14 @@ const conversationApprovalHookWatchdog = 2147483;
 const conversationApprovalRetrySeconds = "120";
 const conversationApprovalLimitSeconds = "570";
 
-// InstallConversationApproval：只安装供应商自有的钩子。生成的脚本不含凭据；
-// 其私有网关能力由进程环境提供，经运行器的控制链路转发。
+/**
+ * 为指定的原生 Agent CLI 安装供应商自有的工具审批钩子并更新启动命令配置。
+ * 使用场景：在会话准备阶段调用，将生成的无凭据审批脚本写入会话目录并挂载到对应 CLI 的配置或参数中。
+ * @param {string} root 会话根目录路径。
+ * @param {string} provider CLI 供应商标识（如 "codebuddy"、"claude-code"、"codex" 等）。
+ * @param {object} command 待启动的命令规格对象（CommandSpec），可能被修改其 Argv 或 AgentCLI 配置。
+ * @returns {object} 安装审批钩子后更新的命令规格对象（CommandSpec）。
+ */
 function InstallConversationApproval(root, provider, command) {
   const hook = path.join(root, "native-approval.py");
   fs.writeFileSync(hook, conversationApprovalPython, { mode: 0o600 });
@@ -114,6 +126,14 @@ function InstallConversationApproval(root, provider, command) {
   return command;
 }
 
+/**
+ * 在命令行参数数组中替换指定标志的值；若该标志不存在，则在可执行文件名后插入该标志及取值。
+ * 使用场景：为 codebuddy / claude-code 注入或覆盖 --settings 配置文件路径。
+ * @param {string[]} argv 原始命令行参数数组（argv[0] 为可执行文件）。
+ * @param {string} name 目标命令行标志名（如 "--settings"）。
+ * @param {string} value 要设置的新参数值。
+ * @returns {string[]} 替换或插入标志后的命令行参数数组。
+ */
 function conversationReplaceFlag(argv, name, value) {
   for (let i = 1; i < argv.length - 1; i++) {
     if (argv[i] === name) {

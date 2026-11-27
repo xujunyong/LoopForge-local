@@ -1,7 +1,13 @@
-// conversation_login_models.js —— 对应 Go 文件：internal/runtime/conversation_login_models.go
-// 作用：用与会话相同的登录来源查询 Runner 上各 CLI 账号可用的模型。
-// context.Context 译为 AbortSignal；(值, error) 译为返回值、失败 throw；
-// Go 的同步 StdinPipe/StdoutPipe 加 bufio.Scanner 是阻塞读写，JS 里译为 async 函数加行队列。
+/**
+ * @file 对应 Go 源文件：internal/runtime/conversation_login_models.go
+ * 职责边界：复用与会话相同的登录来源，在空临时目录与私有 HOME 下调用 Runner 本机 CLI，
+ * 探测 Antigravity、Codex、Claude Code 账号当前可用的模型列表及推理强度选项。
+ * 语法差异说明：
+ * - Go 的 context.Context 译为 AbortSignal，context.WithTimeout 译为 withTimeout；
+ * - Go 的 (值, error) 返回值译为成功直接返回、失败 throw Error；
+ * - Go 的阻塞 StdinPipe/StdoutPipe 与 bufio.Scanner 译为 async 函数与行队列扫描器；
+ * - Go 的 map[string]bool 去重集合译为普通对象 {}。
+ */
 
 "use strict";
 
@@ -18,7 +24,13 @@ const { runnerLoginSpec, prepareConversationRunnerLogin } = require("./conversat
 const { appendEnvironment } = require("./sandbox_process.js"); // 对应 Go 同包函数，sandbox_process.js 待翻译
 const { terminalBaseEnvironment } = require("./workspace_terminal_sandbox.js"); // 对应 Go 同包函数，workspace_terminal_sandbox.js 待翻译
 
-// withTimeout：给 ctx 加一个超时，返回 [信号, 取消函数]，对应 Go 的 context.WithTimeout。
+/**
+ * 基于父级取消信号构造带超时控制的派生 AbortSignal，对应 Go 的 context.WithTimeout。
+ * 使用场景：为查询账号模型的子进程执行设置 15 秒总超时上限。
+ * @param {AbortSignal|null|undefined} ctx 父级取消信号，可为空。
+ * @param {number} ms 超时毫秒数。
+ * @returns {[AbortSignal, function(): void]} 二元组 [signal, cancel]，分别为派生信号与清理定时器的取消函数。
+ */
 function withTimeout(ctx, ms) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new Error("context deadline exceeded")), ms);
@@ -32,8 +44,12 @@ function withTimeout(ctx, ms) {
   return [controller.signal, () => clearTimeout(timer)];
 }
 
-// newLoginScanner：Go 的 bufio.Scanner(io.LimitReader(...)) 加 scanner.Buffer 的对照。
-// 行队列加等待者；2MiB 总量上限与 1MiB 单行上限译为累计字节计数，超限后 Scan 返回 false。
+/**
+ * 创建带总量（2MiB）与单行（1MiB）字节上限的异步按行扫描器，对应 Go 的 bufio.Scanner(io.LimitReader(...))。
+ * 使用场景：逐行读取 Codex 或 Claude Code 子进程标准输出的 JSON-RPC / stream-json 响应。
+ * @param {import("node:stream").Readable} stream 子进程的标准输出可读流。
+ * @returns {{current: string|null, Scan: function(): Promise<boolean>, Bytes: function(): Buffer, Close: function(): void}} 具备 Scan、Bytes、Close 方法的扫描器对象。
+ */
 function newLoginScanner(stream) {
   const lines = [];
   const waiters = [];
@@ -87,7 +103,14 @@ function newLoginScanner(stream) {
   };
 }
 
-// DiscoverRunnerLoginModels：与会话使用相同的登录来源，空工作目录加临时私有 HOME。
+/**
+ * 使用与会话相同的登录来源，在空临时目录和隔离 HOME 中查询指定 CLI 账号可用的模型列表。
+ * 使用场景：Runner 侧模型发现接口调用，支持 Antigravity、Codex 与 Claude Code。
+ * @param {AbortSignal|null|undefined} ctx 外部取消信号。
+ * @param {string} provider CLI 供应商标识。
+ * @param {string} binary 目标 CLI 可执行文件路径。
+ * @returns {Promise<CLIModel[]>} 解析后的可用模型列表。
+ */
 async function DiscoverRunnerLoginModels(ctx, provider, binary) {
   const [login, ok] = runnerLoginSpec(provider);
   if (!ok) {
@@ -216,24 +239,37 @@ async function DiscoverRunnerLoginModels(ctx, provider, binary) {
   }
 }
 
+/**
+ * 解析 Antigravity CLI `models` 子命令的制表符分隔输出，去重后返回模型列表。
+ * 使用场景：DiscoverRunnerLoginModels 处理 Antigravity 输出时调用。
+ * @param {string} output CLI 标准输出文本，每行格式为 "<id>\t<name>"。
+ * @returns {CLIModel[]} 解析并去重后的模型列表。
+ */
 function antigravityLoginModels(output) {
   const models = [];
-  const seen = new Set();
+  const seen = {};
   for (const line of output.split("\n")) {
     const trimmed = line.trim();
     const tab = trimmed.indexOf("\t");
     const found = tab !== -1;
     const id = found ? trimmed.slice(0, tab) : trimmed;
     const name = found ? trimmed.slice(tab + 1) : "";
-    if (!found || id === "" || /[ \r\n]/.test(id) || seen.has(id)) {
+    if (!found || id === "" || /[ \r\n]/.test(id) || seen[id]) {
       continue;
     }
-    seen.add(id);
+    seen[id] = true;
     models.push(new CLIModel({ ID: id, Name: name.trim() }));
   }
   return models;
 }
 
+/**
+ * 通过 JSON-RPC 与 Codex `app-server` 交互，依次完成初始化、读取账号状态并拉取模型列表。
+ * 使用场景：DiscoverRunnerLoginModels 查询 Codex 账号模型时调用。
+ * @param {{Encode: function(any): (Error|null)}} send 向子进程标准输入写入一行 JSON 的编码器。
+ * @param {{Scan: function(): Promise<boolean>, Bytes: function(): Buffer}} scanner 读取子进程标准输出的按行扫描器。
+ * @returns {Promise<CLIModel[]|null>} 成功返回模型列表，协议握手或账号校验失败返回 null。
+ */
 async function codexLoginModels(send, scanner) {
   if (send.Encode({
     id: 1, method: "initialize",
@@ -288,6 +324,13 @@ async function codexLoginModels(send, scanner) {
   return models;
 }
 
+/**
+ * 持续从扫描器读取 JSON-RPC 响应行，直到匹配指定请求 ID 并返回其原始 result 字段字节。
+ * 使用场景：codexLoginModels 等待某次 RPC 请求返回结果时调用。
+ * @param {{Scan: function(): Promise<boolean>, Bytes: function(): Buffer}} scanner 读取子进程标准输出的按行扫描器。
+ * @param {number} id 期望匹配的 JSON-RPC 请求 ID。
+ * @returns {Promise<Buffer|null>} 匹配到的 result 字段 UTF-8 JSON 字节；流结束或缺少 result 时返回 null。
+ */
 async function codexLoginResult(scanner, id) {
   while (await scanner.Scan()) {
     let message = null;
@@ -304,6 +347,13 @@ async function codexLoginResult(scanner, id) {
   return null;
 }
 
+/**
+ * 向 Claude Code 发送 stream-json 初始化控制请求，并从响应中提取可用模型与推理强度列表。
+ * 使用场景：DiscoverRunnerLoginModels 查询 Claude Code 账号模型时调用。
+ * @param {{Encode: function(any): (Error|null)}} send 向子进程标准输入写入一行 JSON 的编码器。
+ * @param {{Scan: function(): Promise<boolean>, Bytes: function(): Buffer}} scanner 读取子进程标准输出的按行扫描器。
+ * @returns {Promise<CLIModel[]|null>} 成功返回模型列表，请求失败或响应无效时返回 null。
+ */
 async function claudeLoginModels(send, scanner) {
   const id = "loopforge-models";
   if (send.Encode({

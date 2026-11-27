@@ -1,8 +1,9 @@
 // git_isolation.js —— 对应 Go 文件：internal/runtime/git_isolation.go
-// 作用：清理旧版 Agent 配置的 Git 掩码、给 .agentflow/ 加 Git 排除、处理 index 锁冲突。
-// Go 的 (值, error) 译为成功返回值、失败 throw；(值, bool) 译为 [值, bool]；(值, bool, error) 译为 [值, bool, 错误或 null]；
-// context.Context 译为 AbortSignal；sync.Mutex 省略，JS 单线程无需加锁；Go 的 map[string]bool 译为普通对象；
-// time.Duration 译为毫秒数；time.Sleep 式的轮询等待译为 Atomics.wait，函数保持同步。
+// 作用与职责边界：清理旧版 Agent 配置在私有克隆中留下的 Git exclude 与 skip-worktree 掩码，为 `.agentflow/` 写入 Git 排除规则，并安全处理 `.git/index.lock` 锁冲突。
+// 语法差异说明：
+// - Go 的 (值, error) 译为成功返回值、失败 throw；(值1, 值2, error) 译为成功返回 [值1, 值2]、失败 throw；
+// - context.Context 译为 AbortSignal；sync.Mutex 在单线程 JS 中略去；defer 译为 try ... finally；
+// - Go 的 map[string]bool 译为普通对象 {}；time.Duration 译为毫秒数；轮询等待用 Atomics.wait 保持同步结构。
 
 "use strict";
 
@@ -28,9 +29,17 @@ const agentFlowGitExcludeBlock = `# AgentFlow managed runtime (hooks, bindings, 
 .agentflow/
 `;
 
+/**
+ * 清理整个工作区（含根目录旧版检出及各子仓库目录）中由旧版指令掩码写入的 Git 配置。
+ *
+ * @param {AbortSignal|null} ctx 用于取消子进程的上下文信号。
+ * @param {string} workspace 工作区根目录路径。
+ * @param {Array<{ WorkspaceDir?: string }>} repositories 工作区内的仓库上下文列表。
+ * @returns {void} 无返回值；遇到非 ENOENT 错误时抛出异常。
+ */
 function RestoreLegacyWorkspaceAgentConfig(ctx, workspace, repositories) {
   RestoreLegacyProjectAgentConfig(ctx, workspace);
-  for (const repo of repositories) {
+  for (const repo of repositories ?? []) {
     const dir = (repo.WorkspaceDir ?? "").trim();
     if (dir === "" || dir === ".") {
       continue;
@@ -56,6 +65,13 @@ function RestoreLegacyWorkspaceAgentConfig(ctx, workspace, repositories) {
   }
 }
 
+/**
+ * 仅对带有旧版掩码标记的私有仓库目录解除 skip-worktree 索引位并移除 `.git/info/exclude` 中的旧版排除块，未标记的仓库保持不动。
+ *
+ * @param {AbortSignal|null} ctx 用于取消子进程的上下文信号。
+ * @param {string} workspace 单个仓库的工作目录路径。
+ * @returns {void} 无返回值；读写或索引更新失败时抛出异常。
+ */
 function RestoreLegacyProjectAgentConfig(ctx, workspace) {
   let git = null;
   let statErr = null;
@@ -104,6 +120,12 @@ function RestoreLegacyProjectAgentConfig(ctx, workspace) {
   }
 }
 
+/**
+ * 确保私有克隆的 `.git/info/exclude` 中包含 `.agentflow/` 排除块，防止 `git stash -u` 误删运行时 hook 与状态文件。
+ *
+ * @param {string} workspace 仓库工作目录路径。
+ * @returns {void} 无返回值；非 Git 目录时静默返回，I/O 失败时抛出异常。
+ */
 function EnsureAgentFlowGitExcludes(workspace) {
   const [root, excludePath] = openWorkspacePath(workspace, path.join(workspace, ".git", "info", "exclude"));
   try {
@@ -150,6 +172,13 @@ function EnsureAgentFlowGitExcludes(workspace) {
   }
 }
 
+/**
+ * 对仓库内被标记了 skip-worktree 的旧版 Agent 配置文件执行 `git update-index --no-skip-worktree`；遇到 `.git/index.lock` 冲突时轮询等待活进程释放，仅在确认锁已陈旧无主时清理重试。
+ *
+ * @param {AbortSignal|null} ctx 用于取消子进程与等待循环的上下文信号。
+ * @param {string} workspace 仓库工作目录路径。
+ * @returns {void} 无返回值；命令失败或锁无法安全解除时抛出异常。
+ */
 function clearLegacyProjectAgentGitIndex(ctx, workspace) {
   const mode = "--no-skip-worktree";
   const paths = trackedSkippedProjectAgentConfigPaths(ctx, workspace);
@@ -168,11 +197,20 @@ function clearLegacyProjectAgentGitIndex(ctx, workspace) {
     if (err == null && result.status !== 0) {
       err = new Error(result.status == null ? `signal: ${result.signal}` : `exit status ${result.status}`);
     }
-    return [output, err];
+    if (err != null) {
+      err.output = output;
+      throw err;
+    }
+    return output;
   };
-  let output;
-  let err;
-  [output, err] = run();
+  let output = Buffer.alloc(0);
+  let err = null;
+  try {
+    output = run();
+  } catch (e) {
+    err = e;
+    output = e.output ?? Buffer.alloc(0);
+  }
   if (ctx instanceof AbortSignal && ctx.aborted) {
     throw ctx.reason ?? new Error("context canceled");
   }
@@ -188,10 +226,14 @@ function clearLegacyProjectAgentGitIndex(ctx, workspace) {
   } catch (lockErr) {
     throw new Error(`git update-index ${mode}: ${err.message}: ${output.toString("utf8").trim()} (resolve index lock: ${lockErr.message})`);
   }
-  let inUse;
-  let confirmed;
-  let inspectErr;
-  [inUse, confirmed, inspectErr] = gitIndexLockInUse(ctx, lockPath);
+  let inUse = false;
+  let confirmed = false;
+  let inspectErr = null;
+  try {
+    [inUse, confirmed] = gitIndexLockInUse(ctx, lockPath);
+  } catch (e) {
+    inspectErr = e;
+  }
   const deadline = Date.now() + gitIndexLockWait;
   while (inspectErr == null && confirmed && inUse && Date.now() < deadline) {
     if (ctx instanceof AbortSignal && ctx.aborted) {
@@ -205,21 +247,31 @@ function clearLegacyProjectAgentGitIndex(ctx, workspace) {
       statErr = e;
     }
     if (statErr != null && statErr.code === "ENOENT") {
-      [output, err] = run();
-      if (err == null) {
+      try {
+        run();
         return;
+      } catch (e) {
+        err = e;
+        output = e.output ?? Buffer.alloc(0);
       }
       if (!isGitIndexLockConflict(output)) {
         throw new Error(`git update-index ${mode}: ${err.message}: ${output.toString("utf8").trim()}`);
       }
     }
-    [inUse, confirmed, inspectErr] = gitIndexLockInUse(ctx, lockPath);
+    inUse = false;
+    confirmed = false;
+    inspectErr = null;
+    try {
+      [inUse, confirmed] = gitIndexLockInUse(ctx, lockPath);
+    } catch (e) {
+      inspectErr = e;
+    }
   }
   if (ctx instanceof AbortSignal && ctx.aborted) {
     throw ctx.reason ?? new Error("context canceled");
   }
   if (inspectErr != null || !confirmed) {
-    throw new Error(`git update-index ${mode}: ${err.message}: ${output.toString("utf8").trim()} (cannot safely inspect index lock: ${inspectErr.message})`);
+    throw new Error(`git update-index ${mode}: ${err.message}: ${output.toString("utf8").trim()} (cannot safely inspect index lock: ${inspectErr != null ? inspectErr.message : "<nil>"})`);
   }
   if (inUse) {
     throw new Error(`git update-index ${mode}: ${err.message}: ${output.toString("utf8").trim()} (index lock is held by a live process)`);
@@ -231,9 +283,11 @@ function clearLegacyProjectAgentGitIndex(ctx, workspace) {
       throw new Error(`git update-index ${mode}: ${err.message}: ${output.toString("utf8").trim()} (remove stale index lock: ${removeErr.message})`);
     }
   }
-  [output, err] = run();
-  if (err != null) {
-    throw new Error(`git update-index ${mode} after stale index lock cleanup: ${err.message}: ${output.toString("utf8").trim()}`);
+  try {
+    run();
+  } catch (e) {
+    const retryOutput = e.output ?? Buffer.alloc(0);
+    throw new Error(`git update-index ${mode} after stale index lock cleanup: ${e.message}: ${retryOutput.toString("utf8").trim()}`);
   }
 }
 
@@ -241,11 +295,24 @@ function clearLegacyProjectAgentGitIndex(ctx, workspace) {
 let gitIndexLockWait = 15 * 1000;
 let gitIndexLockPoll = 200;
 
+/**
+ * 判断 `git update-index` 的合并输出是否属于 `.git/index.lock` 文件已存在的锁冲突错误。
+ *
+ * @param {Buffer} output Git 命令的标准输出与标准错误合并缓冲。
+ * @returns {boolean} 属于 index.lock 冲突时返回 true，否则返回 false。
+ */
 function isGitIndexLockConflict(output) {
   const message = output.toString("utf8").toLowerCase();
   return message.includes("index.lock") && message.includes("file exists");
 }
 
+/**
+ * 通过 `git rev-parse --git-path index.lock` 解析仓库对应的 index.lock 绝对路径。
+ *
+ * @param {AbortSignal|null} ctx 上下文取消信号。
+ * @param {string} workspace 仓库工作目录路径。
+ * @returns {string} 规范化后的 index.lock 绝对路径；解析失败或为空时抛出异常。
+ */
 function gitIndexLockPath(ctx, workspace) {
   const result = spawnSync("git", ["-C", workspace, "rev-parse", "--git-path", "index.lock"], {
     encoding: "utf8",
@@ -267,6 +334,13 @@ function gitIndexLockPath(ctx, workspace) {
   return path.normalize(lockPath);
 }
 
+/**
+ * 检测是否有存活进程正持有指定的 Git index.lock 文件（Linux 扫描 `/proc`，其他平台调用 `lsof`）。
+ *
+ * @param {AbortSignal|null} ctx 上下文取消信号。
+ * @param {string} lockPath index.lock 文件路径。
+ * @returns {[boolean, boolean]} 返回 `[inUse, confirmed]`：`inUse` 表示是否被占用，`confirmed` 为 false 时表示无法确认占用状态，调用方必须保留锁文件；检测本身出错时抛出异常。
+ */
 function gitIndexLockInUse(ctx, lockPath) {
   if (process.platform === "linux") {
     return gitIndexLockInUseProc(lockPath);
@@ -277,24 +351,38 @@ function gitIndexLockInUse(ctx, lockPath) {
   });
   const output = Buffer.concat([result.stdout ?? Buffer.alloc(0), result.stderr ?? Buffer.alloc(0)]);
   if (output.toString("utf8").trim().length > 0) {
-    return [true, true, null];
+    return [true, true];
   }
   if (result.error == null && result.status === 0) {
-    return [false, true, null];
+    return [false, true];
   }
   if (result.error != null) {
-    return [false, false, result.error];
+    throw result.error;
   }
   if (result.status === 1) {
-    return [false, true, null];
+    return [false, true];
   }
-  return [false, false, new Error(result.status == null ? `signal: ${result.signal}` : `exit status ${result.status}`)];
+  throw new Error(result.status == null ? `signal: ${result.signal}` : `exit status ${result.status}`);
 }
 
+/**
+ * 在 Linux 上使用当前进程有效 UID 扫描 `/proc` 判断 index.lock 是否仍被进程打开。
+ *
+ * @param {string} lockPath index.lock 文件路径。
+ * @returns {[boolean, boolean]} 返回 `[inUse, confirmed]`；读取失败时抛出异常。
+ */
 function gitIndexLockInUseProc(lockPath) {
   return gitIndexLockHeldUnder("/proc", lockPath, typeof process.geteuid === "function" ? process.geteuid() : 0);
 }
 
+/**
+ * 扫描指定 proc 根目录下所有进程的文件描述符，按路径或 inode 匹配锁文件是否被占用；对跨用户不可读进程保留不确定状态直到锁文件超过陈旧阈值。
+ *
+ * @param {string} procRoot proc 文件系统根目录（通常为 "/proc"）。
+ * @param {string} lockPath 锁文件路径。
+ * @param {number} self 当前进程的有效 UID。
+ * @returns {[boolean, boolean]} 返回 `[inUse, confirmed]`；锁不存在时返回 `[false, true]`，非普通文件或读取 proc 失败时抛出异常。
+ */
 function gitIndexLockHeldUnder(procRoot, lockPath, self) {
   const want = path.resolve(lockPath);
   let lock;
@@ -302,19 +390,14 @@ function gitIndexLockHeldUnder(procRoot, lockPath, self) {
     lock = fs.lstatSync(want);
   } catch (err) {
     if (err.code === "ENOENT") {
-      return [false, true, null];
+      return [false, true];
     }
-    return [false, false, err];
+    throw err;
   }
   if (!lock.isFile()) {
-    return [false, false, new Error(`index lock ${want} is not a regular file`)];
+    throw new Error(`index lock ${want} is not a regular file`);
   }
-  let entries;
-  try {
-    entries = fs.readdirSync(procRoot, { withFileTypes: true });
-  } catch (err) {
-    return [false, false, err];
-  }
+  const entries = fs.readdirSync(procRoot, { withFileTypes: true });
   let uncertain = false;
   const foreignOwner = lock.uid !== self;
   for (const entry of entries) {
@@ -324,7 +407,13 @@ function gitIndexLockHeldUnder(procRoot, lockPath, self) {
     if (!/^[+-]?\d+$/.test(entry.name)) {
       continue;
     }
-    const [held, readErr] = fdDirHoldsFile(path.join(procRoot, entry.name, "fd"), want, lock);
+    let held = false;
+    let readErr = null;
+    try {
+      held = fdDirHoldsFile(path.join(procRoot, entry.name, "fd"), want, lock);
+    } catch (err) {
+      readErr = err;
+    }
     if (readErr != null) {
       if (foreignOwner && readErr.code !== "ENOENT" && procMayOwnFile(path.join(procRoot, entry.name), lock.uid)) {
         uncertain = true;
@@ -332,24 +421,27 @@ function gitIndexLockHeldUnder(procRoot, lockPath, self) {
       continue;
     }
     if (held) {
-      return [true, true, null];
+      return [true, true];
     }
   }
   if (uncertain && Date.now() - lock.mtimeMs >= gitIndexLockForeignStaleAfter) {
     uncertain = false;
   }
-  return [false, !uncertain, null];
+  return [false, !uncertain];
 }
 
 let gitIndexLockForeignStaleAfter = 30 * 60 * 1000;
 
+/**
+ * 检查单个进程的 `fd` 目录中是否存在指向目标锁文件（按路径或 dev/ino 标识匹配）的文件描述符。
+ *
+ * @param {string} dir 进程的 `/proc/<pid>/fd` 目录路径。
+ * @param {string} want 目标锁文件的绝对路径。
+ * @param {fs.Stats} lock 目标锁文件的 stat 信息（用于比对 dev 与 ino）。
+ * @returns {boolean} 有任意描述符指向该锁文件时返回 true，否则返回 false；无法读取 `fd` 目录本身时抛出异常。
+ */
 function fdDirHoldsFile(dir, want, lock) {
-  let fds;
-  try {
-    fds = fs.readdirSync(dir, { withFileTypes: true });
-  } catch (err) {
-    return [false, err];
-  }
+  const fds = fs.readdirSync(dir, { withFileTypes: true });
   for (const fd of fds) {
     const link = path.join(dir, fd.name);
     let target;
@@ -362,20 +454,27 @@ function fdDirHoldsFile(dir, want, lock) {
       continue;
     }
     if (target === want) {
-      return [true, null];
+      return true;
     }
     try {
       const open = fs.statSync(link);
       if (open.dev === lock.dev && open.ino === lock.ino) {
-        return [true, null];
+        return true;
       }
     } catch {
       continue;
     }
   }
-  return [false, null];
+  return false;
 }
 
+/**
+ * 读取 `/proc/<pid>/status` 中的 `Uid:` 行判断进程是否可能以目标 UID 运行；无法判断时保守返回 true 以免误删他人锁文件。
+ *
+ * @param {string} procDir 进程目录路径（`/proc/<pid>`）。
+ * @param {number} uid 锁文件所属的 UID。
+ * @returns {boolean} 进程可能属于该 UID 时返回 true；进程已退出或确认不属于该 UID 时返回 false。
+ */
 function procMayOwnFile(procDir, uid) {
   let status;
   try {
@@ -401,6 +500,13 @@ function procMayOwnFile(procDir, uid) {
   return true;
 }
 
+/**
+ * 通过 `git ls-files -v -z` 列出工作区中已跟踪、处于 skip-worktree 状态（首字符为 S/s）且属于旧版 Agent 配置文件的路径列表。
+ *
+ * @param {AbortSignal|null} ctx 上下文取消信号。
+ * @param {string} workspace 仓库工作目录路径。
+ * @returns {string[]} 需要解除 skip-worktree 标记的相对文件路径数组；命令失败时抛出异常。
+ */
 function trackedSkippedProjectAgentConfigPaths(ctx, workspace) {
   const result = spawnSync("git", ["-C", workspace, "ls-files", "-v", "-z"], {
     encoding: "buffer",
@@ -437,6 +543,12 @@ const legacyProjectAgentFileNames = {
   "CODEBUDDY.md": true, ".mcp.json": true,
 };
 
+/**
+ * 判断仓库内相对路径是否命中旧版 Agent 配置目录或文件名清单。
+ *
+ * @param {string} filePath 仓库内相对路径。
+ * @returns {boolean} 命中旧版 Agent 配置路径时返回 true，否则返回 false。
+ */
 function isLegacyProjectAgentConfigPath(filePath) {
   const clean = path.normalize(filePath).split(path.sep).join("/");
   if (clean === "." || clean === ".." || clean.startsWith("../") || clean.startsWith("/")) {

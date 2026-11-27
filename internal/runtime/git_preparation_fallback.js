@@ -1,6 +1,8 @@
 // git_preparation_fallback.js —— 对应 Go 文件：internal/runtime/git_preparation_fallback.go
-// 作用：仓库准备失败时给首个 Agent 的兜底提示词，以及校验兜底结果的实际检出。
-// Go 的 (值, error) 译为成功返回值、失败 throw；context.Context 译为 AbortSignal；fmt.Sprintf 的 %q 译为 JSON.stringify。
+// 作用与职责边界：当平台标准 Git 准备失败时，生成交由首个 Agent 自行补齐检出的兜底提示词，并在其完成后离线校验工作区内的实际 Git 仓库、origin 与分支状态。
+// 语法差异说明：
+// - Go 的 (值, error) 译为成功返回值、失败 throw；context.Context 译为 AbortSignal；
+// - fmt.Sprintf 的 %q 译为 JSON.stringify；字符串按 UTF-8 字节长度截断以对齐 Go 的 len(failure) > 4000。
 
 "use strict";
 
@@ -12,12 +14,19 @@ const { RequireOnWorkBranch } = require("../gitwork/workbranch.js"); // 对应 G
 const { RecordBaseline } = require("../gitwork/patch.js"); // 对应 Go 的 gitwork.RecordBaseline，patch.js 待翻译
 const { HTTPSHostScope } = require("../gitwork/https_host.js"); // 对应 Go 的 gitwork.HTTPSHostScope，https_host.js 待翻译
 
+/**
+ * 构造平台仓库准备失败后的兜底提示词，将冻结的仓库列表、目录、基线、工作分支与诊断错误（最多 4000 字节）交由首个 Agent 处理。
+ *
+ * @param {Array<{ CloneURL: string, WorkspaceDir: string, BaseBranch: string, DefaultBranch: string, WorkBranch: string, RequireExistingWorkBranch: boolean }>} repositories 本次运行冻结的仓库上下文列表。
+ * @param {string} failure 平台准备仓库时产生的原始错误文本。
+ * @returns {string} 拼接完成的中文兜底提示词。
+ */
 function GitPreparationFallbackPrompt(repositories, failure) {
   let out = "";
   out += "平台仓库准备兜底（执行本节点任务前必须完成）：\n平台使用标准 Git credential helper 准备仓库失败，不能假定代码已检出。你是首个 Agent 节点，负责在本次工作区内补齐克隆和工作分支，然后再执行原任务。\n";
   out += "优先使用现有 credential helper；如该网站的 Git 认证约定不同，自行查阅其官方说明并使用正确的用户名或认证方式。平台提供当前责任人按主机配置的凭据，可通过 git credential fill 在进程内存中使用；禁止打印、保存令牌或借用其他主机凭据。凭据缺失、无权限或准备仍失败时，以 fail 结束并报告原因。\n";
   out += "以下仓库、目录、基线和工作分支是冻结要求，不得替换、跳过或改推 main/master。保留已有改动，不得重置工作区；继续已有分支时必须检出该远端分支，不能重新创建。已有平台环境准备步骤会在仓库恢复后继续执行。\n";
-  for (const r of repositories) {
+  for (const r of repositories ?? []) {
     let base = r.BaseBranch;
     if (base === "") {
       base = r.DefaultBranch;
@@ -31,8 +40,16 @@ function GitPreparationFallbackPrompt(repositories, failure) {
   return out;
 }
 
+/**
+ * 在接受兜底 Agent 的产出前，离线校验工作区内每个仓库的目录边界、Git 根目录、origin URL（无内嵌凭据且与冻结地址一致）、工作分支与祖先提交，并记录基线。
+ *
+ * @param {AbortSignal|null} ctx 用于取消 Git 子进程的上下文信号。
+ * @param {string} workspace 工作区根目录路径。
+ * @param {Array<{ Name: string, CloneURL: string, WorkspaceDir: string, BaseBranch: string, DefaultBranch: string, WorkBranch: string, RequireExistingWorkBranch: boolean }>} repositories 需要校验的仓库上下文列表。
+ * @returns {void} 无返回值；任意仓库不满足冻结要求时抛出错误。
+ */
 function VerifyGitPreparation(ctx, workspace, repositories) {
-  for (const r of repositories) {
+  for (const r of repositories ?? []) {
     if (r.CloneURL === "") {
       continue;
     }
@@ -67,12 +84,7 @@ function VerifyGitPreparation(ctx, workspace, repositories) {
     if (actual !== expected) {
       throw new Error(`repository ${r.Name}: Git checkout is outside the frozen directory`);
     }
-    let root;
-    try {
-      root = fs.realpathSync(workspace);
-    } catch (err) {
-      throw err;
-    }
+    const root = fs.realpathSync(workspace);
     try {
       rel = path.relative(root, expected);
     } catch {
@@ -135,6 +147,12 @@ function VerifyGitPreparation(ctx, workspace, repositories) {
   }
 }
 
+/**
+ * 将 HTTPS Git 远端地址规范化（统一主机作用域并去掉末尾斜杠和 `.git` 后缀），用于比对实际 origin 与冻结的 clone URL。
+ *
+ * @param {string} raw 原始 Git 远端地址字符串。
+ * @returns {string} 规范化后的远端地址；非 HTTPS 或 URL 解析失败时返回去空白后的原串。
+ */
 function canonicalGitRemote(raw) {
   raw = raw.trim();
   try {
