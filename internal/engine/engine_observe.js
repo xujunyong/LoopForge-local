@@ -1,6 +1,7 @@
 // engine_observe.js —— 对应 Go 文件：internal/engine/engine_observe.go
-// 作用：遥测观察队列：入队、定时刷盘并把事件合并进运行记录。
-// context.Context 译为 AbortSignal；sync.Mutex 在单线程 JS 里不需要；time.Time 零值译为 null；(值, bool) 译为 [值, bool]。
+// 作用：遥测观察队列：负责将节点执行产生的遥测事件入队、定时或按阈值刷盘，并合并写入运行记录的遥测与日志列表。
+// 职责边界：仅处理观察事件缓冲、去重、日志衍生与活动文案提取；不包含遥测上下文拼装与存储层持久化实现。
+// 语法差异说明：context.Context 译为 AbortSignal；sync.Mutex 在单线程 JS 中省略；goroutine/select 循环译为 async/Promise；map[string]struct{} 译为普通对象 {}；(值, bool) 译为 [值, boolean]。
 
 "use strict";
 
@@ -9,18 +10,42 @@ const { ObservabilitySpecVersion, TelemetrySource, LogRecord } = require("../dom
 const { TerminalRunStatus } = require("../domain/run_eval.js"); // 对应 Go 的 domain.TerminalRunStatus，run_eval.js 已翻译
 const { AdapterHooks, AdapterOTEL } = require("../observability/hooks.js"); // 对应 Go 的 observability.AdapterHooks/AdapterOTEL，observability 待翻译
 const { Engine } = require("./engine.js"); // 对应 Go 同包类型，engine.js 已翻译
+const { clarifyProcessLog, applyUsage } = require("./observability.js"); // 对应 Go 同包函数，observability.js 已翻译
+const { shouldRecordLog, boundedLogBody, logAttributes, coalesceProgressTelemetry } = require("./run_events.js"); // 对应 Go 同包函数，run_events.js 已翻译
 
+/**
+ * 待刷盘的遥测观察条目，对应 Go 的 pendingObservation。
+ * 用于在内存中暂存尚未合并回 Run 记录的遥测事件。
+ */
 class pendingObservation {
+  /**
+   * 按 Go 结构体零值语义初始化待刷盘观察条目。
+   * @param {Object} [init={}] - 可选初始字段。
+   * @param {string} [init.runID=""] - 所属运行 ID。
+   * @param {string} [init.nodeID=""] - 所属节点 ID。
+   * @param {TelemetryEvent} [init.event] - 遥测事件对象。
+   * @returns {pendingObservation} 初始化后的条目实例。
+   */
   constructor(init = {}) {
     this.runID = init.runID ?? "";
     this.nodeID = init.nodeID ?? "";
-    this.event = init.event ?? null;
+    this.event = init.event ?? new TelemetryEvent();
   }
 }
 
+/** 遥测队列定时刷盘间隔（毫秒），对应 50ms。 */
 const observationFlushInterval = 50;
+/** 触发立即刷盘的队列堆积阈值。 */
 const observationFlushKickSize = 32;
 
+/**
+ * 将一条遥测观察事件推入引擎内存缓冲队列；当队列长度达到阈值时立即唤醒刷盘循环。
+ * 在节点执行、沙箱或外部上报产生遥测事件时调用。
+ * @param {string} runID - 运行 ID。
+ * @param {string} nodeID - 节点 ID。
+ * @param {TelemetryEvent} observation - 遥测事件对象。
+ * @returns {void} 无返回值。
+ */
 Engine.prototype.enqueueObservation = function (runID, nodeID, observation) {
   if (this == null) {
     return;
@@ -32,6 +57,11 @@ Engine.prototype.enqueueObservation = function (runID, nodeID, observation) {
   }
 };
 
+/**
+ * 以非阻塞方式触发一次遥测队列刷盘信号（对应 Go 的带缓冲 channel 非阻塞发送）。
+ * 在队列达到阈值或需要尽快落盘时调用。
+ * @returns {void} 无返回值。
+ */
 Engine.prototype.signalObservationFlush = function () {
   if (this == null || this.obsKick == null) {
     return;
@@ -46,6 +76,12 @@ Engine.prototype.signalObservationFlush = function () {
   }
 };
 
+/**
+ * 后台遥测刷盘循环，对应 Go 的 goroutine + select（监听取消信号、主动唤醒与 50ms 定时器）。
+ * 由 Engine.StartMaintenance 启动，在收到取消信号时做最后一次全量刷盘后退出。
+ * @param {AbortSignal} ctx - 取消信号，触发 abort 时退出循环。
+ * @returns {Promise<void>} 异步循环结束时 resolve，无返回值。
+ */
 Engine.prototype.observationFlushLoop = async function (ctx) {
   if (this == null || this.obsKick == null) {
     return;
@@ -87,6 +123,11 @@ Engine.prototype.observationFlushLoop = async function (ctx) {
   }
 };
 
+/**
+ * 将当前队列中涉及的所有运行 ID 逐一触发 updateRun 以合并落盘。
+ * 在定时刷盘、阈值唤醒或引擎退出前调用。
+ * @returns {void} 无返回值。
+ */
 Engine.prototype.flushAllObservations = function () {
   if (this == null) {
     return;
@@ -96,19 +137,30 @@ Engine.prototype.flushAllObservations = function () {
   }
 };
 
+/**
+ * 提取待刷盘队列中去重后的运行 ID 列表（保持首次出现顺序）。
+ * 在 flushAllObservations 准备批量更新运行状态时调用。
+ * @returns {string[]} 去重后的运行 ID 数组。
+ */
 Engine.prototype.pendingObservationRunIDs = function () {
-  const seen = new Set();
+  const seen = {};
   const ids = [];
   for (const item of this.obsPending) {
-    if (seen.has(item.runID)) {
+    if (seen[item.runID]) {
       continue;
     }
-    seen.add(item.runID);
+    seen[item.runID] = true;
     ids.push(item.runID);
   }
   return ids;
 };
 
+/**
+ * 从待刷盘队列中取出指定运行 ID 的全部观察条目，并保留其余运行的条目。
+ * 在 updateRun 合并某个运行的待处理观察事件时调用。
+ * @param {string} runID - 目标运行 ID。
+ * @returns {pendingObservation[]|null} 取出的观察条目数组；队列为空时返回 null。
+ */
 Engine.prototype.takePendingObservations = function (runID) {
   if (this.obsPending.length === 0) {
     return null;
@@ -126,10 +178,19 @@ Engine.prototype.takePendingObservations = function (runID) {
   return taken;
 };
 
+/**
+ * 将单条遥测观察事件幂等合并到指定 Run 记录中，并同步衍生日志、节点状态、工具调用计数与用量统计。
+ * 在刷盘或实时写入遥测事件时调用；终态 Run 仅接受 sandbox.closed 事件。
+ * @param {Object} r - 目标运行对象（domain.Run）。
+ * @param {string} nodeID - 关联节点 ID。
+ * @param {TelemetryEvent} observation - 待合并的遥测事件对象。
+ * @returns {void} 无返回值。
+ */
 Engine.prototype.applyObservation = function (r, nodeID, observation) {
   if (TerminalRunStatus(r.Status) && observation.Name !== "sandbox.closed") {
     return;
   }
+  // Worker/OTLP 重试必须保持幂等：保留生产者提供的 ID，若该 Run 已接收则忽略；内部观察无 ID 时在此生成。
   const trimmedID = (observation.ID ?? "").trim();
   if (trimmedID !== "") {
     if (this.repo.TelemetryEventExists(r.ID, trimmedID)) {
@@ -221,6 +282,12 @@ Engine.prototype.applyObservation = function (r, nodeID, observation) {
   }
 };
 
+/**
+ * 根据遥测事件推导用于界面展示的节点活动文案。
+ * 当事件不应覆盖当前活动状态（如成功结束的工具调用或已关闭的沙箱）时，返回 ["", false]。
+ * @param {TelemetryEvent} observation - 遥测事件对象。
+ * @returns {[string, boolean]} 二元组 [活动文案, 是否需要更新当前活动]。
+ */
 function observationActivity(observation) {
   switch (observation.Category) {
     case "reasoning":
