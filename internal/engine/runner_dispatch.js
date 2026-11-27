@@ -1,6 +1,20 @@
-// runner_dispatch.js —— 对应 Go 文件：internal/engine/runner_dispatch.go
-// 作用：执行机任务下发：Agent、脚本与门禁命令排队、等待与产物取回。
-// context.Context 译为 AbortSignal；goroutine 译为不 await 的异步函数；sync.Mutex 在单线程 JS 里不需要；time.Duration 换算为毫秒；(值, error) 译为成功返回值、失败 throw；(值, bool) 译为 [值, bool]；filepath.ToSlash 译为 join 后把分隔符换成 /；errors.Is 译为 ===。
+/**
+ * @file internal/engine/runner_dispatch.js
+ * 对应 Go 源文件：internal/engine/runner_dispatch.go
+ *
+ * 作用与职责边界：
+ * 实现 CLI 执行机器（Runner）任务下发与协作链路，涵盖长轮询/WebSocket 控制通道回调注册、
+ * 执行机工作区相对路径规范化、分支与执行器能力校验、沙箱规格组装、Agent/脚本/验证门禁命令下发与等待、
+ * 运行清理与预览归档任务排队、执行机事件流桥接至遥测接收器，以及执行机上传产物回写至控制面工作区。
+ *
+ * 语法差异说明：
+ * - `Engine` 定义于 `engine.js`，本文件通过 `Engine.prototype` 挂载各执行机下发与等待方法。
+ * - Go 的 `context.Context` 译为 `AbortSignal`；单线程 JS 不需要 `sync.Mutex`，相关加解锁语句直接略去。
+ * - Go 的 `(值, error)` 与仅 `error` 返回统一按成功返回值（或 `undefined`）、失败 `throw err` 处理；
+ *   Go 中用 `_ = ...` 显式忽略的错误以 `try { ... } catch {}` 吸收；`(值, bool)` 译为 `[值, boolean]`。
+ * - Go 的 `map[chan struct{}]struct{}` 存储非字符串的 Promise 唤醒回调函数，因此在 JS 中以 `Set` 表达。
+ * - Go 的 `filepath.ToSlash` 译为按 `path.sep` 拆分后再用 `/` 拼接；`errors.Is` 译为 `===`；`fmt.Sprintf` `%q` 译为 `JSON.stringify`。
+ */
 
 "use strict";
 
@@ -14,12 +28,35 @@ const { RunnerTask, RunnerTaskQueued, RunnerTaskLeased, RunnerTaskRunning, Runne
 const { IsAgentCLI, AgentCLILabel } = require("../runtime/agent_cli.js"); // 对应 Go 的 runtime.IsAgentCLI/AgentCLILabel，runtime 待翻译
 const { IsSSHReference } = require("../gitwork/ssh_remote.js"); // 对应 Go 的 gitwork.IsSSHReference，gitwork 待翻译
 const { Engine } = require("./engine.js"); // 对应 Go 同包的 Engine，engine.js 已翻译
+const { workspaceRunID } = require("./workspace_owner.js"); // 对应 Go 同包函数，workspace_owner.js 已翻译
+const { resolvedSandboxSnapshot } = require("./run_environment.js"); // 对应 Go 同包函数，run_environment.js 已翻译
+const { workspaceConversationRequirements } = require("./workspace_preparation.js"); // 对应 Go 同包函数，workspace_preparation.js 已翻译
+const { firstRepositoryAgent } = require("./git_preparation_fallback.js"); // 对应 Go 同包函数，git_preparation_fallback.js 已翻译
+const { gateResultContract } = require("./gate_submit.js"); // 对应 Go 同包函数，gate_submit.js 已翻译
+const { artifactOutputFiles, artifactRelPath } = require("./node_outputs.js"); // 对应 Go 同包函数，node_outputs.js 已翻译
+const { normalizeExecutionScope, repositoryBaseBranch } = require("./execution_scope.js"); // 对应 Go 同包函数，execution_scope.js 已翻译
+const { validateSOPHandoffRunnerPayload } = require("./legacy_handoff.js"); // 对应 Go 同包函数，legacy_handoff.js 已翻译
+const { explainGitAuthFailure, resolveGitIdentity } = require("./git_auth.js"); // 对应 Go 同包函数，git_auth.js 已翻译
+const { isPoolRun } = require("./cloud_pool.js"); // 对应 Go 同包函数，cloud_pool.js 已翻译
+const { workflowAgent } = require("./assets.js"); // 对应 Go 同包函数，assets.js 已翻译
+const { workflowNodeExecutor, errSOPExecutorUnconfigured } = require("./sop_executors.js"); // 对应 Go 同包函数与哨兵错误，sop_executors.js 已翻译
 
-// SetRunnerDispatchNotify：接通长轮询唤醒，让刚排队的任务立刻到达空闲执行机，而不是等下一次认领重试。
+/**
+ * 注册长轮询任务派发唤醒回调，使新入队的执行机任务立即送达空闲执行机，无需等待下次认领轮询。
+ *
+ * @param {function(string): void|null} fn - 接收 `provider` 名称的唤醒回调函数。
+ * @returns {void} 无返回值。
+ */
 Engine.prototype.SetRunnerDispatchNotify = function (fn) {
   this.runnerDispatchNotify = fn;
 };
 
+/**
+ * 触发指定提供方的执行机任务派发唤醒回调（若已注册）。
+ *
+ * @param {string} provider - 执行器提供方标识（如 `"terminal"`、`"codex"` 等）。
+ * @returns {void} 无返回值。
+ */
 Engine.prototype.notifyRunnerDispatch = function (provider) {
   const fn = this.runnerDispatchNotify;
   if (fn != null) {
@@ -27,11 +64,25 @@ Engine.prototype.notifyRunnerDispatch = function (provider) {
   }
 };
 
-// SetRunnerControlNotify：接通低延迟执行机 WebSocket 控制通道；监听缺失或断开无害，desired_state 是持久化的，租约续期也会返回。
+/**
+ * 注册低延迟执行机 WebSocket 控制通道回调，用于即时下发取消等期望状态。
+ * 监听缺失或断开不影响正确性，因为 `desired_state` 已持久化且租约续期响应也会携带。
+ *
+ * @param {function(string, string, string): void|null} fn - 接收 `(runnerID, taskID, desiredState)` 的控制回调。
+ * @returns {void} 无返回值。
+ */
 Engine.prototype.SetRunnerControlNotify = function (fn) {
   this.runnerControlNotify = fn;
 };
 
+/**
+ * 通过已注册的控制通道向指定执行机推送任务期望状态变更。
+ *
+ * @param {string} runnerID - 目标执行机 ID。
+ * @param {string} taskID - 任务 ID。
+ * @param {string} desiredState - 期望控制状态（如取消标记）。
+ * @returns {void} 无返回值。
+ */
 Engine.prototype.notifyRunnerControl = function (runnerID, taskID, desiredState) {
   const fn = this.runnerControlNotify;
   if (fn != null && runnerID.trim() !== "") {
@@ -39,11 +90,16 @@ Engine.prototype.notifyRunnerControl = function (runnerID, taskID, desiredState)
   }
 };
 
+/**
+ * 取消指定运行下全部未终结的执行机任务，并唤醒等待协程与通知对应执行机控制通道。
+ * 用于用户取消/暂停运行或恢复循环结算孤儿运行。
+ *
+ * @param {string} runID - 运行唯一标识。
+ * @returns {void} 无返回值。
+ * @throws {Error} 仓储批量取消任务失败时抛出错误。
+ */
 Engine.prototype.cancelRunnerTasksForRun = function (runID) {
-  const [ids, cancelErr] = this.repo.CancelRunnerTasksForRun(runID, new Date());
-  if (cancelErr != null) {
-    throw cancelErr;
-  }
+  const ids = this.repo.CancelRunnerTasksForRun(runID, new Date());
   for (const id of ids) {
     this.NotifyRunnerTaskChanged(id);
     const [task, ok] = this.repo.RunnerTask(id);
@@ -53,7 +109,14 @@ Engine.prototype.cancelRunnerTasksForRun = function (runID) {
   }
 };
 
-// runnerWorkspaceRel：一次运行在执行机侧冻结的工作区；新运行跨脚本、Agent 与门禁共用一个检出；该布局引入前创建的运行保留每节点路径，就地重试从原来失败的目录继续。
+/**
+ * 计算一次运行在执行机侧冻结的工作区相对路径（统一使用 `/` 分隔）。
+ * 新运行采用共享布局跨脚本、Agent 与门禁共用同一工作区（子 SOP 复用父工作区）；旧布局保留按节点隔离路径以兼容就地重试。
+ *
+ * @param {import("../domain/run.js").Run} run - 运行快照对象。
+ * @param {string} nodeID - 节点唯一标识（共享布局下忽略）。
+ * @returns {string} 相对执行机根目录的工作区路径。
+ */
 function runnerWorkspaceRel(run, nodeID) {
   if (run.ExecutionContext.RunnerWorkspaceLayout === RunnerWorkspaceLayoutShared) {
     return path.join("runs", safeRunnerPath(workspaceRunID(run)), "workspace").split(path.sep).join("/");
@@ -61,7 +124,13 @@ function runnerWorkspaceRel(run, nodeID) {
   return path.join("runs", safeRunnerPath(run.ID), safeRunnerPath(nodeID)).split(path.sep).join("/");
 }
 
-// runnerPreviewWorkspaceRel：预览 SourcePath 相对的目录：共享检出，或旧布局的运行根目录。
+/**
+ * 计算预览构建产物 `SourcePath` 相对的执行机目录。
+ * 共享布局指向共享工作区目录，旧布局指向运行根目录。
+ *
+ * @param {import("../domain/run.js").Run} run - 运行快照对象。
+ * @returns {string} 相对执行机根目录的预览工作区路径。
+ */
 function runnerPreviewWorkspaceRel(run) {
   if (run.ExecutionContext.RunnerWorkspaceLayout === RunnerWorkspaceLayoutShared) {
     return runnerWorkspaceRel(run, "");
@@ -69,10 +138,23 @@ function runnerPreviewWorkspaceRel(run) {
   return runnerRunWorkspaceRel(run.ID);
 }
 
+/**
+ * 计算指定运行在执行机侧的顶层工作目录相对路径（`runs/<runID>`）。
+ *
+ * @param {string} runID - 运行唯一标识。
+ * @returns {string} 相对执行机根目录的运行目录路径。
+ */
 function runnerRunWorkspaceRel(runID) {
   return path.join("runs", safeRunnerPath(runID)).split(path.sep).join("/");
 }
 
+/**
+ * 将任意标识字符串清洗为可用于执行机本地路径的安全片段。
+ * 仅保留 ASCII 字母、数字及 `-`、`_`、`.`，其余字符统一替换为 `-`；空白串回退为 `"node"`。
+ *
+ * @param {string} v - 原始标识字符串。
+ * @returns {string} 清洗后的路径安全片段。
+ */
 function safeRunnerPath(v) {
   v = v.trim();
   if (v === "") {
@@ -89,7 +171,15 @@ function safeRunnerPath(v) {
   return b;
 }
 
-// requireWorkBranchCapabilities：拒绝分支语义超出所选执行机能力的运行：旧 daemon 会忽略这些标志，静默检出同名已存在分支。
+/**
+ * 校验目标执行机版本是否支持仓库列表所需的 SSH 认证、按名新建分支或续用已有分支语义。
+ * 防止旧版执行机忽略这些标志并静默检出同名已存在分支。
+ *
+ * @param {string} runnerID - 目标执行机 ID；为空时跳过校验。
+ * @param {import("../domain/project.js").RepositoryContext[]} repositories - 参与运行的仓库上下文列表。
+ * @returns {void} 校验通过时无返回值。
+ * @throws {Error} 执行机不存在或版本不满足任一仓库所需能力时抛出中文提示错误。
+ */
 Engine.prototype.requireWorkBranchCapabilities = function (runnerID, repositories) {
   if (runnerID === "") {
     return;
@@ -118,6 +208,13 @@ Engine.prototype.requireWorkBranchCapabilities = function (runnerID, repositorie
   }
 };
 
+/**
+ * 为下发至执行机的任务组装完整的沙箱快照与运行需求（含私密主目录、BunFS、登录中继与 CLI 状态目录）。
+ *
+ * @param {import("../domain/run.js").Run} run - 运行快照对象。
+ * @returns {import("../domain/runner.js").RunnerSandboxSpec} 组装完成的执行机沙箱规格对象。
+ * @throws {Error} 分支能力校验、沙箱配置解析或会话需求计算失败时抛出错误。
+ */
 Engine.prototype.runnerSandboxSpec = function (run) {
   const runnerID = this.defaultExecutionRunner(run);
   this.requireWorkBranchCapabilities(runnerID, run.RepositoryContexts());
@@ -141,7 +238,26 @@ Engine.prototype.runnerSandboxSpec = function (run) {
   return spec;
 };
 
-// dispatchRunnerTask：把一次 Agent 调用作为 RunnerTask 排队到责任人默认执行机，并等它到终态；各运行时选本机 CLI 登录或责任人保存的提供方凭证，只有后者放进任务级调用；运行仓库随任务走，沙箱/工作区在那台机器上创建。
+/**
+ * 将一次 Agent 节点调用封装为持久化 `RunnerTask` 下发至指定执行机，等待其到达终态并回写产物/上报输出。
+ * 根据执行机认证模式决定使用本机 CLI 登录或携带责任人的个人提供方 API Key，同时附带仓库与沙箱规格。
+ *
+ * @param {AbortSignal|null} ctx - 控制任务等待取消的信号。
+ * @param {string} runnerID - 目标执行机 ID。
+ * @param {import("../domain/run.js").Run} run - 当前运行快照对象。
+ * @param {import("../domain/workflow.js").WorkflowNode} node - 当前执行的 Agent 节点定义。
+ * @param {import("./run_environment.js").runEnvironment} sb - 控制面运行环境（提供凭证快照、上报输出收集器与工作区路径）。
+ * @param {string} workspace - 执行机侧工作区相对路径。
+ * @param {import("../domain/agent.js").ExecutorDefinition} ex - 节点执行器定义。
+ * @param {import("../domain/agent.js").AgentDefinition} agent - 节点角色定义。
+ * @param {import("../domain/agent.js").AgentAssetBundle} assets - 编译后的角色资产包（规则、技能、MCP 等）。
+ * @param {string} prompt - 编译完成的任务提示词。
+ * @param {string} invocationID - 本次调用唯一标识。
+ * @param {Object} options - 调用选项（含 `ResumeSessionID`、`GateResultPath` 等）。
+ * @param {function(TelemetryEvent): void|null} sink - 实时遥测事件接收回调。
+ * @returns {Promise<string>} 执行成功时返回执行机产出的最终结果文本。
+ * @throws {Error} 校验失败、凭证缺失、任务入队/等待失败、产物回写失败或任务失败/取消时抛出错误。
+ */
 Engine.prototype.dispatchRunnerTask = async function (ctx, runnerID, run, node, sb, workspace, ex, agent, assets, prompt, invocationID, options, sink) {
   this.requireWorkBranchCapabilities(runnerID, run.RepositoryContexts());
   this.requireRunnerProvider(runnerID, ex.Kind);
@@ -236,10 +352,7 @@ Engine.prototype.dispatchRunnerTask = async function (ctx, runnerID, run, node, 
   });
   task.Sandbox = this.runnerSandboxSpec(run);
   validateSOPHandoffRunnerPayload(run, task);
-  const putErr = this.repo.PutRunnerTask(task);
-  if (putErr != null) {
-    throw putErr;
-  }
+  this.repo.PutRunnerTask(task);
   this.notifyRunnerDispatch(ex.Kind);
   if (sink != null) {
     sink(new TelemetryEvent({
@@ -288,7 +401,15 @@ Engine.prototype.dispatchRunnerTask = async function (ctx, runnerID, run, node, 
   }
 };
 
-// resolveRunnerResumeSessionID：选执行机侧调用应续接的 CLI 会话；引擎级选项优先：缺失提交恢复路径上它带着引擎刚观察到的会话（nr.SessionID），而 nr.ResumeSessionID 可能已被遥测清掉；节点字段是未走引擎循环的操作员请求续接的后备。
+/**
+ * 选择执行机侧调用应当续接的 CLI 会话 ID。
+ * 引擎级 `options.ResumeSessionID` 优先（用于缺失提交恢复路径携带刚观察到的会话），其次回退到节点状态上的 `ResumeSessionID`。
+ *
+ * @param {import("../domain/run.js").Run} run - 当前运行快照对象。
+ * @param {string} nodeID - 节点唯一标识。
+ * @param {Object} options - 调用选项对象（含 `ResumeSessionID`）。
+ * @returns {string} 选中的会话 ID；无需续接时返回 `""`。
+ */
 function resolveRunnerResumeSessionID(run, nodeID, options) {
   if (options.ResumeSessionID.trim() !== "") {
     return options.ResumeSessionID.trim();
@@ -300,6 +421,16 @@ function resolveRunnerResumeSessionID(run, nodeID, options) {
   return "";
 }
 
+/**
+ * 将运行关联的代码仓库列表、Git 作者身份及 HTTP/SSH 凭证用户 ID 绑定到执行机调用载荷中。
+ * 对使用 SSH 协议的仓库会清空 `GitToken` 并回填 `GitSSHUserID`。
+ *
+ * @param {RunnerInvocation|null} invocation - 待填充的执行机调用载荷对象（就地修改）。
+ * @param {import("../domain/run.js").Run} run - 运行快照对象。
+ * @param {string} gitUserName - Git 提交用户名。
+ * @param {string} gitUserEmail - Git 提交邮箱。
+ * @returns {void} 无返回值。
+ */
 function bindRunnerRepositories(invocation, run, gitUserName, gitUserEmail) {
   if (invocation == null) {
     return;
@@ -348,11 +479,38 @@ function bindRunnerRepositories(invocation, run, gitUserName, gitUserEmail) {
   }
 }
 
+/**
+ * 使用 POSIX 单引号对字符串进行转义包裹，便于安全拼入 `python3 -c` 等 shell 命令。
+ *
+ * @param {string} value - 待转义的原始文本。
+ * @returns {string} 单引号安全包裹后的字符串。
+ */
 function shellSingleQuote(value) {
   return "'" + value.replaceAll("'", `'"'"'`) + "'";
 }
 
-// dispatchRunnerScript：在运行冻结的执行机上执行工作流脚本；仓库元数据随任务走，脚本也可作首节点；后续共享布局节点复用同一检出及其工作区级 Git 索引标志。
+/**
+ * 在运行冻结的执行机上以 `terminal` 任务方式执行工作流脚本（Shell 或 Python），并等待结果与回写产物。
+ * 载荷中附带仓库元数据，使脚本节点也能作为首个初始化工作区的节点。
+ *
+ * @param {AbortSignal|null} ctx - 控制任务等待取消的信号。
+ * @param {string} runnerID - 目标执行机 ID。
+ * @param {import("../domain/run.js").Run} run - 当前运行快照对象。
+ * @param {string} nodeID - 脚本节点 ID。
+ * @param {string} workspace - 执行机侧工作区相对路径。
+ * @param {string} language - 脚本语言（`"python"` 或 shell）。
+ * @param {string} script - 待执行的脚本正文。
+ * @param {string} artifactDirectory - 产物相对输出目录。
+ * @param {import("../domain/workflow.js").ArtifactContract[]} artifacts - 声明的产物契约列表。
+ * @param {import("./run_environment.js").runEnvironment} sb - 控制面运行环境。
+ * @param {string} gitToken - 保留参数（与 Go 签名对齐，实际凭证由 `bindRunnerRepositories` 经用户 ID 下发）。
+ * @param {string} gitUserName - Git 提交用户名。
+ * @param {string} gitUserEmail - Git 提交邮箱。
+ * @param {import("../domain/agent.js").AgentAssetBundle} assets - 脚本可访问的 MCP 等资产包。
+ * @param {function(TelemetryEvent): void|null} sink - 实时遥测事件接收回调。
+ * @returns {Promise<string>} 执行成功时返回脚本输出文本。
+ * @throws {Error} 校验失败、任务入队/等待失败、产物回写失败或脚本执行失败/取消时抛出错误。
+ */
 Engine.prototype.dispatchRunnerScript = async function (ctx, runnerID, run, nodeID, workspace, language, script, artifactDirectory, artifacts, sb, gitToken, gitUserName, gitUserEmail, assets, sink) {
   this.requireWorkBranchCapabilities(runnerID, run.RepositoryContexts());
   this.requireRunnerProvider(runnerID, "terminal");
@@ -393,10 +551,7 @@ Engine.prototype.dispatchRunnerScript = async function (ctx, runnerID, run, node
   });
   task.Sandbox = this.runnerSandboxSpec(run);
   validateSOPHandoffRunnerPayload(run, task);
-  const putErr = this.repo.PutRunnerTask(task);
-  if (putErr != null) {
-    throw putErr;
-  }
+  this.repo.PutRunnerTask(task);
   this.notifyRunnerDispatch("terminal");
   if (sink != null) {
     sink(new TelemetryEvent({
@@ -435,7 +590,13 @@ Engine.prototype.dispatchRunnerScript = async function (ctx, runnerID, run, node
   }
 };
 
-// defaultExecutionRunner：解析责任人默认执行机；空表示云端模式。
+/**
+ * 解析运行所使用的执行机 ID；返回空字符串表示云端模式。
+ * 新运行读取冻结在 `ExecutionContext` 中的模式与执行机 ID，老运行兼容回退到责任人当前默认执行机。
+ *
+ * @param {import("../domain/run.js").Run} run - 运行快照对象。
+ * @returns {string} 执行机 ID；云端模式或未绑定执行机时返回 `""`。
+ */
 Engine.prototype.defaultExecutionRunner = function (run) {
   switch (run.ExecutionContext.ExecutionMode) {
   case ExecutionModeCloud:
@@ -446,7 +607,15 @@ Engine.prototype.defaultExecutionRunner = function (run) {
   return this.repo.DefaultRunner(run.ExecutionContext.ResponsibleUserID);
 };
 
-// validateExecutionReconnect：冻结的执行目标不可达时，在改运行状态前让重试失败；实际下发会重复同一校验，覆盖检查与执行之间断连的情况。
+/**
+ * 在节点重试修改运行状态前，前置校验冻结的执行机是否仍在线且支持目标节点所需的提供方。
+ * 云端模式与云池运行（启动节点时可重新绑定池内机器）直接放行。
+ *
+ * @param {import("../domain/run.js").Run} run - 运行快照对象。
+ * @param {string} nodeID - 拟重试的节点 ID。
+ * @returns {void} 可重连时无返回值。
+ * @throws {Error} 执行机不存在、离线、不再支持目标提供方或快照中缺少节点/角色时抛出中文提示错误。
+ */
 Engine.prototype.validateExecutionReconnect = function (run, nodeID) {
   const runnerID = this.defaultExecutionRunner(run);
   if (runnerID === "" || isPoolRun(run)) {
@@ -488,7 +657,14 @@ Engine.prototype.validateExecutionReconnect = function (run, nodeID) {
   throw new Error(`无法重连原执行环境：快照中不存在节点 ${nodeID}`);
 };
 
-// queueRunnerRunCleanup：持久化调度清理到拥有冻结执行机工作区的机器；成功运行在正常收尾时调用，显式删除也为失败/取消的运行调用；确定性任务 ID 让这些路径幂等，不重置进行中/已完成的工作。
+/**
+ * 为拥有冻结工作区的执行机持久化排队一次幂等的运行目录清理任务。
+ * 成功运行在收尾时调用，失败/取消运行在显式删除时调用；确定性任务 ID 避免重复重置活跃清理任务。
+ *
+ * @param {import("../domain/run.js").Run} run - 待清理工作区的运行快照对象。
+ * @returns {void} 无需清理、已有活跃清理任务或入队成功时无返回值。
+ * @throws {Error} 任务落库失败时抛出错误。
+ */
 Engine.prototype.queueRunnerRunCleanup = function (run) {
   const runnerID = this.defaultExecutionRunner(run);
   if (runnerID === "") {
@@ -519,13 +695,19 @@ Engine.prototype.queueRunnerRunCleanup = function (run) {
     RunID: run.ID,
     Sandbox: run.WorkflowSnapshot.SandboxSnapshot,
   });
-  const putErr = this.repo.PutRunnerTask(task);
-  if (putErr != null) {
-    throw putErr;
-  }
+  this.repo.PutRunnerTask(task);
   this.notifyRunnerDispatch("terminal");
 };
 
+/**
+ * 向原执行机排队一次预览产物归档上传任务。
+ * 若已有排队/执行中的归档任务则幂等跳过；已完成的旧归档任务会在构建节点再次成功后被新任务替换。
+ *
+ * @param {import("../domain/run.js").Run} run - 关联运行快照对象。
+ * @param {import("../domain/runner.js").RunnerPreviewArchiveSpec} spec - 预览归档规格（源路径与上传凭证等）。
+ * @returns {void} 排队成功或已有活跃任务时无返回值。
+ * @throws {Error} 运行未绑定执行机、执行机已不可用或任务落库失败时抛出错误。
+ */
 Engine.prototype.queueRunnerPreviewArchive = function (run, spec) {
   const runnerID = this.defaultExecutionRunner(run);
   if (runnerID === "") {
@@ -556,14 +738,24 @@ Engine.prototype.queueRunnerPreviewArchive = function (run, spec) {
     RunID: run.ID,
     PreviewArchive: spec,
   });
-  const putErr = this.repo.PutRunnerTask(task);
-  if (putErr != null) {
-    throw putErr;
-  }
+  this.repo.PutRunnerTask(task);
   this.notifyRunnerDispatch("terminal");
 };
 
-// dispatchRunnerCommand：在绑定的执行机上、节点任务工作区内运行终端命令（验证门禁）；调用携带与脚本任务相同的仓库 git token，否则 `git push` 之类的门禁在禁用提示且无凭证的情况下启动。
+/**
+ * 在绑定的执行机上、节点任务工作区内执行验证门禁终端命令，并等待其完成。
+ * 载荷中携带责任人 Git 凭证，使 `git push` 等门禁命令在无交互提示环境下也能正常认证。
+ *
+ * @param {AbortSignal|null} ctx - 控制任务等待取消的信号。
+ * @param {string} runnerID - 目标执行机 ID。
+ * @param {string} runID - 运行唯一标识。
+ * @param {string} nodeID - 节点唯一标识。
+ * @param {string} workspace - 执行机侧工作区相对路径。
+ * @param {string} command - 待执行的终端命令字符串。
+ * @param {function(TelemetryEvent): void|null} gateSink - 门禁遥测事件接收回调。
+ * @returns {Promise<string>} 命令执行成功时返回输出文本。
+ * @throws {Error} 沙箱规格组装失败、入队/等待失败或命令失败/取消时抛出错误。
+ */
 Engine.prototype.dispatchRunnerCommand = async function (ctx, runnerID, runID, nodeID, workspace, command, gateSink) {
   const task = new RunnerTask({
     ID: `rt-${BigInt(Date.now()) * 1000000n}-gate`,
@@ -581,10 +773,7 @@ Engine.prototype.dispatchRunnerCommand = async function (ctx, runnerID, runID, n
     task.Sandbox = this.runnerSandboxSpec(run);
     task.Invocation = this.gateCommandInvocation(run, nodeID);
   }
-  const putErr = this.repo.PutRunnerTask(task);
-  if (putErr != null) {
-    throw putErr;
-  }
+  this.repo.PutRunnerTask(task);
   this.notifyRunnerDispatch("terminal");
   if (gateSink != null) {
     gateSink(new TelemetryEvent({ Category: "process", Name: "process.started", Phase: "start", Message: "门禁命令下发到执行器：" + command }));
@@ -611,7 +800,13 @@ Engine.prototype.dispatchRunnerCommand = async function (ctx, runnerID, runID, n
   }
 };
 
-// gateCommandInvocation：验证命令在执行机上所需的载荷；仓库条目提供责任人的 git token；已有检出留在原地，执行机只用该 token 认证这条命令。
+/**
+ * 构造验证门禁命令在执行机上运行所需的调用载荷，附带 MCP 资产与责任人 Git 身份及仓库凭证绑定。
+ *
+ * @param {import("../domain/run.js").Run} run - 运行快照对象。
+ * @param {string} nodeID - 节点唯一标识。
+ * @returns {RunnerInvocation} 填充完毕的门禁调用载荷。
+ */
 Engine.prototype.gateCommandInvocation = function (run, nodeID) {
   const assets = this.resolveScriptMCPAssets(run.ExecutionContext.ProjectID, run.ExecutionContext.ResponsibleUserID);
   const invocation = new RunnerInvocation({
@@ -622,17 +817,30 @@ Engine.prototype.gateCommandInvocation = function (run, nodeID) {
   return invocation;
 };
 
-// NotifyRunnerTaskChanged：唤醒等待执行机任务状态变迁的工作流 goroutine；DB 仍是权威来源，通知只避免每运行任务每秒查一次。
+/**
+ * 唤醒进程内所有正在等待指定执行机任务状态变更的协程。
+ * 数据库仍是权威状态源，进程内通知仅用于降低轮询延迟与数据库查询频次。
+ *
+ * @param {string} taskID - 发生变更的执行机任务 ID。
+ * @returns {void} 无返回值。
+ */
 Engine.prototype.NotifyRunnerTaskChanged = function (taskID) {
   for (const resolve of this.runnerTaskSubs[taskID] ?? []) {
     resolve();
   }
 };
 
+/**
+ * 订阅指定执行机任务的进程内一次性变更通知，返回通知 Promise 与取消订阅函数。
+ *
+ * @param {string} taskID - 待监听的执行机任务 ID。
+ * @returns {[Promise<void>, function(): void]} 返回 `[变更通知 Promise, 取消订阅回调]` 二元组。
+ */
 Engine.prototype.subscribeRunnerTask = function (taskID) {
   let resolve;
   const changed = new Promise((r) => { resolve = r; });
   if (this.runnerTaskSubs[taskID] == null) {
+    // 对应 Go 的 map[chan struct{}]struct{}：元素为非字符串的 resolve 回调函数，使用 Set 存储。
     this.runnerTaskSubs[taskID] = new Set();
   }
   this.runnerTaskSubs[taskID].add(resolve);
@@ -646,7 +854,16 @@ Engine.prototype.subscribeRunnerTask = function (taskID) {
   }];
 };
 
-// awaitRunnerTask：等进程内任务通知，API 与 worker 分属不同进程时轮询持久任务/事件流；运行取消也会标记远端任务。
+/**
+ * 结合进程内通知与 1 秒兜底轮询，等待执行机任务进入终态（成功/失败/取消），并持续桥接任务事件流至遥测回调。
+ * 当 `ctx` 取消时同步在仓储中标记取消远端任务并抛出取消原因。
+ *
+ * @param {AbortSignal|null} ctx - 控制等待取消的信号。
+ * @param {string} taskID - 待等待的执行机任务 ID。
+ * @param {function(TelemetryEvent): void|null} sink - 实时遥测事件接收回调。
+ * @returns {Promise<RunnerTask>} 到达终态后的最新执行机任务对象。
+ * @throws {Error} 任务记录消失或 `ctx` 触发取消时抛出错误。
+ */
 Engine.prototype.awaitRunnerTask = async function (ctx, taskID, sink) {
   let lastEventSeq = 0;
   let lastStatus = "";
@@ -708,14 +925,25 @@ Engine.prototype.awaitRunnerTask = async function (ctx, taskID, sink) {
       await Promise.race([changed, sleepOrAbort(ctx, 1000)]);
     } catch {
       unsubscribe();
-      this.repo.CancelRunnerTask(taskID, new Date());
+      try {
+        this.repo.CancelRunnerTask(taskID, new Date());
+      } catch {}
       throw ctx.reason;
     }
     unsubscribe();
   }
 };
 
-// bridgeRunnerEventsToSink：在持有运行租约的进程内归一化持久执行机事件；API 进程不得改 worker 拥有的运行：updateRun 会拒绝这种写入，之前还让远端可观测性悄悄消失，尽管 runner_task_events 里有完整流。
+/**
+ * 在持有运行租约的进程内，将持久化执行机任务事件流增量归一化并转发至遥测回调 `sink`。
+ * 自动补齐 `observation` 事件的来源信息，并过滤已由适配器归一化过的 `stderr` 与结构化 JSON stdout 帧以避免重复噪音。
+ *
+ * @param {RunnerTask} task - 关联的执行机任务对象。
+ * @param {import("../domain/runner.js").RunnerTaskEvent[]} events - 新读取的增量任务事件列表。
+ * @param {number} after - 上一次已消费的最大事件序号。
+ * @param {function(TelemetryEvent): void|null} sink - 遥测事件接收回调；为 `null` 时仅推进序号。
+ * @returns {number} 本批处理后最新的最大事件序号。
+ */
 function bridgeRunnerEventsToSink(task, events, after, sink) {
   if (sink == null) {
     for (const event of events) {
@@ -783,7 +1011,14 @@ function bridgeRunnerEventsToSink(task, events, after, sink) {
   return after;
 }
 
-// requireRunnerProvider：校验绑定的执行机在线且已启用该执行器的 CLI，错绑的角色快速失败并给出明确信息，而不是排队一个无人认领的任务。
+/**
+ * 校验目标执行机存在、当前在线且已启用指定提供方 CLI，避免将任务排给不可用执行机而长期无人认领。
+ *
+ * @param {string} runnerID - 目标执行机 ID。
+ * @param {string} provider - 所需执行器提供方名称。
+ * @returns {void} 校验通过时无返回值。
+ * @throws {Error} 执行机不存在、离线或未启用对应提供方时抛出中文提示错误。
+ */
 Engine.prototype.requireRunnerProvider = function (runnerID, provider) {
   const [runner, ok] = this.repo.Runner(runnerID.trim());
   if (!ok) {
@@ -797,7 +1032,15 @@ Engine.prototype.requireRunnerProvider = function (runnerID, provider) {
   }
 };
 
-// restoreRunnerArtifacts：把执行机上传的产物内容写回控制面运行沙箱工作区，collectArtifacts、验证门禁与下游交接无需改动继续工作。
+/**
+ * 将执行机上传的产物内容按契约路径写回控制面运行沙箱工作区，保证后续产物采集、验证门禁与下游交接无需改动即可工作。
+ *
+ * @param {string} sandboxWorkspace - 控制面沙箱工作区根目录。
+ * @param {import("../domain/workflow.js").ArtifactContract[]|null} contracts - 声明的产物契约列表。
+ * @param {Object.<string, string>|null} uploaded - 执行机上传的产物名到文件内容的映射。
+ * @returns {void} 无返回值。
+ * @throws {Error} 创建父目录或写入产物文件失败时抛出文件系统错误。
+ */
 function restoreRunnerArtifacts(sandboxWorkspace, contracts, uploaded) {
   if (contracts == null || contracts.length === 0 || uploaded == null || Object.keys(uploaded).length === 0) {
     return;
@@ -817,7 +1060,14 @@ function restoreRunnerArtifacts(sandboxWorkspace, contracts, uploaded) {
   }
 }
 
-// sleepOrAbort：等满毫秒或等到 ctx 取消，对应 Go 的 time.NewTimer + select。
+/**
+ * 等待指定毫秒数或直到取消信号触发，对应 Go 的 `time.NewTimer` 搭配 `select <-ctx.Done()`。
+ *
+ * @param {AbortSignal|null} ctx - 可选取消信号；为 `null` 时仅按毫秒数等待。
+ * @param {number} ms - 等待时长（毫秒）。
+ * @returns {Promise<void>} 正常到时后兑现，无返回值。
+ * @throws {Error} 等待期间 `ctx` 中止时拒绝并抛出 `ctx.reason`。
+ */
 function sleepOrAbort(ctx, ms) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -844,7 +1094,12 @@ function sleepOrAbort(ctx, ms) {
   });
 }
 
-// isValidJSON：Go 的 json.Valid 无 JS 内置对应写法。
+/**
+ * 判断字符串是否为合法 JSON 文本，对应 Go 的 `json.Valid`。
+ *
+ * @param {string} s - 待检测的字符串。
+ * @returns {boolean} 解析成功返回 `true`，否则返回 `false`。
+ */
 function isValidJSON(s) {
   try {
     JSON.parse(s);

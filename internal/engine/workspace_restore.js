@@ -1,17 +1,38 @@
-// workspace_restore.js —— 对应 Go 文件：internal/engine/workspace_restore.go
-// 作用：工作区恢复：恢复状态查询与后台恢复。
-// (值, error) 译为成功返回值、失败 throw；context.Context 译为 AbortSignal；goroutine 译为不 await 的异步函数；errors.Is 译为 ===；time.Time 零值译为 null；log.Printf 译为 console.log。
+/**
+ * @file internal/engine/workspace_restore.js
+ * 对应 Go 源文件：internal/engine/workspace_restore.go
+ *
+ * 作用与职责边界：
+ * 实现运行工作区快照的持久恢复状态查询（`WorkspaceRestoreStatus`）、异步发起后台恢复（`StartWorkspaceRestore`）
+ * 以及带租约重试与超时收尾的后台恢复协程（`restoreWorkspaceInBackground`）；
+ * `Engine` 方法挂载于 `Engine.prototype`（`Engine` 定义于 `engine.js`）。
+ *
+ * 语法差异说明：
+ * - Go 的 `(值, error)` 与仅 `error` 返回统一按成功返回值（或 `undefined`）、失败 `throw err` 处理；`(值, bool)` 译为 `[值, boolean]`。
+ * - Go 的 `context.Context` 译为 `AbortSignal`；`go e.restoreWorkspaceInBackground(...)` 译为不 `await` 的异步函数调用。
+ * - Go 的 `errors.Is` 译为 `===`；`time.Time` 零值译为 `null`；`log.Printf` 译为 `console.log`。
+ */
 
 "use strict";
 
-const { Engine } = require("./engine.js"); // 对应 Go 同包的 Engine，engine.js 已翻译
+const { Engine } = require("./engine.js"); // 对应 Go 同包类型，engine.js 已翻译
 const { WorkspaceRestoreStatus } = require("../domain/runner_workspace.js"); // 对应 Go 的 domain.WorkspaceRestoreStatus，runner_workspace.js 已翻译
 const { ErrWorkspaceInUse } = require("../repo/workspace_checkpoints.js"); // 对应 Go 的 repo.ErrWorkspaceInUse，workspace_checkpoints.js 已翻译
 const { WorkspaceRestoreInterrupted } = require("../repo/workspace_restore.js"); // 对应 Go 的 repo.WorkspaceRestoreInterrupted，workspace_restore.js 已翻译
+const { sharesWorkspace, workspaceRunID } = require("./workspace_owner.js"); // 对应 Go 同包函数，workspace_owner.js 已翻译
+const { WithConversationWorkspaceToken } = require("./conversation_workspace.js"); // 对应 Go 同包函数，conversation_workspace.js 已翻译
 
-// WorkspaceRestoreStatus 是持久的，刷新或另一 API 实例看到的是同一个后台恢复，不会启动竞争传输。
+/**
+ * 查询指定运行工作区的持久恢复状态（`"idle"` / `"restoring"` / `"failed"` / `"ready"`）；
+ * 子 SOP 自动重定向至其共享的父运行；先读快照租约再读运行记录，确保已释放租约不会配上陈旧的清理标记。
+ * 使用场景：前端轮询或跨 API 实例检查是否已有后台恢复正在进行。
+ *
+ * @param {string} id - 运行记录主键 ID。
+ * @returns {WorkspaceRestoreStatus} 当前持久化的工作区恢复状态。
+ * @throws {Error} 运行不存在时抛出错误。
+ */
 Engine.prototype.WorkspaceRestoreStatus = function (id) {
-  // 先读租约再读运行。恢复在释放租约前清除运行的清理标记，所以已释放的租约绝不会配上陈旧的清理标记（那会被报成 "idle" 而非 "ready"）。
+  // 先读租约再读运行。恢复在释放租约前清除运行的清理标记，所以已释放的租约绝不会配上陈旧的清理标记（避免误报为 "idle" 而非 "ready"）。
   const [meta] = this.repo.WorkspaceCheckpoint(id);
   const [run, ok] = this.repo.RunState(id);
   if (!ok) {
@@ -21,7 +42,7 @@ Engine.prototype.WorkspaceRestoreStatus = function (id) {
     return this.WorkspaceRestoreStatus(workspaceRunID(run));
   }
   const state = new WorkspaceRestoreStatus({ Status: "idle", StartedAt: meta.RestoreStarted });
-  // 恢复在绑定工作区时清除清理标记，早于剩余工作完成。因此记录的结果优先于绑定：失败或中断的恢复绝不是 "ready"。
+  // 恢复在绑定工作区时即清除清理标记（早于剩余工作完成），因此记录的恢复结果优先于绑定状态：失败或中断的恢复绝不视为 "ready"。
   if (meta.RestoreStatus === "restoring" && meta.LeaseUntil != null && meta.LeaseUntil.getTime() > Date.now()) {
     state.Status = "restoring";
   } else if (meta.RestoreStatus === "failed") {
@@ -36,7 +57,15 @@ Engine.prototype.WorkspaceRestoreStatus = function (id) {
   return state;
 };
 
-// StartWorkspaceRestore 及时确认。有界的后台操作持有 DB 租约，直到恢复与绑定确认完成；关闭 HTTP 请求不能在执行机仍工作时释放它。
+/**
+ * 立即确认并启动有界的后台工作区恢复任务；若工作区已就绪或已有实例正在恢复则直接返回当前状态。
+ * 后台操作在数据库租约下独立运行，不会因 HTTP 请求提前断开而中断执行机侧恢复。
+ * 使用场景：前端点击恢复已回收工作区或 API 触发异步恢复时调用。
+ *
+ * @param {string} id - 运行记录主键 ID。
+ * @returns {WorkspaceRestoreStatus} 启动或复核后的工作区恢复状态。
+ * @throws {Error} 运行不存在、租约被其他独占操作占用或数据库申请恢复失败时抛出错误。
+ */
 Engine.prototype.StartWorkspaceRestore = function (id) {
   const [run, ok] = this.repo.RunState(id);
   if (!ok) {
@@ -54,14 +83,14 @@ Engine.prototype.StartWorkspaceRestore = function (id) {
     token = this.repo.BeginWorkspaceRestore(id, new Date());
   } catch (err) {
     if (err === ErrWorkspaceInUse) {
-      // 另一 API 可能在读取与认领之间抢到了恢复。
+      // 另一 API 实例可能在读取与认领之间抢先启动了恢复。
       try {
         const reread = this.WorkspaceRestoreStatus(id);
         if (reread.Status === "restoring" || reread.Status === "ready") {
           return reread;
         }
       } catch {
-        // Go：重读失败时继续走 err 分支。
+        // Go：重读失败时继续抛出原始 err。
       }
     }
     throw err;
@@ -73,8 +102,17 @@ Engine.prototype.StartWorkspaceRestore = function (id) {
   return this.WorkspaceRestoreStatus(id);
 };
 
+/**
+ * 在 10 分钟有界超时内后台执行工作区快照恢复：遇到 `ErrWorkspaceInUse` 时每秒重试直至成功、非忙碌错误或超时，
+ * 最终调用 `FinishWorkspaceRestore` 释放租约并写入最终恢复状态。
+ * 使用场景：由 `StartWorkspaceRestore` 以后台协程方式启动（不 `await`）。
+ *
+ * @param {string} id - 运行记录主键 ID。
+ * @param {string} token - 本次后台恢复持有的数据库租约令牌。
+ * @returns {Promise<void>} 无返回值。
+ */
 Engine.prototype.restoreWorkspaceInBackground = async function (id, token) {
-  // 工作区使用租约 15 分钟。整个操作（含旧执行机 RPC 完成前的重试）限制在该 TTL 之下。
+  // 工作区使用租约有效期为 15 分钟；将完整后台恢复（含等待旧执行机 RPC 结束的重试）限制在 10 分钟内。
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new Error("context deadline exceeded")), 10 * 60 * 1000);
   const ctx = WithConversationWorkspaceToken(controller.signal, token, id);
@@ -102,8 +140,9 @@ Engine.prototype.restoreWorkspaceInBackground = async function (id, token) {
     if (err != null) {
       message = err.message;
     }
-    const finishErr = this.repo.FinishWorkspaceRestore(id, token, new Date(), message);
-    if (finishErr != null) {
+    try {
+      this.repo.FinishWorkspaceRestore(id, token, new Date(), message);
+    } catch (finishErr) {
       console.log(`finish workspace restore ${id}: ${finishErr}`);
     }
   } finally {
@@ -111,7 +150,15 @@ Engine.prototype.restoreWorkspaceInBackground = async function (id, token) {
   }
 };
 
-// sleepOrAbort：等满毫秒或等到 ctx 取消，对应 Go 的 time.NewTimer + select。
+/**
+ * 等待指定毫秒数或直至 `ctx` 触发取消信号（对应 Go 的 `time.After` + `select`）。
+ * 使用场景：供 `restoreWorkspaceInBackground` 在租约冲突时执行可中断的 1 秒重试等待。
+ *
+ * @param {AbortSignal|null} ctx - 取消控制信号。
+ * @param {number} ms - 等待时长（毫秒）。
+ * @returns {Promise<void>} 定时到达时正常兑现。
+ * @throws {Error} 等待期间 `ctx` 取消时拒绝并抛出 `ctx.reason`。
+ */
 function sleepOrAbort(ctx, ms) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {

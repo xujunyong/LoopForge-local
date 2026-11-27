@@ -1,14 +1,37 @@
-// workspace_cleanup.js —— 对应 Go 文件：internal/engine/workspace_cleanup.go
-// 作用：工作区清理：运行工作区查询、终态清理、沙箱回收与孤儿结算。
-// (值, error) 译为成功返回值、失败 throw，(值, bool) 译为 [值, bool]；time.Time 零值译为 null；time.Duration 译为毫秒数；sync.Mutex 省略；ticker 译为 sleepOrAbort 循环；defer 译为 try/finally；log.Printf 译为 console.log；context.Background() 译为 null；map[string]bool 译为普通对象。
+/**
+ * @file internal/engine/workspace_cleanup.js
+ * 对应 Go 源文件：internal/engine/workspace_cleanup.go
+ *
+ * 作用与职责边界：
+ * 实现运行工作区路径与事实查询、预览归档排队与取消、后台沙箱定时清扫（`sandboxSweep`）、
+ * 终态工作区清理、空闲容器回收、运行显式删除及孤儿运行结算；
+ * `Engine` 相关方法挂载于 `Engine.prototype`（`Engine` 定义于 `engine.js`）。
+ *
+ * 语法差异说明：
+ * - Go 的 `(值, error)` 与仅 `error` 返回统一按成功返回值（或 `undefined`）、失败 `throw err` 处理；`(值, bool)` 译为 `[值, boolean]`。
+ * - Go 的 `time.Time` 零值译为 `null`；`time.Duration` 换算为毫秒数；`sync.Mutex` 在单线程 JS 中省略。
+ * - Go 的 `time.NewTicker` + `select` 译为 `async` 配合 `sleepOrAbort` 定时器循环；`defer` 译为 `try ... finally`。
+ * - Go 的 `log.Printf` 译为 `console.log`；`context.Background()` 译为 `null`；`map[string]bool` 与 `map[string]struct{}` 均译为普通对象 `{}`。
+ */
 
 "use strict";
 
-const { Engine } = require("./engine.js"); // 对应 Go 同包的 Engine，engine.js 已翻译
+const { Engine } = require("./engine.js"); // 对应 Go 同包类型，engine.js 已翻译
 const { RunnerWorkspaceFacts, RunnerTaskFailed, RunnerTaskCanceled, RunnerTaskActionArchivePreview } = require("../domain/runner.js"); // 对应 Go 的 domain.RunnerWorkspaceFacts/RunnerTaskFailed/RunnerTaskCanceled/RunnerTaskActionArchivePreview，runner.js 已翻译
 const { RunnerWorkspaceRequest, RunnerWorkspaceOperationReclaim } = require("../domain/runner_workspace.js"); // 对应 Go 的 domain.RunnerWorkspaceRequest/RunnerWorkspaceOperationReclaim，runner_workspace.js 已翻译
 const { RunnerSandbox } = require("../domain/assets.js"); // 对应 Go 的 domain.RunnerSandbox，assets.js 已翻译
+const { workspaceRunID } = require("./workspace_owner.js"); // 对应 Go 同包函数，workspace_owner.js 已翻译
+const { safeRunnerPath } = require("./runner_dispatch.js"); // 对应 Go 同包函数，runner_dispatch.js 已翻译
+const { ConversationWorkspaceIdleTTL } = require("./conversation_workspace.js"); // 对应 Go 同包常量，conversation_workspace.js 已翻译
+const { orphanSettleStatus } = require("./lifecycle.js"); // 对应 Go 同包函数，lifecycle.js 已翻译
 
+/**
+ * 查询指定运行在本地沙箱管理器中对应的工作区目录路径；若运行存在，优先解析其实际归属的工作区运行 ID（子 SOP 跟随父运行）。
+ * 使用场景：本地文件浏览、产物检查或预览构建需要定位运行工作区目录时调用。
+ *
+ * @param {string} runID - 运行记录主键 ID。
+ * @returns {string} 本地工作区根目录路径；沙箱管理器未初始化时返回空字符串 `""`。
+ */
 Engine.prototype.RunWorkspace = function (runID) {
   if (this.sandboxes == null) {
     return "";
@@ -20,12 +43,24 @@ Engine.prototype.RunWorkspace = function (runID) {
   return this.sandboxes.RunWorkspace(runID);
 };
 
-// WorkspaceRunID 返回 run 执行所在的工作区所属运行；子 SOP 共享启动其 SOP 链的运行的检出。
+/**
+ * 返回 `run` 实际执行所在的工作区归属运行 ID；子 SOP 共享发起该 SOP 链的父运行检出目录。
+ * 使用场景：对外暴露工作区归属查询（委托同包 `workspaceRunID`）。
+ *
+ * @param {object} run - 运行快照对象（`domain.Run`）。
+ * @returns {string} 持有工作区目录的运行 ID。
+ */
 function WorkspaceRunID(run) {
   return workspaceRunID(run);
 }
 
-// RunWorkspaceFacts 返回执行机最后上报的运行工作区事实；ok 为 false 时引擎须自行检查 RunWorkspace。
+/**
+ * 返回执行机最近一次上报的运行工作区事实信息；当 `ok` 为 `false` 时，引擎需自行检查本地 `RunWorkspace`。
+ * 使用场景：读取执行机回传的仓库状态或工作区元信息。
+ *
+ * @param {string} runID - 运行记录主键 ID。
+ * @returns {[RunnerWorkspaceFacts, boolean]} 找到时返回 `[facts, true]`，否则返回 `[空 RunnerWorkspaceFacts, false]`。
+ */
 Engine.prototype.RunWorkspaceFacts = function (runID) {
   const facts = this.workspaceFacts[runID];
   if (facts == null) {
@@ -34,6 +69,14 @@ Engine.prototype.RunWorkspaceFacts = function (runID) {
   return [facts, true];
 };
 
+/**
+ * 记录执行机任务输出中附带的工作区事实信息。
+ * 使用场景：执行机任务上报或结束回写输出时更新内存缓存。
+ *
+ * @param {string} runID - 运行记录主键 ID。
+ * @param {object|null} outputs - 执行机任务输出（`domain.RunnerTaskOutputs`）。
+ * @returns {void} 无返回值。
+ */
 Engine.prototype.recordWorkspaceFacts = function (runID, outputs) {
   if (outputs == null || outputs.Facts == null) {
     return;
@@ -41,14 +84,31 @@ Engine.prototype.recordWorkspaceFacts = function (runID, outputs) {
   this.workspaceFacts[runID] = outputs.Facts;
 };
 
+/**
+ * 为指定运行在执行机侧排队一次预览产物归档任务。
+ * 使用场景：预览服务需要从远端执行机拉取构建产物时调用。
+ *
+ * @param {object} run - 运行快照对象（`domain.Run`）。
+ * @param {object} spec - 预览归档规格（`domain.RunnerPreviewArchiveSpec`）。
+ * @returns {void} 无返回值。
+ * @throws {Error} 排队执行机任务失败时抛出错误。
+ */
 Engine.prototype.QueuePreviewArchive = function (run, spec) {
   this.queueRunnerPreviewArchive(run, spec);
-  return null;
 };
 
+/**
+ * 取消指定运行下全部仍处于活跃状态的预览归档执行机任务，并通知执行机控制通道。
+ * 使用场景：运行取消、删除或预览构建被替代时中止冗余归档任务。
+ *
+ * @param {string} runID - 运行记录主键 ID。
+ * @returns {void} 无返回值。
+ */
 Engine.prototype.CancelPreviewArchive = function (runID) {
-  const [tasks, err] = this.repo.ActiveRunnerTasksForRun(runID);
-  if (err != null) {
+  let tasks;
+  try {
+    tasks = this.repo.ActiveRunnerTasksForRun(runID);
+  } catch (err) {
     console.log(`list preview archive tasks ${runID}: ${err}`);
     return;
   }
@@ -57,8 +117,9 @@ Engine.prototype.CancelPreviewArchive = function (runID) {
     if (task.Action !== RunnerTaskActionArchivePreview) {
       continue;
     }
-    const cancelErr = this.repo.CancelRunnerTask(task.ID, now);
-    if (cancelErr != null) {
+    try {
+      this.repo.CancelRunnerTask(task.ID, now);
+    } catch (cancelErr) {
       console.log(`cancel preview archive ${task.ID}: ${cancelErr}`);
       continue;
     }
@@ -70,10 +131,25 @@ Engine.prototype.CancelPreviewArchive = function (runID) {
   }
 };
 
+/**
+ * 触发指定运行的工作区清理流程。
+ * 使用场景：外部模块主动请求释放已完成或已取消运行的工作区。
+ *
+ * @param {string} runID - 运行记录主键 ID。
+ * @returns {void} 无返回值。
+ */
 Engine.prototype.ReleaseWorkspace = function (runID) {
   this.cleanupRunWorkspace(runID);
 };
 
+/**
+ * 引擎后台定时清扫循环：每 20 秒清理过期分块传输、恢复漏掉的预览归档与终结器、推进终态工作区清理并回收闲置沙箱与镜像缓存；
+ * 当 `ctx` 取消时关闭分块传输管理器并退出。
+ * 使用场景：由 `Engine.Start` 作为后台守护协程启动。
+ *
+ * @param {AbortSignal|null} ctx - 引擎生命周期取消信号。
+ * @returns {Promise<void>} 无返回值。
+ */
 Engine.prototype.sandboxSweep = async function (ctx) {
   for (;;) {
     try {
@@ -88,29 +164,40 @@ Engine.prototype.sandboxSweep = async function (ctx) {
       this.recoverMissingPreviewFinalizers();
       this.preview.Reconcile();
     }
-    this.reconcileTerminalWorkspaceCleanup();
+    await this.reconcileTerminalWorkspaceCleanup();
     this.reclaimSandboxes();
   }
 };
 
-Engine.prototype.reconcileTerminalWorkspaceCleanup = function () {
+/**
+ * 扫描所有待清理的终态运行与受快照管理的工作区运行，去重后逐一执行工作区清理。
+ * 使用场景：由 `sandboxSweep` 周期性调用。
+ *
+ * @returns {Promise<void>} 无返回值。
+ */
+Engine.prototype.reconcileTerminalWorkspaceCleanup = async function () {
   const now = new Date();
   const seen = {};
   for (const run of this.repo.TerminalWorkspaceCleanupRuns()) {
     seen[run.ID] = true;
-    this.cleanupWorkspace(run, now);
+    await this.cleanupWorkspace(run, now);
   }
   for (const id of this.repo.CheckpointWorkspaceRunIDs()) {
     if (!seen[id]) {
       const [run, ok] = this.repo.RunState(id);
       if (ok) {
-        this.cleanupWorkspace(run, now);
+        await this.cleanupWorkspace(run, now);
       }
     }
   }
 };
 
-// recoverBuiltPreviewArchives 覆盖已完成却未写预览行的预览构建：运行仍在等后续门禁，或进程在归档排队前重启。它在成功运行清扫前运行，避免从空的控制面检出判断执行机工作区后跳过。
+/**
+ * 补救已完成预览构建却尚未写入预览记录的运行（例如运行仍停在后续审批门禁或进程在排队归档前重启）。
+ * 必须在成功运行清理之前执行，避免误从空的控制面目录判断执行机工作区而跳过归档。
+ *
+ * @returns {void} 无返回值。
+ */
 Engine.prototype.recoverBuiltPreviewArchives = function () {
   if (this.preview == null) {
     return;
@@ -124,11 +211,18 @@ Engine.prototype.recoverBuiltPreviewArchives = function () {
     if (previewOk) {
       continue;
     }
-    this.preview.ArchiveBuiltPreview(run);
+    try {
+      this.preview.ArchiveBuiltPreview(run);
+    } catch {}
   }
 };
 
-// recoverMissingPreviewFinalizers 覆盖运行已持久化为成功、但 BeginFinalization 写预览行与清理保留前的崩溃窗口。清扫须在终态工作区清理前运行它。
+/**
+ * 补救运行已持久化为 `succeeded`、但 `BeginFinalization` 尚未写入预览记录和清理保留标记前的崩溃窗口。
+ * 清扫循环必须在终态工作区清理之前调用此方法。
+ *
+ * @returns {void} 无返回值。
+ */
 Engine.prototype.recoverMissingPreviewFinalizers = function () {
   if (this.preview == null) {
     return;
@@ -144,25 +238,43 @@ Engine.prototype.recoverMissingPreviewFinalizers = function () {
     if (previewOk) {
       continue;
     }
-    this.preview.BeginFinalization(run);
+    try {
+      this.preview.BeginFinalization(run);
+    } catch {}
   }
 };
 
-Engine.prototype.cleanupRunWorkspace = function (runID) {
+/**
+ * 按运行 ID 读取最新状态并以当前时刻触发 `cleanupWorkspace`。
+ * 使用场景：孤儿取消结算或外部调用 `ReleaseWorkspace` 时触发单次清理。
+ *
+ * @param {string} runID - 运行记录主键 ID。
+ * @returns {Promise<void>} 无返回值。
+ */
+Engine.prototype.cleanupRunWorkspace = async function (runID) {
   const [run, ok] = this.repo.RunState(runID);
   if (!ok) {
     return;
   }
-  this.cleanupWorkspace(run, new Date());
+  await this.cleanupWorkspace(run, new Date());
 };
 
-Engine.prototype.cleanupWorkspace = function (run, now) {
+/**
+ * 执行单次运行的工作区清理：先处理受快照管理的对话工作区空闲保存与认领，
+ * 再对已标记清理的执行机任务做重试补偿，最后认领清理权并释放跨宿主/本地/执行机三类工作区环境。
+ * 使用场景：由 `reconcileTerminalWorkspaceCleanup` 或 `cleanupRunWorkspace` 调用。
+ *
+ * @param {object} run - 待清理的运行快照（`domain.Run`）。
+ * @param {Date} now - 当前清理判定时刻。
+ * @returns {Promise<void>} 无返回值。
+ */
+Engine.prototype.cleanupWorkspace = async function (run, now) {
   let managed = false;
   let checkpointClaimed = false;
   let releaseCheckpoint = null;
   let checkpointErr = null;
   try {
-    [managed, checkpointClaimed, releaseCheckpoint] = this.claimIdleConversationWorkspace(run, now);
+    [managed, checkpointClaimed, releaseCheckpoint] = await this.claimIdleConversationWorkspace(run, now);
   } catch (e) {
     checkpointErr = e;
   }
@@ -184,31 +296,36 @@ Engine.prototype.cleanupWorkspace = function (run, now) {
         // 已注销的执行机在注销时已清理工作区；否则允许重新排队清理请求。
         const [, runnerExists] = this.repo.Runner(runnerID);
         if (runnerExists) {
-          this.repo.ResetRunWorkspaceCleanup(run.ID);
+          try {
+            this.repo.ResetRunWorkspaceCleanup(run.ID);
+          } catch {}
         }
         return;
       }
       if (task.Status === RunnerTaskFailed || task.Status === RunnerTaskCanceled) {
-        this.repo.ResetRunWorkspaceCleanup(run.ID);
+        try {
+          this.repo.ResetRunWorkspaceCleanup(run.ID);
+        } catch {}
       }
       return;
     }
     let claimed = checkpointClaimed;
-    let claimErr = null;
     if (!managed) {
-      [claimed, claimErr] = this.repo.ClaimRunWorkspaceCleanup(run.ID, now);
-    }
-    if (claimErr != null) {
-      console.log(`claim terminal workspace cleanup ${run.ID}: ${claimErr}`);
-      return;
+      try {
+        claimed = this.repo.ClaimRunWorkspaceCleanup(run.ID, now);
+      } catch (claimErr) {
+        console.log(`claim terminal workspace cleanup ${run.ID}: ${claimErr}`);
+        return;
+      }
     }
     if (!claimed) {
       return;
     }
     const reset = (cleanupErr) => {
       console.log(`cleanup terminal workspace ${run.ID}: ${cleanupErr}`);
-      const resetErr = this.repo.ResetRunWorkspaceCleanup(run.ID);
-      if (resetErr != null) {
+      try {
+        this.repo.ResetRunWorkspaceCleanup(run.ID);
+      } catch (resetErr) {
         console.log(`reset terminal workspace cleanup ${run.ID}: ${resetErr}`);
       }
     };
@@ -221,7 +338,7 @@ Engine.prototype.cleanupWorkspace = function (run, now) {
       const checkpointController = new AbortController();
       const checkpointTimer = setTimeout(() => checkpointController.abort(new Error("context deadline exceeded")), 30 * 1000);
       try {
-        const response = this.requestWorkspaceCheckpoint(checkpointController.signal, run, new RunnerWorkspaceRequest({ RunID: run.ID, Operation: RunnerWorkspaceOperationReclaim, CheckpointLease: meta.LeaseToken }));
+        const response = await this.requestWorkspaceCheckpoint(checkpointController.signal, run, new RunnerWorkspaceRequest({ RunID: run.ID, Operation: RunnerWorkspaceOperationReclaim, CheckpointLease: meta.LeaseToken }));
         if (response.Error !== "") {
           reset(new Error(response.Error));
         }
@@ -254,13 +371,20 @@ Engine.prototype.cleanupWorkspace = function (run, now) {
   }
 };
 
+/**
+ * 汇总当前所有受保护、不可被底层孤儿目录与容器清扫回收的运行 ID 列表，
+ * 包含活跃运行、未清理的共享助手会话工作区以及未清理的快照受管工作区。
+ * 使用场景：由 `reclaimSandboxes` 在执行目录与 Docker 容器回收前构建白名单。
+ *
+ * @returns {string[]} 受保护的运行 ID 数组。
+ */
 Engine.prototype.liveSandboxRunIDs = function () {
   const ids = this.repo.LiveSandboxRunIDs();
   const seen = {};
   for (const id of ids) {
     seen[id] = true;
   }
-  // 未回收的受管工作区（含保存失败的）不受下层孤儿目录/容器清扫影响。
+  // 未回收的受管工作区（包括保存失败的）不受下层孤儿目录/容器清扫影响。
   for (const session of this.repo.ListSharedAssistantSessions()) {
     if (seen[session.RunID]) {
       continue;
@@ -283,8 +407,14 @@ Engine.prototype.liveSandboxRunIDs = function () {
   return ids;
 };
 
-// SupersedeIssueRuns 释放同一议题早前已结算运行的沙箱容器，新分派已取代它们。
-// 从头重新分派不是重试：它分配新运行 ID 与新容器，从不碰旧容器。旧运行保持失败，失败运行为重试特意保留工作区——也让容器无限期存活，各自持有已长到 GB 级的可写层。工作区留在原地供检查旧尝试，只回收容器。
+/**
+ * 当同一议题已有新的同工作流分派取代旧尝试时，释放早前已结算运行的本地沙箱容器（保留工作区目录供排查）。
+ * 使用场景：议题重新从头分派工作流后，回收历史失败运行残留的大体积容器可写层。
+ *
+ * @param {string} issueID - 议题 ID。
+ * @param {string} keepRunID - 需要保留的新运行 ID。
+ * @returns {void} 无返回值。
+ */
 Engine.prototype.SupersedeIssueRuns = function (issueID, keepRunID) {
   if (!this.executes()) {
     return;
@@ -295,7 +425,7 @@ Engine.prototype.SupersedeIssueRuns = function (issueID, keepRunID) {
     if (!ok || this.foreignWorkspaceBind(run)) {
       continue;
     }
-    // 同一议题的另一 SOP 不是取代本运行；它仍可能被重试。
+    // 同一议题的另一条 SOP 不会取代本运行；它仍可能被重试。
     if (keptFound && run.WorkflowID !== kept.WorkflowID) {
       continue;
     }
@@ -308,6 +438,13 @@ Engine.prototype.SupersedeIssueRuns = function (issueID, keepRunID) {
   }
 };
 
+/**
+ * 释放并销毁指定运行的本地沙箱环境及工作区目录，错误仅记日志不向上抛出。
+ * 使用场景：需要直接清理单个运行沙箱的内部路径。
+ *
+ * @param {string} runID - 运行记录主键 ID。
+ * @returns {void} 无返回值。
+ */
 Engine.prototype.destroySandbox = function (runID) {
   try {
     this.releaseRunEnvironment(runID, true);
@@ -316,7 +453,15 @@ Engine.prototype.destroySandbox = function (runID) {
   }
 };
 
-// DeleteRun 仅在本地执行环境已销毁、且执行机侧工作区清理已持久排队后删除已结算运行。失败运行通常为重试保留工作区；显式删除须同时清理两端宿主。
+/**
+ * 显式删除已结算的运行记录：先校验运行及节点均已停止、获取工作区使用租约并声明删除标记，
+ * 再将关联任务结算为终态、删除预览、排队执行机清理、销毁本地沙箱，最后删除数据库中的运行记录。
+ * 使用场景：用户在界面或 API 主动删除历史运行。
+ *
+ * @param {string} runID - 待删除的运行记录主键 ID。
+ * @returns {Promise<void>} 无返回值。
+ * @throws {Error} 运行不存在、仍处于活跃状态、工作区正在使用或任一清理/删除步骤失败时抛出错误。
+ */
 Engine.prototype.DeleteRun = async function (runID) {
   const [run, ok] = this.repo.RunState(runID);
   if (!ok) {
@@ -333,15 +478,13 @@ Engine.prototype.DeleteRun = async function (runID) {
     if ((this.WorkspaceActive != null && this.WorkspaceActive(run)) || this.conversationGenerationRunning(run)) {
       throw new Error("工作区仍在使用，请先停止");
     }
-    const claimErr = this.repo.ClaimWorkspaceDeletion(runID, token, run.Revision, new Date());
-    if (claimErr != null) {
-      throw claimErr;
-    }
-    // 先在持久 Task 上保留终态结果再删 Run。否则后续任务同步只能看到悬空 RunID，无法区分已删成功/失败与已删取消。
+    this.repo.ClaimWorkspaceDeletion(runID, token, run.Revision, new Date());
+    // 先在持久 Task 上保留终态结果再删 Run，避免后续任务同步面对悬空 RunID 无法区分成功/失败与取消。
     this.settleDeletedRunTasks(run);
     if (this.preview != null) {
-      const previewErr = this.preview.DeleteForRun(runID);
-      if (previewErr != null) {
+      try {
+        this.preview.DeleteForRun(runID);
+      } catch (previewErr) {
         throw new Error(`delete run preview: ${previewErr.message}`);
       }
     }
@@ -355,20 +498,26 @@ Engine.prototype.DeleteRun = async function (runID) {
     } catch (e) {
       throw new Error(`destroy run sandbox: ${e.message}`);
     }
-    const deleteErr = this.repo.DeleteRun(runID);
-    if (deleteErr != null) {
-      throw deleteErr;
-    }
-    return null;
+    this.repo.DeleteRun(runID);
   } finally {
-    this.repo.FinishWorkspaceUse(runID, token, new Date(), null, "");
+    try {
+      this.repo.FinishWorkspaceUse(runID, token, new Date(), null, "");
+    } catch {}
   }
 };
 
+/**
+ * 在删除运行记录前，将所有绑定到该运行（按 `RunID` 或 `ExecutionContext.TaskID` 匹配）的持久任务状态同步为对应终态。
+ * 使用场景：由 `DeleteRun` 在删除运行前调用。
+ *
+ * @param {object} run - 待删除的运行快照（`domain.Run`）。
+ * @returns {void} 无返回值。
+ * @throws {Error} 更新任务状态失败时抛出错误。
+ */
 Engine.prototype.settleDeletedRunTasks = function (run) {
   const status = { succeeded: "completed", failed: "failed", cancelled: "cancelled" }[run.Status] ?? "";
   if (status === "") {
-    return null;
+    return;
   }
   const contextTaskID = run.ExecutionContext.TaskID.trim();
   for (const task of this.repo.Tasks()) {
@@ -378,25 +527,35 @@ Engine.prototype.settleDeletedRunTasks = function (run) {
     if (task.Status === status) {
       continue;
     }
-    const err = this.repo.UpdateTaskStatus(task, status);
-    if (err != null) {
+    try {
+      this.repo.UpdateTaskStatus(task, status);
+    } catch (err) {
       throw new Error(`settle task ${task.ID} before deleting run ${run.ID}: ${err.message}`);
     }
   }
-  return null;
 };
 
+/**
+ * 按存活运行白名单依次回收孤儿沙箱目录、孤儿 Docker 容器、超期闲置的失败/等待运行容器以及不再使用的 Docker 镜像缓存标签。
+ * 使用场景：由 `sandboxSweep` 周期性调用。
+ *
+ * @returns {void} 无返回值。
+ */
 Engine.prototype.reclaimSandboxes = function () {
   const live = this.liveSandboxRunIDs();
-  const [n, err] = this.sandboxes.ReclaimExcept(live);
-  if (err != null) {
+  try {
+    const n = this.sandboxes.ReclaimExcept(live);
+    if (n > 0) {
+      console.log(`reclaimed ${n} finished sandbox workspace(s)`);
+    }
+  } catch (err) {
     console.log(`reclaim sandboxes: ${err}`);
-  } else if (n > 0) {
-    console.log(`reclaimed ${n} finished sandbox workspace(s)`);
   }
-  // 容器比上面的目录清扫活得久：工作区已回收或已彻底删除的运行仍有容器持有 GB 级可写层，只有显式 docker rm 能释放。
-  const [containers, containersErr] = this.sandboxes.ReclaimDockerSandboxes(null, live);
-  if (containersErr != null) {
+  // 容器寿命长于目录清扫：工作区已回收或运行已删除的容器仍持有大体积可写层，需显式 docker rm 释放。
+  let containers;
+  try {
+    containers = this.sandboxes.ReclaimDockerSandboxes(null, live);
+  } catch (containersErr) {
     console.log(`reclaim docker sandboxes: ${containersErr}`);
     return;
   }
@@ -414,8 +573,10 @@ Engine.prototype.reclaimSandboxes = function () {
       keep.push(spec.Dockerfile);
     }
   }
-  const [images, imagesErr] = this.sandboxes.ReclaimCachedDockerImages(null, keep);
-  if (imagesErr != null) {
+  let images;
+  try {
+    images = this.sandboxes.ReclaimCachedDockerImages(null, keep);
+  } catch (imagesErr) {
     console.log(`reclaim cached docker images: ${imagesErr}`);
     return;
   }
@@ -424,10 +585,19 @@ Engine.prototype.reclaimSandboxes = function () {
   }
 };
 
-// 失败与等待运行为重试或人工决策保留工作区，存活集永不释放它们。容器只挂着 `sleep infinity` 占内存与可写层；闲置满这些时长后容器回收、工作区保留。下次重试、批准或恢复重新获取环境，重建容器并重跑环境安装。
+// 失败与等待运行为重试或人工审批保留工作区目录，但其容器闲置超过以下时长后将被回收以释放内存与可写层（毫秒）。
 const idleFailedRunContainerTTL = 30 * 60 * 1000;
 const idleWaitingRunContainerTTL = 2 * 60 * 60 * 1000;
 
+/**
+ * 扫描并回收已超过闲置阈值的失败/等待运行的本地 Docker 容器（工作区目录保留不变）。
+ * 优先释放当前进程内持有句柄的运行，再扫描外部空闲 Docker 容器。
+ * 使用场景：由 `reclaimSandboxes` 调用。
+ *
+ * @param {AbortSignal|null} ctx - 取消控制信号。
+ * @param {Date} now - 当前判定时刻。
+ * @returns {number} 本次实际回收的闲置容器数量。
+ */
 Engine.prototype.discardIdleRunContainers = function (ctx, now) {
   if (!this.executes() || this.sandboxes == null) {
     return 0;
@@ -437,15 +607,17 @@ Engine.prototype.discardIdleRunContainers = function (ctx, now) {
     return 0;
   }
   const discarded = {};
-  // 进程内句柄持有工作区 flock，下面的 docker 扫描会视其为忙碌，所以先释放这些运行。
+  // 进程内句柄持有工作区 flock，后续 docker 扫描会视其为忙碌，因此优先释放本进程持有的运行。
   for (const runID of candidates) {
     const held = this.runEnvs[runID] != null;
     if (held && this.discardIdleRunContainer(ctx, runID, now)) {
       discarded[runID] = true;
     }
   }
-  const [withContainer, err] = this.sandboxes.RunsWithIdleDockerSandbox(ctx, candidates);
-  if (err != null) {
+  let withContainer = [];
+  try {
+    withContainer = this.sandboxes.RunsWithIdleDockerSandbox(ctx, candidates);
+  } catch (err) {
     console.log(`list idle run sandboxes: ${err}`);
   }
   for (const runID of withContainer) {
@@ -459,8 +631,13 @@ Engine.prototype.discardIdleRunContainers = function (ctx, now) {
   return Object.keys(discarded).length;
 };
 
-// discardIdleRunContainer 在 stateMu 下重读运行，Retry 与 Approve 翻回 running 前都持该锁。
-// discardLocalSandbox 在运行迁到池执行机后移除本机沙箱容器；工作区保留供检查。
+/**
+ * 运行迁移到执行机池后移除本机残留的沙箱容器（保留本地工作区目录供检查）。
+ * 使用场景：池执行机接管运行后清理控制面本地临时容器。
+ *
+ * @param {string} runID - 运行记录主键 ID。
+ * @returns {void} 无返回值。
+ */
 Engine.prototype.discardLocalSandbox = function (runID) {
   try {
     this.releaseRunEnvironment(runID, false);
@@ -472,9 +649,19 @@ Engine.prototype.discardLocalSandbox = function (runID) {
   }
 };
 
+/**
+ * 复核单个候选运行是否满足容器闲置回收条件（避开活跃租约、跟进保护期、活跃工作区及跨宿主绑定），
+ * 满足时释放内存运行环境并销毁其 Docker 容器。
+ * 使用场景：由 `discardIdleRunContainers` 逐个调用。
+ *
+ * @param {AbortSignal|null} ctx - 取消控制信号。
+ * @param {string} runID - 运行记录主键 ID。
+ * @param {Date} now - 当前判定时刻。
+ * @returns {boolean} 实际执行了容器回收返回 `true`，跳过返回 `false`。
+ */
 Engine.prototype.discardIdleRunContainer = function (ctx, runID, now) {
   const [run, ok] = this.repo.RunState(runID);
-  // 保留预览对迁到执行机的运行的本地容器回收，同时保留活跃工作区操作与新的闲置截止期。
+  // 保留对迁往执行机运行的本地容器回收，同时保护活跃工作区操作与跟进闲置截止期。
   const [meta, managed] = this.repo.WorkspaceCheckpoint(runID);
   if (managed && (meta.Error !== "" || (meta.LeaseUntil != null && meta.LeaseUntil.getTime() > now.getTime()) || (meta.FollowUp && now.getTime() < (meta.LastUsedAt ?? new Date(0)).getTime() + ConversationWorkspaceIdleTTL))) {
     return false;
@@ -494,6 +681,15 @@ Engine.prototype.discardIdleRunContainer = function (ctx, runID, now) {
   return true;
 };
 
+/**
+ * 判断指定运行的沙箱容器是否已处于可回收的闲置状态：工作区尚未清理、运行处于 `failed` 或 `waiting` 且超过对应 TTL，
+ * 并且不存在 `running` 或 `pending_input` 的节点。
+ * 使用场景：由 `discardIdleRunContainer` 校验回收前提。
+ *
+ * @param {object} run - 运行快照对象（`domain.Run`）。
+ * @param {Date} now - 当前判定时刻。
+ * @returns {boolean} 满足闲置回收条件返回 `true`，否则返回 `false`。
+ */
 function runContainerIdle(run, now) {
   if (run.WorkspaceCleanedAt != null) {
     return false;
@@ -520,7 +716,14 @@ function runContainerIdle(run, now) {
   return true;
 }
 
-// settleOrphan 把无主运行及其在途节点标记为失败。updateRun 已在 stateMu 上串行化并发布新快照。
+/**
+ * 将失去调度租约的无主运行及其在途节点结算为失败或已取消状态，并发布运行事件；若结算为已取消，立即触发工作区清理。
+ * 使用场景：租约巡检发现孤儿运行或强制停止无主运行时调用。
+ *
+ * @param {string} runID - 运行记录主键 ID。
+ * @param {string} reason - 结算原因描述文本。
+ * @returns {void} 无返回值。
+ */
 Engine.prototype.settleOrphan = function (runID, reason) {
   this.stopRunScheduler(runID);
   const status = orphanSettleStatus(reason);
@@ -548,11 +751,26 @@ Engine.prototype.settleOrphan = function (runID, reason) {
   }
 };
 
+/**
+ * 判断运行状态是否仍处于存活调度阶段（`running` 或 `waiting`）。
+ * 使用场景：筛选存活运行与状态守卫。
+ *
+ * @param {string} status - 运行状态字符串。
+ * @returns {boolean} 属于存活状态返回 `true`，否则返回 `false`。
+ */
 function isLiveStatus(status) {
   return status === "running" || status === "waiting";
 }
 
-// sleepOrAbort：等满毫秒或等到 ctx 取消，对应 Go 的 time.NewTimer + select。
+/**
+ * 等待指定毫秒数或直至 `ctx` 触发取消信号（对应 Go 的 `time.NewTicker`/`time.After` + `select`）。
+ * 使用场景：供 `sandboxSweep` 实现可中断的定时循环。
+ *
+ * @param {AbortSignal|null} ctx - 取消控制信号。
+ * @param {number} ms - 等待时长（毫秒）。
+ * @returns {Promise<void>} 定时到达时正常兑现。
+ * @throws {Error} 等待期间 `ctx` 取消时拒绝并抛出 `ctx.reason`。
+ */
 function sleepOrAbort(ctx, ms) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {

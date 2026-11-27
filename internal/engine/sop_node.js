@@ -1,6 +1,18 @@
-// sop_node.js —— 对应 Go 文件：internal/engine/sop_node.go
-// 作用：SOP 节点执行：启动或接上子 SOP、等它结束、把产物交接回父流程。
-// context.Context 译为 AbortSignal；time.Ticker + select 译为 sleepOrAbort 循环；(值, error) 译为成功返回值、失败 throw；fmt.Sprintf 的 %q 译为 JSON.stringify。
+/**
+ * 对应 Go 源文件：internal/engine/sop_node.go
+ *
+ * 文件作用与职责边界：
+ * 负责父工作流中嵌套 SOP 节点的完整执行生命周期：
+ * 包括循环嵌套与深度校验、复用或启动子 SOP 运行、轮询等待子运行结束、
+ * 响应父运行取消信号以及将子 SOP 产出的交付物按合约导入回父运行。
+ *
+ * Go 与 JS 语法差异说明：
+ * - Go 的 `context.Context` 译为 `AbortSignal`。
+ * - Go 的 `time.NewTicker` + `select` 并发等待译为 `async/await` 配合 `sleepOrAbort` 循环。
+ * - Go 的 `(值, error)` 译为成功返回值、失败 `throw`；仅返回 `error` 的函数成功返回 `undefined`、失败 `throw`。
+ * - Go 的 `fmt.Sprintf` 的 `%q` 译为 `JSON.stringify`；Go 的 `crypto/sha256` 译为 `node:crypto` 的 `createHash("sha256")`。
+ * - Go 的结构体值复制在 JS 中通过对象展开 `{ ...obj }` 表达。
+ */
 
 "use strict";
 
@@ -8,14 +20,28 @@ const { createHash } = require("node:crypto"); // Go crypto/sha256
 const { Engine } = require("./engine.js"); // 对应 Go 同包的 Engine，engine.js 已翻译
 const { Run, TelemetryEvent } = require("../domain/run.js"); // 对应 Go 的 domain.Run/TelemetryEvent，run.js 已翻译
 const { TerminalRunStatus } = require("../domain/run_eval.js"); // 对应 Go 的 domain.TerminalRunStatus，run_eval.js 已翻译
-const { ancestors } = require("./workflow_graph.js"); // 对应 Go 同包函数，workflow_graph.js 本批翻译
+const { ancestors } = require("./workflow_graph.js"); // 对应 Go 同包函数，workflow_graph.js 已翻译
 const { groupSOPHandoffNode } = require("./legacy_handoff.js"); // 对应 Go 同包常量，legacy_handoff.js 已翻译
 const { nodeRejects, shouldCommitNodeOutcome } = require("./node_outcome.js"); // 对应 Go 同包函数，node_outcome.js 已翻译
+const { isLiveStatus } = require("./workspace_cleanup.js"); // 对应 Go 同包函数，workspace_cleanup.js 已翻译
+const { workspaceRunID } = require("./workspace_owner.js"); // 对应 Go 同包函数，workspace_owner.js 已翻译
 
 const maxSOPNesting = 6;
 
 const errSOPArtifactWrite = new Error("保存子 SOP 产物失败");
 
+/**
+ * 执行父工作流中的一个嵌套 SOP 节点：校验嵌套关系、复用或启动子流程、等待结束并交接产物。
+ * 使用场景：调度器分派到 `node.Type === "sop"` 的节点时异步调用。
+ *
+ * @param {AbortSignal} ctx - 取消控制信号，用于响应排空、暂停、租约丢失或父流程取消。
+ * @param {string} runID - 父运行 ID。
+ * @param {object} wf - 父运行的工作流定义（domain.WorkflowDefinition）。
+ * @param {object} node - 当前执行的 SOP 节点定义（domain.WorkflowNode）。
+ * @param {number} attempt - 当前节点执行尝试次数。
+ * @param {number} generation - 当前运行的调度代次，用于提交结果时防并发覆盖。
+ * @returns {Promise<void>} 无返回值；节点成功或失败状态均直接写回运行记录。
+ */
 Engine.prototype.executeSOPNode = async function (ctx, runID, wf, node, attempt, generation) {
   const fail = (err) => {
     if (err == null) {
@@ -57,7 +83,11 @@ Engine.prototype.executeSOPNode = async function (ctx, runID, wf, node, attempt,
         child = prev;
       } else if (isLiveStatus(prev.Status)) {
         // 节点被重新指向另一个 SOP（RefreshRunSOP）；旧子流程的工作不再属于该节点。
-        this.Cancel(prev.ID);
+        try {
+          this.Cancel(prev.ID);
+        } catch (_) {
+          // 对应 Go `_ = e.Cancel(prev.ID)`，忽略取消错误。
+        }
       }
     }
   }
@@ -169,6 +199,15 @@ Engine.prototype.executeSOPNode = async function (ctx, runID, wf, node, attempt,
   }
 };
 
+/**
+ * 沿父运行链向上回溯，校验启动目标子 SOP 是否会造成循环引用或超过最大嵌套深度限制。
+ * 使用场景：在 executeSOPNode 启动子 SOP 前调用。
+ *
+ * @param {object} parent - 当前父运行实例（domain.Run）。
+ * @param {string} childWorkflowID - 待启动的子工作流 ID。
+ * @returns {void} 无返回值。
+ * @throws {Error} 检测到循环引用或嵌套层数达到上限（maxSOPNesting）时抛出错误。
+ */
 Engine.prototype.guardSOPCycle = function (parent, childWorkflowID) {
   childWorkflowID = childWorkflowID.trim();
   const seen = {};
@@ -201,6 +240,14 @@ Engine.prototype.guardSOPCycle = function (parent, childWorkflowID) {
   }
 };
 
+/**
+ * 组装传递给子 SOP 的输入文本，附加本节点声明的期望产出产物以及父流程上游节点已交付的产物清单。
+ * 使用场景：启动新的子 SOP 运行前生成子运行输入提示。
+ *
+ * @param {object} parent - 父运行实例（domain.Run）。
+ * @param {object} node - 当前 SOP 节点定义（domain.WorkflowNode）。
+ * @returns {string} 拼接好的子 SOP 输入文本。
+ */
 function sopChildInput(parent, node) {
   let input = parent.Input.trim();
   const prior = ancestors(parent.WorkflowSnapshot, node.ID);
@@ -230,6 +277,13 @@ function sopChildInput(parent, node) {
   return input;
 }
 
+/**
+ * 将产物合约列表中的非空产物名用逗号空格拼接为字符串。
+ * 使用场景：由 sopChildInput 调用，在输入文本中列出该 SOP 节点需要向父流程交付的产物名。
+ *
+ * @param {object[]} contracts - 产物合约数组（domain.ArtifactContract[]）。
+ * @returns {string} 以 ", " 连接的产物名称列表。
+ */
 function joinArtifactNames(contracts) {
   const names = [];
   for (const c of contracts) {
@@ -241,6 +295,16 @@ function joinArtifactNames(contracts) {
   return names.join(", ");
 }
 
+/**
+ * 每隔 200ms 轮询等待子 SOP 运行到达终态，同时监听父流程取消与上下文中止信号。
+ * 使用场景：executeSOPNode 启动或重新接上子 SOP 后调用。
+ *
+ * @param {AbortSignal} ctx - 取消控制信号。
+ * @param {string} parentID - 父运行 ID。
+ * @param {string} childID - 子运行 ID。
+ * @returns {Promise<object>} 到达终态后的子运行实例（domain.Run）。
+ * @throws {Error} 当上下文中止、父流程已取消或子运行记录消失时抛出错误。
+ */
 Engine.prototype.waitChildRun = async function (ctx, parentID, childID) {
   for (;;) {
     try {
@@ -250,13 +314,21 @@ Engine.prototype.waitChildRun = async function (ctx, parentID, childID) {
       // 排空、暂停或租约丢失：子流程自己恢复，父流程再接上它；只有父流程显式取消才会停掉子流程。
       const [parent, ok] = this.repo.RunState(parentID);
       if (ok && (parent.CancelRequested || parent.Status === "cancelled")) {
-        this.Cancel(childID);
+        try {
+          this.Cancel(childID);
+        } catch (_) {
+          // 对应 Go `_ = e.Cancel(childID)`，忽略取消错误。
+        }
       }
       throw err;
     }
     const [parent, ok] = this.repo.RunState(parentID);
     if (ok && (parent.CancelRequested || parent.Status === "cancelled")) {
-      this.Cancel(childID);
+      try {
+        this.Cancel(childID);
+      } catch (_) {
+        // 对应 Go `_ = e.Cancel(childID)`，忽略取消错误。
+      }
       throw new Error("父流程已取消");
     }
     const [child, okChild] = this.repo.RunState(childID);
@@ -269,6 +341,17 @@ Engine.prototype.waitChildRun = async function (ctx, parentID, childID) {
   }
 };
 
+/**
+ * 从已成功的子 SOP 运行中筛选并导入应交接给父运行的产物列表，同名产物取最新一份并生成稳定 ID。
+ * 使用场景：子 SOP 成功后，由 executeSOPNode 调用以校验产出合约并归属到父运行节点。
+ *
+ * @param {string} parentID - 父运行 ID。
+ * @param {object} node - 当前 SOP 节点定义（domain.WorkflowNode）。
+ * @param {number} attempt - 当前节点尝试次数。
+ * @param {object} child - 已成功的子运行实例（domain.Run）。
+ * @returns {object[]} 归属信息已重写为父运行的新产物列表（domain.Artifact[]）。
+ * @throws {Error} 当节点声明了必需的产物合约但子 SOP 未交出对应产物时抛出错误。
+ */
 function importChildArtifacts(parentID, node, attempt, child) {
   const want = {};
   for (const contract of node.ArtifactOutputs) {
@@ -325,7 +408,14 @@ function importChildArtifacts(parentID, node, attempt, child) {
   return imported;
 }
 
-// sleepOrAbort：等满毫秒或等到 ctx 取消，对应 Go 的 time.NewTimer + select。
+/**
+ * 等待指定毫秒数或在 AbortSignal 触发中止时立即拒绝 Promise。
+ * 使用场景：配合 waitChildRun 实现与 Go `time.NewTicker` + `select` 等价的可取消轮询等待。
+ *
+ * @param {AbortSignal} ctx - 取消控制信号。
+ * @param {number} ms - 等待的毫秒数。
+ * @returns {Promise<void>} 正常到时后 resolve，无返回值；中止时以 `ctx.reason` reject。
+ */
 function sleepOrAbort(ctx, ms) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
